@@ -6,9 +6,7 @@ No knowledge of servers, Java or coding needed.
 **[Download for Windows](https://github.com/ricoism/minecraft-server-manager/releases/latest/download/MinecraftServerManager-Setup.exe)**
 · [What's new](CHANGELOG.md)
 
-<img width="1136" height="939" alt="Screenshot 2026-10-15 151006" src="https://github.com/user-attachments/assets/f8d4dec9-3034-4ae3-aa38-14a5bdee2b96" />
-<img width="1136" height="939" alt="Screenshot 2026-10-15 151025" src="https://github.com/user-attachments/assets/dcb4d52f-6e15-47df-9729-9f10cebc6a6e" />
-<img width="1136" height="939" alt="Screenshot 2026-10-15 151043" src="https://github.com/user-attachments/assets/fc86b084-9c23-4b99-bbb0-064d30099403" />
+https://github.com/user-attachments/assets/753af1eb-c239-4ea4-938b-2ffd6bcdaaf8
 
 ## Using it
 
