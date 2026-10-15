@@ -11,6 +11,16 @@ How to write an entry (for whoever makes the next update):
   * One short sentence per line. Bold the thing they'll look for, e.g. **Fix it for me**.
 -->
 
+## 3.2.0 - October 15, 2026
+
+### New
+- **The app tells you when there's an update.** Every time you open it, it checks for a new version. If there is one, it shows what's new and asks whether to **Update and restart** now or **Remind me later**.
+- If a server is running when you choose to update, the app stops it safely first (your world is saved), then updates.
+
+### Better
+- The update prompt waits for a quiet moment. It never pops up while a server is being set up.
+- Chose "Remind me later"? The **Update ready** button at the top lets you update whenever you like, and the app asks again next time you open it.
+
 ## 3.1.2 - October 15, 2026
 
 ### Fixed

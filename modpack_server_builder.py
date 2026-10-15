@@ -4226,7 +4226,9 @@ def api_post_extra(h, app, path, body):
         return h._json(app.updater.status() if app.updater else {"state": "disabled"})
     if path == "/api/update/install":
         if app.runner and app.runner.state in ("starting", "online", "stopping"):
-            raise ValueError("Stop your server first, then install the update.")
+            if not body.get("stop_server"):
+                raise ValueError("Stop your server first, then install the update.")
+            app.runner.shutdown()                # saves the world and stops the server, then we update
         if app.busy():
             raise ValueError("Wait for the current task to finish, then install the update.")
         if not (app.updater and app.updater.install_now()):
@@ -5516,7 +5518,7 @@ def run_web(port=0, open_browser=True, app_window=True, browser=None, browser_ar
     if mode == "app":
         refresh_icons_if_needed()
         try:
-            app.updater = AutoUpdater()
+            app.updater = AutoUpdater(first_delay=1.0)   # check as soon as the app opens
             app.updater.start()
         except Exception:  # noqa: BLE001
             app.updater = None
@@ -6539,11 +6541,26 @@ $('#cfkey').onchange=function(){S.info.settings.cfkey=this.value.trim();api('/ap
 var upd={state:'idle'};
 function paintUpdate(){var t={idle:'Up to date.',checking:'Checking for updates\u2026',downloading:'Downloading version '+(upd.version||'')+'\u2026',ready:'Version '+(upd.version||'')+' is ready to install.',up_to_date:'You have the newest version.',error:'Couldn\u2019t check for updates right now.',disabled:'Updates are switched off in this copy.'}[upd.state]||'';
   $('#upd-text').textContent=t;var p=$('#upd-pill');p.hidden=upd.state!=='ready';$('#upd-check').textContent=upd.state==='ready'?'Install now':'Check now'}
-function pollUpdate(){api('/api/update').then(function(d){upd=d;paintUpdate()}).catch(function(){})}
-$('#upd-pill').onclick=installUpdate;
-$('#upd-check').onclick=function(){if(upd.state==='ready'){installUpdate();return}api('/api/update/check',{}).then(function(d){upd=d;paintUpdate();setTimeout(pollUpdate,4000)}).catch(function(){})};
-function installUpdate(){var box=el('div','notes');box.appendChild(el('p',null,'The app closes, installs version '+upd.version+', and opens again. It takes a few seconds.'));if(upd.notes)box.appendChild(renderNotes(upd.notes));
-  modal('Install the update?',box,[{t:'Later'},{t:'Install and restart',primary:true,fn:function(){api('/api/update/install',{}).then(function(){document.body.textContent='';var p=el('p',null,'Installing the update\u2026 The app will open again in a moment.');p.style.cssText='margin:30vh auto;text-align:center;font:600 18px system-ui;color:#c9d3ea';document.body.appendChild(p)}).catch(function(e){toast(e.message,true)})}}])}
+var updAsked={},updBoot=Date.now();
+function pollUpdate(){api('/api/update').then(function(d){upd=d;paintUpdate();maybeAskUpdate();
+  // right after opening, follow the first check closely so the prompt appears as soon as the update is downloaded
+  if(Date.now()-updBoot<180000&&/^(idle|checking|downloading)$/.test(d.state))setTimeout(pollUpdate,1500)}).catch(function(){})}
+function runningServer(){return S.servers.filter(function(s){return s.state==='online'||s.state==='starting'||s.state==='stopping'})[0]}
+function maybeAskUpdate(){if(upd.state!=='ready'||!upd.version||updAsked[upd.version])return;
+  if(!S.booted||S.view==='install'||!$('#veil').hidden||polling){clearTimeout(S.askT);S.askT=setTimeout(maybeAskUpdate,3000);return}   // wait for a quiet moment
+  updAsked[upd.version]=true;installUpdate(true)}
+$('#upd-pill').onclick=function(){installUpdate(false)};
+$('#upd-check').onclick=function(){if(upd.state==='ready'){installUpdate(false);return}api('/api/update/check',{}).then(function(d){upd=d;paintUpdate();setTimeout(pollUpdate,1500)}).catch(function(){})};
+function installUpdate(auto){api('/api/servers').then(function(d){S.servers=d.servers}).catch(function(){}).then(function(){showUpdate(auto)})}
+function showUpdate(auto){var box=el('div','notes'),cur=upd.current||S.info.version,rs=runningServer();
+  box.appendChild(el('p',null,'Version '+upd.version+' of Modpack Server Builder is ready'+(cur?'. You have version '+cur+'.':'.')+' Updating takes a few seconds: the app closes, updates and opens again.'));
+  if(rs){var w=el('p',null,'\u201c'+rs.name+'\u201d is running. Updating stops it safely first (your world is saved). You can start it again afterwards.');w.style.color='var(--t-warn)';box.appendChild(w)}
+  if(upd.notes){box.appendChild(el('h4',null,'What\u2019s new'));box.appendChild(renderNotes(upd.notes))}
+  modal('Update available',box,[{t:'Remind me later',fn:function(){if(auto)toast('No problem. Click \u201cUpdate ready\u201d at the top whenever you like.')}},
+    {t:'Update and restart',primary:true,fn:function(){setTimeout(function(){doUpdate(!!rs)},0)}}])}
+function doUpdate(stopping){document.body.textContent='';var p=el('p',null,stopping?'Stopping your server safely, then updating\u2026':'Updating\u2026 The app will open again in a moment.');
+  p.style.cssText='margin:30vh auto;max-width:520px;text-align:center;font:600 18px system-ui;color:#c9d3ea;padding:0 20px';document.body.style.background='#0d1428';document.body.appendChild(p);
+  api('/api/update/install',{stop_server:true}).then(function(){p.textContent='Updating\u2026 The app will open again in a moment.'}).catch(function(e){p.textContent='The update couldn\u2019t be installed: '+e.message+' Close the app and open it again to try once more.'})}
 function renderNotes(md){var box=el('div','notes'),ul=null;String(md).split(/\r?\n/).forEach(function(l){var m;
   if((m=l.match(/^#{1,4}\s+(.*)/))){ul=null;box.appendChild(el('h4',null,m[1]))}else if((m=l.match(/^\s*[-*]\s+(.*)/))){if(!ul){ul=el('ul');box.appendChild(ul)}ul.appendChild(el('li',null,m[1].replace(/\*\*/g,'')))}else if(l.trim()){ul=null;box.appendChild(el('p',null,l.replace(/\*\*/g,'')))}});return box}
 $('#whats-new').onclick=function(){api('/api/whatsnew?force=1').then(function(d){modal('What\u2019s new in '+d.version,d.notes?renderNotes(d.notes):'Release notes aren\u2019t available right now.',[{t:'Close',primary:true}])}).catch(function(){})};
@@ -6563,7 +6580,7 @@ api('/api/info').then(function(d){S.info=d;S.home=d.home;S.sep=d.win?'\\':'/';va
   applyTheme(st.theme==='light'||st.theme==='dark'?st.theme:themeMode(),false);setupFrame();
   if(d.mode==='install'){$('#inst-dir').textContent=d.install_dir;if(d.installed){$('#inst-sub').textContent='Version '+d.installed+' is installed. This updates it to '+d.version+'.';$('#go-install').textContent='Update'}else $('#inst-sub').textContent='Version '+d.version+'. About 9 MB.';
     VIEWS.forEach(function(x){$('#v-'+x).hidden=x!=='install'});S.view='install';$('#go-settings').hidden=true;return}
-  api('/api/events?since=0').then(function(ev){if(ev.state==='running'){S.jobKind=ev.kind;startProgress(ev.kind==='fix'?'fix':'build')}else go('home')}).catch(function(){go('home')});
+  api('/api/events?since=0').then(function(ev){if(ev.state==='running'){S.jobKind=ev.kind;startProgress(ev.kind==='fix'?'fix':'build')}else go('home')}).catch(function(){go('home')}).then(function(){S.booted=true});
   pollUpdate();setInterval(pollUpdate,60000);
   api('/api/whatsnew').then(function(w){if(w.notes)modal('What\u2019s new in '+w.version,renderNotes(w.notes),[{t:'Got it',primary:true,fn:function(){api('/api/whatsnew/seen',{}).catch(function(){})}}],function(){api('/api/whatsnew/seen',{}).catch(function(){})})}).catch(function(){});
 }).catch(function(){buildScene();go('home')});
