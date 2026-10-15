@@ -11,6 +11,19 @@ How to write an entry (for whoever makes the next update):
   * One short sentence per line. Bold the thing they'll look for, e.g. **Fix it for me**.
 -->
 
+## 3.1.1 - October 15, 2026
+
+### New
+- **You can leave a setup and come back.** While a server is being set up, a button at the top of the window shows how far along it is. Click it from anywhere in the app to return to the progress screen.
+- **New servers show up in "Your servers" right away**, marked "Setting up…". Click the card to see its progress.
+- **Skip the test.** During "First start" you can skip the check and start the server yourself whenever you like.
+
+### Fixed
+- **The first start could keep trying the same fix over and over.** If a fix doesn't help, the app now stops and tells you plainly what still needs doing, instead of going round in circles.
+- If another server is already using the same port, the app now says so instead of trying to start again and again.
+- When a setup finishes while you're on another screen, the app no longer pulls you away. The button at the top changes to "Server ready" instead.
+- Stopping a setup before anything was built no longer leaves a broken server in your list.
+
 ## 3.1.0 - October 15, 2026
 
 ### New

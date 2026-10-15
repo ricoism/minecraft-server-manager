@@ -87,6 +87,11 @@ class Cancelled(Exception):
 
 
 CANCEL = threading.Event()      # one job runs at a time; the UI sets this to stop it
+SKIP_TEST = threading.Event()   # "Skip the test": end the first-start check, keep the server
+
+
+class TestSkipped(Exception):
+    """Raised inside a test launch when the user presses 'Skip the test'."""
 
 
 def check_cancel():
@@ -1755,9 +1760,11 @@ def run_server_once(server_dir: Path, ctx: Ctx, timeout=1200):
     threading.Thread(target=reader, daemon=True).start()
     ok, echoed, last_beat, deadline = False, 0, time.time(), start + timeout
     while True:
-        if CANCEL.is_set():
+        if CANCEL.is_set() or SKIP_TEST.is_set():
             proc.kill()
             proc.wait(timeout=30)
+            if SKIP_TEST.is_set():
+                raise TestSkipped()
             raise Cancelled("Stopped by you.")
         try:
             item = q.get(timeout=1)
@@ -1814,15 +1821,57 @@ def collect_failure_text(server_dir: Path, output: str, since: float) -> str:
     return "\n".join(parts)
 
 
+def _fix_key(f):
+    """What a fix does, so the same fix isn't applied over and over when it doesn't help."""
+    return (f.action, f.kind, f.data.get("modid"), f.info.name if f.info else None, f.data.get("java"))
+
+
+def server_port(server_dir: Path) -> int:
+    try:
+        for line in (server_dir / "server.properties").read_text(encoding="utf-8", errors="ignore").splitlines():
+            if line.strip().startswith("server-port="):
+                return int(line.split("=", 1)[1].strip())
+    except (OSError, ValueError):
+        pass
+    return 25565
+
+
+def port_in_use(port: int) -> bool:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if not IS_WIN:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", port))
+        return False
+    except OSError:
+        return True
+    finally:
+        s.close()
+
+
 def test_and_fix(server_dir: Path, ctx: Ctx, max_attempts=8, timeout=1200):
-    """Launch, read the crash, fix, repeat. -> True when the server reached 'Done!'."""
-    all_manual = []
+    """Launch, read the crash, fix, repeat. -> True when the server reached 'Done!', None when skipped.
+
+    Stops early when a crash only calls for fixes that were already tried, so it never goes round in circles."""
+    all_manual, tried = [], set()
+    SKIP_TEST.clear()
+    port = server_port(server_dir)
     for attempt in range(1, max_attempts + 1):
         ctx.log(f"\nTest launch {attempt}/{max_attempts} ...")
         remove_duplicates(ModIndex(server_dir / "mods"), server_dir, ctx)
         check_cancel()
+        if port_in_use(port):
+            msg = (f"Port {port} is already in use, so the server can't start. Another Minecraft server (or a copy "
+                   f"of this one) is probably running. Close it, then start this server from its page.")
+            ctx.log("  " + msg)
+            ctx.notes.append(msg)
+            return False
         try:
             ok, out, started = run_server_once(server_dir, ctx, timeout)
+        except TestSkipped:
+            ctx.log("  Skipped the test start (you can start the server yourself from its page).")
+            ctx.note("Test start skipped")
+            return None
         except Cancelled:
             raise
         except Exception as e:  # noqa: BLE001
@@ -1837,7 +1886,14 @@ def test_and_fix(server_dir: Path, ctx: Ctx, max_attempts=8, timeout=1200):
         ctx.log("  The server did not start. Reading the crash...")
         findings = analyze_text(collect_failure_text(server_dir, out, started), server_dir, ctx)
         print_findings(findings, ctx)
-        changed, manual = apply_findings(findings, server_dir, ctx)
+        fresh = [f for f in findings if _fix_key(f) not in tried or f.action in ("manual",)]
+        for f in findings:
+            if f not in fresh:
+                m = f"Already tried: {f.message}. It didn't solve the problem."
+                if m not in all_manual:
+                    all_manual.append(m)
+        tried.update(_fix_key(f) for f in fresh if f.action != "manual")
+        changed, manual = apply_findings(fresh, server_dir, ctx)
         all_manual += [m for m in manual if m not in all_manual]
         if not changed:
             ctx.log("\nI couldn't fix the remaining problem automatically:")
@@ -1845,7 +1901,8 @@ def test_and_fix(server_dir: Path, ctx: Ctx, max_attempts=8, timeout=1200):
                 ctx.log("  - " + m)
             ctx.notes.extend(all_manual)
             return False
-    ctx.log(f"\nStopped after {max_attempts} attempts. Run 'Fix from log' with the newest logs/latest.log.")
+    ctx.log(f"\nStopped after {max_attempts} attempts. Open the server's page and press 'Fix it for me', "
+            f"or start it to see what happens.")
     return False
 
 
@@ -3827,7 +3884,7 @@ def update_server(sid: str, **fields) -> dict:
         servers = list_servers()
         for s in servers:
             if s["id"] == sid:
-                s.update({k: v for k, v in fields.items() if k in ("name", "icon", "mc", "loader", "pack")})
+                s.update({k: v for k, v in fields.items() if k in ("name", "icon", "mc", "loader", "pack", "setup")})
                 save_settings({"servers": [{k: v for k, v in x.items() if k != "missing"} for x in servers]})
                 return s
     raise ValueError("That server isn't in your list any more.")
@@ -3943,26 +4000,55 @@ def create_server(job, b: dict):
     eula, test = bool(b.get("eula")), bool(b.get("test", True))
     if eula:
         save_settings({"eula": True})       # agreed once in the app; don't ask again on Start
-    extra = {}
     kind = src.get("type")
-    if kind == "modrinth":
-        pack, title, icon = modrinth_pack_download(str(src.get("id") or ""), job.log)
-        extra = {"icon": icon, "pack": title}
-        res = build_server(pack, out, ram, eula, None, (), False, test, bool(b.get("aggressive")), 8, True, job.log)
-    elif kind == "file":
-        res = build_server(user_path(src.get("path"), "file"), out, ram, eula, (b.get("cfkey") or None), (), False,
-                           test, bool(b.get("aggressive")), 8, True, job.log)
-    elif kind == "vanilla":
-        res = build_vanilla_server(str(src.get("version") or ""), out, ram, eula, test, True, job.log)
-    else:
+    if kind not in ("modrinth", "file", "vanilla"):
         raise ValueError("Choose what you want to play first.")
-    rec = add_server(Path(res.server_dir), name, extra)
-    job.finish(dir=str(res.server_dir), ok=res.test_ok, failures=res.failures, server_id=rec["id"])
+    # Put it in "Your servers" straight away, so it can be found (and its progress reopened) while it's set up.
+    out.mkdir(parents=True, exist_ok=True)
+    early = {"setup": "running", "mc": str(src.get("mc") or src.get("version") or ""),
+             "loader": "vanilla" if kind == "vanilla" else str(src.get("loader") or "").lower(),
+             "pack": "" if kind == "vanilla" else str(src.get("title") or ""), "icon": str(src.get("icon") or "")}
+    rec = add_server(out, name, early)
+    job.server_id = rec["id"]
+    try:
+        if kind == "modrinth":
+            pack, title, icon = modrinth_pack_download(str(src.get("id") or ""), job.log)
+            update_server(rec["id"], icon=icon, pack=title)
+            res = build_server(pack, out, ram, eula, None, (), False, test, bool(b.get("aggressive")), 8, True, job.log)
+        elif kind == "file":
+            res = build_server(user_path(src.get("path"), "file"), out, ram, eula, (b.get("cfkey") or None), (), False,
+                               test, bool(b.get("aggressive")), 8, True, job.log)
+        else:
+            res = build_vanilla_server(str(src.get("version") or ""), out, ram, eula, test, True, job.log)
+    except BaseException:
+        # Keep it in the list only if there's a server that can actually be started.
+        try:
+            if launch_spec(out) is None:
+                remove_server(rec["id"])
+            else:
+                update_server(rec["id"], setup="")
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    env = detect_server_env(Path(res.server_dir))
+    upd = {"setup": ""}
+    if env.get("mc"):
+        upd["mc"] = env["mc"]
+    if env.get("loader"):
+        upd["loader"] = env["loader"]
+    update_server(rec["id"], **upd)
+    job.finish(dir=str(res.server_dir), ok=res.test_ok, failures=res.failures, server_id=rec["id"],
+               skipped=res.test_ok is None and test)
 
 
 # ---- extra API routes for the app screens -------------------------------------------------------
 
 def _server_state(app, s):
+    job = app.job
+    if s.get("setup") == "running":
+        if job is not None and job.state == "running" and getattr(job, "server_id", None) == s["id"]:
+            return {"state": "setting_up", "players": [], "error": None}
+        s["setup"] = ""                      # the app was closed mid-setup; treat it like any other server
     r = app.runner
     if r is not None and r.status().get("dir") and Path(r.status()["dir"]) == Path(s["dir"]):
         st = r.status()
@@ -4112,6 +4198,7 @@ def api_post_extra(h, app, path, body):
         eula = bool(load_settings().get("eula"))
 
         def fn(job):
+            job.server_id = s["id"]
             info = {}
             ok = fix_from_log(log_path, Path(s["dir"]), eula, bool(body.get("aggressive")), False, True, True,
                               job.log, info)
@@ -4176,6 +4263,7 @@ class Job:
         self.stage = ""
         self.dl = None                  # (done, total) while downloading mods
         self.result = {}
+        self.server_id = None           # the server this job is making or fixing
         self.lock = threading.Lock()
         self.rules = BUILD_RULES if kind == "build" else FIX_RULES
 
@@ -4473,6 +4561,7 @@ def make_handler(app: WebApp):
                         return self._json({"lines": [], "next": 0, "state": "idle"})
                     with job.lock:
                         out = {"lines": job.lines[since:], "next": len(job.lines), "state": job.state,
+                               "server_id": getattr(job, "server_id", None),
                                "stage": job.stage, "dl": job.dl, "result": job.result, "kind": job.kind}
                     return self._json(out)
                 return self._err("Not found.", 404)
@@ -4559,6 +4648,9 @@ def make_handler(app: WebApp):
                     return
                 if u.path == "/api/cancel":
                     CANCEL.set()
+                    return self._json({"ok": True})
+                if u.path == "/api/skiptest":
+                    SKIP_TEST.set()
                     return self._json({"ok": True})
                 if u.path == "/api/settings":
                     cur = save_settings(body if isinstance(body, dict) else {})
@@ -5529,7 +5621,12 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:24px;heigh
 .chip{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:8px;font-size:12.5px;background:var(--field);box-shadow:inset 0 0 0 1px var(--line);color:var(--ink-2);white-space:nowrap}
 .chip.pix{font-family:var(--pix);font-size:11.5px;letter-spacing:.02em;padding:4px 9px}
 .dot{width:9px;height:9px;border-radius:2.5px;flex:none;background:var(--ink-3)}
-.dot.online{background:var(--emerald);box-shadow:0 0 10px var(--emerald)}.dot.starting,.dot.stopping{background:var(--gold);box-shadow:0 0 10px var(--gold)}.dot.crashed{background:var(--redstone);box-shadow:0 0 10px var(--redstone)}
+.dot.online{background:var(--emerald);box-shadow:0 0 10px var(--emerald)}.dot.starting,.dot.stopping{background:var(--gold);box-shadow:0 0 10px var(--gold)}.dot.crashed{background:var(--redstone);box-shadow:0 0 10px var(--redstone)}.dot.setting_up{background:var(--lapis);box-shadow:0 0 10px var(--lapis);animation:blink 1.2s steps(2) infinite}
+@keyframes blink{50%{opacity:.35}}@media (prefers-reduced-motion:reduce){.dot.setting_up,.running-pill.job i{animation:none}}
+.running-pill.job{color:var(--t-acc);background:color-mix(in srgb,var(--lapis) 18%,transparent)}.running-pill.job i{background:var(--lapis);box-shadow:0 0 10px var(--lapis);animation:blink 1.2s steps(2) infinite}
+.running-pill.job.ready{color:var(--t-ok);background:color-mix(in srgb,var(--emerald) 16%,transparent)}.running-pill.job.ready i{background:var(--emerald);box-shadow:0 0 10px var(--emerald);animation:none}
+.running-pill.job.bad{color:var(--t-bad);background:color-mix(in srgb,var(--redstone) 16%,transparent)}.running-pill.job.bad i{background:var(--redstone);box-shadow:none;animation:none}
+.pfoot .acts{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 
 /* ================= home ================= */
 .servers{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:18px;margin-top:28px}
@@ -5790,7 +5887,7 @@ details.log summary::-webkit-details-marker{display:none}
     <button class="brand" id="go-home" title="All servers"><svg class="logo"><use href="#i-gblock"/></svg><b>Modpack Server Builder</b></button>
     <nav class="crumb" id="crumb" aria-label="Where you are"></nav>
   </div>
-  <button class="running-pill" id="run-pill" hidden><i></i><span></span></button>
+  <button class="running-pill job" id="job-pill" hidden><i></i><span></span></button><button class="running-pill" id="run-pill" hidden><i></i><span></span></button>
   <button class="tbtn update" id="upd-pill" hidden><svg><use href="#i-sparkle"/></svg><span>Update ready</span></button>
   <button class="tbtn" id="go-settings" aria-label="Settings" title="Settings"><svg><use href="#i-gear"/></svg></button>
   <div class="wc" id="wc" hidden>
@@ -5882,7 +5979,7 @@ details.log summary::-webkit-details-marker{display:none}
     <p class="now" id="b-now">Getting started</p>
     <div class="track" id="b-track"></div>
     <div class="bar" id="b-bar"><i></i></div>
-    <div class="pfoot"><span class="muted" id="b-tip">This usually takes a few minutes. You can leave this window open and do something else.</span><button class="btn sm" id="b-stop"><svg><use href="#i-x"/></svg><span>Stop</span></button></div>
+    <div class="pfoot"><span class="muted" id="b-tip">This usually takes a few minutes. You can look around the app meanwhile: the button at the top brings you back here.</span><div class="acts"><button class="btn sm quiet" id="b-leave"><svg><use href="#i-back"/></svg><span>All servers</span></button><button class="btn sm" id="b-skip" hidden><span>Skip the test</span></button><button class="btn sm" id="b-stop"><svg><use href="#i-x"/></svg><span>Stop</span></button></div></div>
     <details class="log" id="b-log"><summary><svg width="14" height="14"><use href="#i-down"/></svg>Show details</summary><div class="feed" id="feed" role="log"></div></details>
   </div>
   <div class="glass progress" id="b-result" hidden data-shine>
@@ -6116,6 +6213,7 @@ function go(v,arg){
   else if(v==='build'){crumb(S.jobKind==='fix'?'Fixing':'Setting up')}
   else if(v==='server'){S.sid=arg;var s=S.servers.filter(function(x){return x.id===arg})[0];crumb(s?s.name:'Server');openServer(arg)}
   else if(v==='settings'){crumb('Settings');loadSettings()}
+  paintJobPill();paintRunPill();
   var h=$('#v-'+v+' h1, #v-'+v+' h2');if(h&&v!=='home'){h.setAttribute('tabindex','-1');h.focus({preventScroll:true})}
 }
 $('#go-home').onclick=function(){if(S.view!=='install')go('home')};$('#go-settings').onclick=function(){go('settings')};
@@ -6123,7 +6221,7 @@ $('#create-back').onclick=function(){go('home')};$('#srv-back').onclick=function
 document.addEventListener('contextmenu',function(e){if(!(e.target.closest&&e.target.closest('input,textarea,.feed,.console,code')))e.preventDefault()});
 
 /* ---------- home ---------- */
-function stateText(s){var n=(s.players||[]).length;return({online:n?'Online, '+n+' playing':'Online',starting:'Starting\u2026',stopping:'Stopping\u2026',crashed:'Stopped with a problem'})[s.state]||'Offline'}
+function stateText(s){var n=(s.players||[]).length;return({online:n?'Online, '+n+' playing':'Online',starting:'Starting\u2026',stopping:'Stopping\u2026',crashed:'Stopped with a problem',setting_up:'Setting up\u2026'})[s.state]||'Offline'}
 function loadHome(){return api('/api/servers').then(function(d){S.servers=d.servers;renderHome();paintRunPill()}).catch(function(e){toast(e.message,true)})}
 function renderHome(){
   var box=$('#servers');box.textContent='';var has=S.servers.length>0;
@@ -6133,14 +6231,14 @@ function renderHome(){
     var top=el('div','top'),ic=el('div','picon');packIcon(ic,s.icon);top.appendChild(ic);var nm=el('div');nm.style.minWidth='0';nm.appendChild(el('h3',null,s.name));top.appendChild(nm);c.appendChild(top);
     var chips=el('div','chips');if(s.mc)chips.appendChild(el('span','chip pix',s.mc));if(s.loader)chips.appendChild(el('span','chip',loaderName(s.loader)));if(s.pack&&s.pack!==s.name)chips.appendChild(el('span','chip',s.pack));c.appendChild(chips);
     var f=el('div','foot'),st=el('span','state'),d=el('i','dot '+(s.missing?'':s.state));st.appendChild(d);st.appendChild(document.createTextNode(s.missing?'Folder not found':stateText(s)));f.appendChild(st);f.appendChild(icon('chev'));f.lastChild.setAttribute('width','16');f.lastChild.setAttribute('height','16');c.appendChild(f);
-    c.onclick=function(){if(s.missing){ask('Folder not found','The folder for \u201c'+s.name+'\u201d can\u2019t be found. It may have been moved or deleted. Remove it from your list?','Remove',true).then(function(ok){if(ok)api('/api/servers/remove',{id:s.id}).then(loadHome)});return}go('server',s.id)};
+    c.onclick=function(){if(s.missing){ask('Folder not found','The folder for \u201c'+s.name+'\u201d can\u2019t be found. It may have been moved or deleted. Remove it from your list?','Remove',true).then(function(ok){if(ok)api('/api/servers/remove',{id:s.id}).then(loadHome)});return}if(s.state==='setting_up'){go('build');return}go('server',s.id)};
     box.appendChild(c)});
   if(has){var n=el('button','scard new');var p=el('span','plus');p.appendChild(icon('plus'));n.appendChild(p);n.appendChild(el('b',null,'Create a new server'));var im=el('span','muted','or add one you already have');n.appendChild(im);
     n.onclick=function(e){go('create')};im.onclick=function(e){e.stopPropagation();importServer()};box.appendChild(n)}
 }
 $('#home-new').onclick=$('#empty-new').onclick=function(){go('create')};$('#empty-import').onclick=importServer;
 function importServer(){pick({kind:'dir',title:'Choose your server folder'}).then(function(p){if(!p)return;api('/api/servers/import',{dir:p}).then(function(s){toast('Added \u201c'+s.name+'\u201d');loadHome().then(function(){go('server',s.id)})}).catch(function(e){toast(e.message,true)})})}
-function paintRunPill(){var r=S.servers.filter(function(s){return s.state&&s.state!=='offline'&&s.state!=='crashed'})[0];var p=$('#run-pill');p.hidden=!r||(S.view==='server'&&S.sid===r.id);if(r){p.lastElementChild.textContent=r.name+': '+stateText(r);p.onclick=function(){go('server',r.id)}}}
+function paintRunPill(){var r=S.servers.filter(function(s){return s.state&&s.state!=='offline'&&s.state!=='crashed'&&s.state!=='setting_up'})[0];var p=$('#run-pill');p.hidden=!r||(S.view==='server'&&S.sid===r.id);if(r){p.lastElementChild.textContent=r.name+': '+stateText(r);p.onclick=function(){go('server',r.id)}}}
 setInterval(function(){if(S.view==='home'||S.view==='settings'||S.view==='create')api('/api/servers').then(function(d){S.servers=d.servers;if(S.view==='home')renderHome();paintRunPill()}).catch(function(){})},4000);
 
 /* ---------- create wizard ---------- */
@@ -6185,14 +6283,21 @@ $('#w2-next').onclick=function(){if(!$('#w-name').value.trim()){$('#w-name').foc
   t.appendChild(el('span',null,(S.src.type==='vanilla'?'Minecraft '+S.src.version:S.src.title+(S.src.mc?', Minecraft '+S.src.mc:''))+', '+S.ram+' GB memory'));sm.appendChild(t);setStep(3);validateW()};
 $('#w-create').onclick=function(){var b=this;if(!$('#w-eula').checked)return;b.disabled=true;
   api('/api/create',{source:S.src,name:$('#w-name').value.trim(),dir:S.dir,ram_mb:S.ram*1024,eula:true,test:$('#w-test').checked,aggressive:!!(S.info.settings&&S.info.settings.aggressive),cfkey:(S.info.settings&&S.info.settings.cfkey)||''})
-    .then(function(){api('/api/settings',{eula:true}).catch(function(){});S.info.settings=S.info.settings||{};S.info.settings.eula=true;startProgress('build',S.src.type)}).catch(function(e){b.disabled=false;toast(e.message,true)})};
+    .then(function(){S.jobName=$('#w-name').value.trim();S.jobSid=null;api('/api/settings',{eula:true}).catch(function(){});S.info.settings=S.info.settings||{};S.info.settings.eula=true;startProgress('build',S.src.type)}).catch(function(e){b.disabled=false;toast(e.message,true)})};
 
 /* ---------- progress (create / fix jobs) ---------- */
 var STAGES={build:[['read','Get the game files'],['mods','Download mods'],['detect','Take out client-only mods'],['loader','Set up the server'],['test','First start']],
   vanilla:[['read','Get ready'],['loader','Download Minecraft'],['test','First start']],
   fix:[['read','Read the log'],['diagnose','Find the cause'],['repair','Fix it'],['test','Start the server']]};
-var cursor=0,polling=false,fails=0,todos=[],todoMode=false,stageKey='build';
-function startProgress(kind,srcType){S.jobKind=kind;stageKey=kind==='fix'?'fix':(srcType==='vanilla'?'vanilla':'build');cursor=0;todos=[];todoMode=false;$('#feed').textContent='';
+var cursor=0,polling=false,fails=0,todos=[],todoMode=false,stageKey='build',jobPct=0,jobStage='',doneJob=null;
+function jobName(){var s=S.servers.filter(function(x){return x.id===S.jobSid})[0];return s?s.name:(S.jobName||'')}
+function paintJobPill(){var p=$('#job-pill');if(!p)return;p.className='running-pill job';
+  if(polling){p.hidden=S.view==='build';var n=jobName();p.lastElementChild.textContent=(S.jobKind==='fix'?'Fixing':'Setting up')+(n?' '+n:'')+(jobPct?' \u00b7 '+jobPct+'%':'');p.title='Show progress';p.onclick=function(){go('build')};return}
+  if(doneJob&&S.view!=='build'){var r=doneJob.result||{},bad=doneJob.state==='error'||r.ok===false;p.classList.add(bad?'bad':'ready');p.hidden=false;
+    p.lastElementChild.textContent=r.cancelled?'Setup stopped':doneJob.state==='error'?'Setup didn\u2019t finish':bad?'Needs a fix':(S.jobKind==='fix'?'Fixed':'Server ready');p.title='Show the result';
+    p.onclick=function(){var d=doneJob;doneJob=null;go('build');showResult(d)};return}
+  p.hidden=true}
+function startProgress(kind,srcType){S.jobKind=kind;stageKey=kind==='fix'?'fix':(srcType==='vanilla'?'vanilla':'build');cursor=0;todos=[];todoMode=false;jobPct=0;jobStage='';doneJob=null;$('#feed').textContent='';$('#b-skip').hidden=true;
   $('#b-result').hidden=true;$('.progress').hidden=false;$('#b-title').textContent=kind==='fix'?'Fixing your server':'Setting up your server';
   var tr=$('#b-track');tr.textContent='';STAGES[stageKey].forEach(function(s){var d=el('div','st');var dd=el('span','d');dd.appendChild(icon('check'));d.appendChild(dd);d.appendChild(el('span',null,s[1]));tr.appendChild(d)});
   var st=$('#b-stop');st.disabled=false;st.lastElementChild.textContent='Stop';paintStage('',null,'running');go('build');if(!polling){polling=true;fails=0;pollJob()}}
@@ -6200,6 +6305,7 @@ var NOW={read:{build:'Reading the modpack',vanilla:'Getting ready',fix:'Reading 
 function paintStage(stage,dl,state){var ids=STAGES[stageKey].map(function(x){return x[0]}),i=ids.indexOf(stage);
   $$('#b-track .st').forEach(function(n,k){n.className='st'+(state==='done'?' done':state==='error'&&k===Math.max(i,0)?' bad':k<i?' done':k===i?' on':'')});
   var frac=stage==='mods'&&dl&&dl[1]?dl[0]/dl[1]:0,p=state==='done'?1:(i<0?.03:(i+frac)/ids.length),bar=$('#b-bar');
+  jobPct=Math.round(p*100);jobStage=stage;var sk=$('#b-skip');sk.hidden=!(state==='running'&&stage==='test'&&S.jobKind!=='fix');
   bar.classList.toggle('ind',state==='running'&&(stage==='test'||stage===''));bar.firstElementChild.style.setProperty('--p',Math.max(3,p*100)+'%');
   var n=NOW[stage];if(n&&typeof n==='object')n=n[stageKey]||n.build;$('#b-now').textContent=state==='running'?(n||'Getting started')+(stage==='mods'&&dl?' ('+dl[0]+' of '+dl[1]+')':''):''}
 function feedLine(t){var m;if(!t.trim()||/^={5,}/.test(t)||/^\s+\d+\/\d+ done$/.test(t))return null;
@@ -6214,17 +6320,24 @@ function feedLine(t){var m;if(!t.trim()||/^={5,}/.test(t)||/^\s+\d+\/\d+ done$/.
 function ev(tone,ic,title,detail){var n=el('div','ev '+tone),b=el('span','b');b.appendChild(icon(ic));n.appendChild(b);var t=el('div','t');t.appendChild(document.createTextNode(title));if(detail)t.appendChild(el('small',null,detail));n.appendChild(t);return n}
 function addFeed(lines){if(!lines.length)return;var feed=$('#feed'),frag=document.createDocumentFragment();lines.forEach(function(l){var n=feedLine(l);if(n)frag.appendChild(n)});
   var near=feed.scrollHeight-feed.scrollTop-feed.clientHeight<80;feed.appendChild(frag);var extra=feed.childElementCount-400;if(extra>0){var r=document.createRange();r.setStartBefore(feed.firstChild);r.setEndAfter(feed.children[extra-1]);r.deleteContents()}if(near)feed.scrollTop=feed.scrollHeight}
-function pollJob(){api('/api/events?since='+cursor).then(function(d){fails=0;cursor=d.next;addFeed(d.lines);
-  if(d.state==='running'||d.state==='idle'){paintStage(d.stage,d.dl,'running');setTimeout(pollJob,document.hidden?2000:450)}else{polling=false;finishJob(d)}})
+function pollJob(){api('/api/events?since='+cursor).then(function(d){fails=0;cursor=d.next;addFeed(d.lines);if(d.server_id)S.jobSid=d.server_id;
+  if(d.state==='running'||d.state==='idle'){paintStage(d.stage,d.dl,'running');paintJobPill();setTimeout(pollJob,document.hidden?2000:450)}else{polling=false;finishJob(d)}})
   .catch(function(){if(++fails>8){polling=false;finishJob({state:'error',result:{error:'Lost contact with the app. Open it again to carry on.'}})}else setTimeout(pollJob,1200)})}
+$('#b-leave').onclick=function(){go('home')};
+$('#b-skip').onclick=function(){var b=this;ask('Skip the test start?','The server is already set up. Skipping only means the app won\u2019t check that it starts. You can press Start on its page whenever you like, and \u201cFix it for me\u201d helps if it doesn\u2019t.','Skip the test',false).then(function(ok){if(!ok)return;b.disabled=true;api('/api/skiptest',{}).then(function(){b.hidden=true;b.disabled=false}).catch(function(e){b.disabled=false;toast(e.message,true)})})};
 $('#b-stop').onclick=function(){var b=this;ask('Stop setting up?','The app stops what it\u2019s doing. Anything already downloaded stays in the server folder.','Stop',true).then(function(ok){if(!ok)return;b.disabled=true;b.lastElementChild.textContent='Stopping\u2026';api('/api/cancel',{}).catch(function(){})})};
-function finishJob(d){var r=d.result||{};paintStage(d.stage,d.dl,d.state==='error'?'error':'done');
+function finishJob(d){paintStage(d.stage,d.dl,d.state==='error'?'error':'done');$('#b-skip').hidden=true;loadHome();
+  if(S.view!=='build'){doneJob=d;paintJobPill();var r=d.result||{};
+    toast(r.cancelled?'Setup stopped.':d.state==='error'?'Setting up didn\u2019t finish. Click the button at the top for details.':r.ok===false?(jobName()||'Your server')+' needs a fix first. Click the button at the top.':(jobName()||'Your server')+' is ready!',d.state==='error'||r.ok===false);return}
+  showResult(d)}
+function showResult(d){var r=d.result||{};paintJobPill();
   if(d.state!=='error'&&r.server_id){loadHome().then(function(){S.justMade=r.ok!==false;go('server',r.server_id);if(r.ok===false)setTimeout(function(){selTab('problems')},300);
-    toast(d.kind==='fix'?(r.ok?'Fixed. Your server starts again.':'Some problems still need you. See Health.'):(r.ok===false?'Your server was made, but it needs a fix first.':'Your server is ready!'),r.ok===false)});return}
+    toast(d.kind==='fix'?(r.ok?'Fixed. Your server starts again.':'Some problems still need you. See Health.'):(r.ok===false?'Your server was made, but it needs a fix first.':r.skipped?'Your server is ready. Press Start to play.':'Your server is ready!'),r.ok===false)});return}
   $('.progress').hidden=true;$('#b-result').hidden=false;
   var title,sub;if(r.cancelled){title='Stopped';sub='Nothing else will change. The server folder keeps what was done so far.'}else if(d.state==='error'){title='That didn\u2019t work';sub=r.error||'Something went wrong.'}else{title='Done';sub=''}
   $('#r-title').textContent=title;$('#r-sub').textContent=sub;var td=$('#r-todos');td.textContent='';todos.forEach(function(t){var f=el('div','finding t-warn');f.appendChild(icon('alert'));f.appendChild(el('div',null,t));td.appendChild(f)});
-  $('#r-open').hidden=!r.server_id;$('#r-open').onclick=function(){go('server',r.server_id)};$('#r-title').focus()}
+  var sid=r.server_id||(r.cancelled||d.state==='error'?S.jobSid:null),known=sid&&S.servers.some(function(x){return x.id===sid});
+  $('#r-open').hidden=!known;$('#r-open').onclick=function(){go('server',sid)};$('#r-title').focus()}
 $('#r-home').onclick=function(){go('home')};
 
 /* ---------- server control room ---------- */

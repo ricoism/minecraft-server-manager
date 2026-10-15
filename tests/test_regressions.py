@@ -117,4 +117,38 @@ m.write_start_scripts(d, 256, "java", log)
 bat = (d / "start.bat").read_text(encoding="utf-8")
 assert "-Xms256M -Xmx256M" in bat and "chcp 65001" in bat
 ok("valid memory flags; UTF-8 batch file")
+# 12. a fix that doesn't help is not repeated (the first-start test used to go round in circles)
+d = srv("loop"); (d / "server.jar").write_bytes(b""); fabric(d / "mods/needy.jar", "needy")
+crash = TMP / "crash.py"
+crash.write_text("print(\"- Mod 'Needy' (needy) 1.0 requires any version of cloth-config, which is missing!\", flush=True)\n")
+m.launch_cmd = lambda dd, c: [sys.executable, str(crash)]
+installs = []
+def fake_install(modid, ctx, mods_dir):
+    installs.append(modid); fabric(mods_dir / f"{modid}-{len(installs)}.jar", f"x{len(installs)}"); return "installed", modid
+m.install_dependency = fake_install
+c = m.Ctx("1.20.1", "fabric", log=log, online=True)
+t0 = time.time(); res = m.test_and_fix(d, c, max_attempts=8, timeout=20)
+assert res is False and installs == ["cloth-config"], (res, installs)
+assert any("Already tried" in n for n in c.notes), c.notes
+ok("a fix that didn't help is tried once, then reported instead of looping")
+
+# 13. port already taken: said plainly, no launch attempts
+import socket as _s
+busy = _s.socket(); busy.bind(("0.0.0.0", 0)); busy.listen(1); port = busy.getsockname()[1]
+(d / "server.properties").write_text(f"server-port={port}\n")
+launched = []
+m.launch_cmd = lambda dd, c: launched.append(1) or [sys.executable, "-c", "pass"]
+c = m.Ctx("1.20.1", "fabric", log=log, online=False)
+assert m.test_and_fix(d, c, max_attempts=3, timeout=5) is False and not launched
+assert any(f"Port {port}" in n for n in c.notes); busy.close()
+ok("a busy port is caught before launching")
+
+# 14. "Skip the test" ends the first start without failing the build
+d = srv("skip"); (d / "server.jar").write_bytes(b"")
+slow = TMP / "slow.py"; slow.write_text("import time\nwhile True:\n    print('loading', flush=True); time.sleep(0.2)\n")
+m.launch_cmd = lambda dd, c: [sys.executable, str(slow)]
+threading.Timer(1.5, m.SKIP_TEST.set).start()
+t0 = time.time(); r = m.test_and_fix(d, m.Ctx("1.20.1", "vanilla", log=log, online=False), max_attempts=3, timeout=60)
+assert r is None and time.time() - t0 < 10, r
+ok("skipping the test start returns quickly and keeps the server")
 print("ALL REGRESSION TESTS PASSED")
