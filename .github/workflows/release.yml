@@ -1,0 +1,142 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+    branches: [main]
+    paths: ["CHANGELOG.md"]          # a new "## X.Y.Z" entry on main publishes that version
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. 3.1.0 (creates tag v3.1.0 on this commit)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.p.outputs.tag }}
+      go: ${{ steps.p.outputs.go }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: p
+        name: Decide what to release
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            V="${{ inputs.version }}"; TAG="v${V#v}"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            V=$(grep -m1 -oE '^##[[:space:]]+\[?v?[0-9]+\.[0-9]+\.[0-9]+' CHANGELOG.md | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
+            if [ -z "$V" ]; then echo "No version entry in CHANGELOG.md"; echo "go=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+            TAG="v$V"
+            if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+              echo "$TAG is already released; nothing to do."; echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+          fi
+          echo "Releasing $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "go=true" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: plan
+    if: needs.plan.outputs.go == 'true'
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      MSB_SOURCE: ${{ github.workspace }}/modpack_server_builder.py
+      PYTHONUTF8: "1"
+    steps:
+      - name: Require the signing key
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -z "$UPDATE_SIGNING_KEY" ]; then
+            echo "::error::Repository secret UPDATE_SIGNING_KEY is not set; releases must be signed."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Work out the tag
+        id: tag
+        run: |
+          TAG="${{ needs.plan.outputs.tag }}"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            # actions/checkout can turn annotated tags into lightweight ones; fetch the real tag object
+            git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install PyInstaller
+        run: python -m pip install --disable-pip-version-check pyinstaller==6.22.3
+
+      - name: Set version
+        id: ver
+        run: |
+          VERSION=$(python tools/set_version.py "${{ steps.tag.outputs.tag }}")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          grep -n '^APP_VERSION = ' modpack_server_builder.py
+
+      - name: Tests
+        run: |
+          python -m py_compile modpack_server_builder.py
+          # The full suite runs in ci.yml; here, check what signing and the updater depend on.
+          for t in tests/test_updater.py tests/test_release_tools.py; do
+            echo "::group::$t"
+            python -I "$t" || exit 1
+            echo "::endgroup::"
+          done
+
+      - name: Build
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed --name "ModpackServerBuilder"
+          --icon assets/app.ico --version-file build/version_info.txt
+          --add-binary "vendor/webview.dll;."
+          --exclude-module tkinter --exclude-module unittest --exclude-module pydoc
+          modpack_server_builder.py
+
+      - name: Checksums and signature
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          cp dist/ModpackServerBuilder.exe dist/ModpackServerBuilder-Setup.exe
+          python tools/write_sums.py --version "${{ steps.ver.outputs.version }}" --out dist/SHA256SUMS \
+            dist/ModpackServerBuilder-Setup.exe dist/ModpackServerBuilder.exe
+          python tools/release_sign.py dist/SHA256SUMS
+          (cd dist && sha256sum -c SHA256SUMS)
+
+      - name: Release notes
+        run: python tools/release_notes.py "${{ steps.tag.outputs.tag }}" --out build/release_notes.md
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            WHERE=(--verify-tag)
+          else
+            WHERE=(--target "$GITHUB_SHA")         # creates the tag on this commit
+          fi
+          # Create as a draft and publish once every asset is uploaded, so the app never sees a half release.
+          gh release create "$TAG" "${WHERE[@]}" --draft \
+            --title "Modpack Server Builder ${{ steps.ver.outputs.version }}" \
+            --notes-file build/release_notes.md \
+            dist/ModpackServerBuilder-Setup.exe dist/ModpackServerBuilder.exe dist/SHA256SUMS dist/SHA256SUMS.sig
+          gh release edit "$TAG" --draft=false --latest

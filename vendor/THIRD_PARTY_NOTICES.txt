@@ -1,0 +1,4 @@
+webview.dll - built from webview/webview 0.12.0 (https://github.com/webview/webview), MIT License,
+Copyright (c) 2017 Serge Zaitsev, (c) 2022 Steffen Andre Langnes. Compiled with llvm-mingw against
+Microsoft's WebView2 SDK header 1.0.1150.38 (BSD-style license, Copyright (C) Microsoft Corporation).
+The app is bundled with PyInstaller 6.22.3 (GPL with a bootloader exception) and CPython 3.13.

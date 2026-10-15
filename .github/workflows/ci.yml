@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      MSB_SOURCE: ${{ github.workspace }}/modpack_server_builder.py
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Compile
+        run: python -m py_compile modpack_server_builder.py tools/*.py tests/*.py
+
+      - name: Tests
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then T="tests/test_updater.py tests/test_release_tools.py tests/test_regressions.py"; else T=$(ls tests/test_*.py); fi
+          for t in $T; do
+            echo "::group::$t"
+            python -I "$t" || exit 1
+            echo "::endgroup::"
+          done
