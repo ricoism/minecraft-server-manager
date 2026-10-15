@@ -256,7 +256,7 @@ class TestCheck(Base):
         info = M.check_for_update()
         self.assertEqual(info["version"], "9.0.0")
         self.assertEqual(info["notes"], "Fixed things.")
-        self.assertTrue(info["setup_url"].endswith("/ModpackServerBuilder-Setup.exe"))
+        self.assertTrue(info["setup_url"].endswith("/MinecraftServerManager-Setup.exe"))
         self.assertTrue(info["sums_url"].endswith("/SHA256SUMS"))
         self.assertTrue(info["sig_url"].endswith("/SHA256SUMS.sig"))
         self.assertGreater(info["size"], 0)
@@ -303,14 +303,14 @@ class TestDownload(Base):
         exe = self.gh.publish("v9.0.0")
         seen = []
         path = M.download_update(M.check_for_update(), progress=seen.append)
-        self.assertEqual(path, M.app_data_dir() / "updates" / "9.0.0" / "ModpackServerBuilder-Setup.exe")
+        self.assertEqual(path, M.app_data_dir() / "updates" / "9.0.0" / "MinecraftServerManager-Setup.exe")
         self.assertEqual(path.read_bytes(), exe)
         self.assertTrue(seen and seen[-1] == 1.0 and all(0 <= f <= 1 for f in seen))
         self.assertEqual(sorted(p.name for p in path.parent.iterdir()),
-                         ["ModpackServerBuilder-Setup.exe", "SHA256SUMS", "SHA256SUMS.sig", "update.json"])
+                         ["MinecraftServerManager-Setup.exe", "SHA256SUMS", "SHA256SUMS.sig", "update.json"])
         # a second call re-verifies the cached exe instead of downloading it again
         M.download_update(M.check_for_update())
-        self.assertEqual(self.gh.hit_count("/ModpackServerBuilder-Setup.exe"), 1)
+        self.assertEqual(self.gh.hit_count("/MinecraftServerManager-Setup.exe"), 1)
 
     def assert_rejected(self, msg_part=None):
         info = M.check_for_update()
@@ -325,7 +325,7 @@ class TestDownload(Base):
         sums = make_sums("9.0.0", {M.UPDATE_SETUP_ASSET: b"evil"})
         self.gh.publish("v9.0.0", exe=b"evil", sums=sums, sig=sign_hex(sums, OTHER_SEED))
         self.assert_rejected("signature")
-        self.assertEqual(self.gh.hit_count("/ModpackServerBuilder-Setup.exe"), 0)    # never fetched
+        self.assertEqual(self.gh.hit_count("/MinecraftServerManager-Setup.exe"), 0)    # never fetched
         self.gh.publish("v9.0.0", sig=b"zz-not-hex")
         self.assert_rejected("signature")
         good = make_sums("9.0.0", {M.UPDATE_SETUP_ASSET: b"x"})
@@ -458,10 +458,10 @@ class TestAutoUpdater(Base):
                 ap.assert_called_once()
                 self.assertEqual(Path(ap.call_args[0][0]).read_bytes(), exe)
             # a later check finding the same version keeps "ready" and downloads nothing
-            n = self.gh.hit_count("/ModpackServerBuilder-Setup.exe")
+            n = self.gh.hit_count("/MinecraftServerManager-Setup.exe")
             u._cycle()
             self.assertEqual(u.status()["state"], "ready")
-            self.assertEqual(self.gh.hit_count("/ModpackServerBuilder-Setup.exe"), n)
+            self.assertEqual(self.gh.hit_count("/MinecraftServerManager-Setup.exe"), n)
         finally:
             u.stop()
 
@@ -515,7 +515,7 @@ class TestAutoUpdater(Base):
 class TestFinishUpdate(Base):
     def setUp(self):
         super().setUp()
-        self.new_exe = TMP / "updates_src" / "ModpackServerBuilder-Setup.exe"
+        self.new_exe = TMP / "updates_src" / "MinecraftServerManager-Setup.exe"
         self.new_exe.parent.mkdir(parents=True, exist_ok=True)
         self.new_exe.write_bytes(b"NEW VERSION " * 5000)
         self.spawned = []

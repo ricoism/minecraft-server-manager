@@ -11,6 +11,12 @@ How to write an entry (for whoever makes the next update):
   * One short sentence per line. Bold the thing they'll look for, e.g. **Fix it for me**.
 -->
 
+## 3.5.0 - October 15, 2026
+
+### Better
+- **One download, clearly named.** The downloads page now has a single installer, **MinecraftServerManager-Setup.exe**. The extra copies under the old name and the separate "portable" version are gone.
+- Updates now use the new installer name too. If you're on an older version, it still updates automatically as usual.
+
 ## 3.4.0 - October 15, 2026
 
 ### New

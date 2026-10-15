@@ -3154,7 +3154,7 @@ def recommended_ram_mb(server_dir_or_mod_count, system_mb) -> int:
 # Self-update: signed releases from GitHub
 # ============================================================================
 #
-# A release (tag vX.Y.Z) carries ModpackServerBuilder-Setup.exe, ModpackServerBuilder.exe, SHA256SUMS
+# A release (tag vX.Y.Z) carries MinecraftServerManager-Setup.exe, SHA256SUMS
 # and SHA256SUMS.sig (hex Ed25519 signature over the exact bytes of SHA256SUMS). The first line of
 # SHA256SUMS is "# ModpackServerBuilder X.Y.Z" so an old signed list can't be replayed under a newer
 # tag (sha256sum -c ignores "#" lines). Nothing is trusted until the signature checks out against
@@ -3168,7 +3168,8 @@ def recommended_ram_mb(server_dir_or_mod_count, system_mb) -> int:
 UPDATE_REPO = "ricoism/minecraft-server-manager"
 GITHUB_API = "https://api.github.com"
 UPDATE_PUBKEY = "bc5632337815cc7be10d669f2a77a72cf14ca90256608db0a429b4bbbbe1f9ef"   # Ed25519, release signing
-UPDATE_SETUP_ASSET = "ModpackServerBuilder-Setup.exe"
+UPDATE_SETUP_ASSET = "MinecraftServerManager-Setup.exe"
+LEGACY_SETUP_ASSET = "ModpackServerBuilder-Setup.exe"    # the name copies before 3.5 download (kept on releases for a while)
 UPDATE_SUMS_ASSET = "SHA256SUMS"
 UPDATE_SIG_ASSET = "SHA256SUMS.sig"
 UPDATE_CHECK_INTERVAL = 6 * 3600
@@ -3617,7 +3618,7 @@ def _cleanup_leftovers(folder=None, min_age=300):
             return
         folder = Path(sys.executable).parent
     names = {Path(sys.executable).name, f"{APP_NAME}.exe", f"{LEGACY_NAME}.exe", "ModpackServerBuilder.exe",
-             UPDATE_SETUP_ASSET}
+             UPDATE_SETUP_ASSET, LEGACY_SETUP_ASSET}
     now = time.time()
     try:
         for f in Path(folder).iterdir():
