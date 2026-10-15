@@ -548,7 +548,7 @@ class TestFinishUpdate(Base):
         (M.updates_dir() / "99.0.0").mkdir(parents=True)
         patch, state = self.locked_replace(target, 5)
         regs = []
-        with patch, mock.patch.object(M, "register_uninstaller", regs.append, create=True):
+        with patch, mock.patch.object(M, "refresh_shell_icons", regs.append, create=True):
             self.assertTrue(M.finish_update_mode(target, source=self.new_exe))
         self.assertEqual(state["fails"], 5)
         self.assertEqual(target.read_bytes(), self.new_exe.read_bytes())
@@ -565,7 +565,7 @@ class TestFinishUpdate(Base):
         (target.parent / "install.json").write_text(json.dumps({"version": "1.0.0", "shortcuts": ["a.lnk"]}))
         regs = []
         patch, _ = self.locked_replace(target, 2)
-        with patch, mock.patch.object(M, "register_uninstaller", regs.append, create=True), \
+        with patch, mock.patch.object(M, "refresh_shell_icons", regs.append, create=True), \
                 mock.patch.object(M, "IS_WIN", True):
             self.assertTrue(M.finish_update_mode(str(target), source=self.new_exe))
         self.assertEqual(regs, [target])

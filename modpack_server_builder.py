@@ -3286,8 +3286,20 @@ def ed25519_verify(pub: bytes, msg: bytes, sig: bytes) -> bool:
 # ---- helpers -------------------------------------------------------------------------------
 
 def _ulog(msg):
+    """Updater/installer diary: stderr, plus update.log in the app's data folder (the .exe has no console)."""
+    line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}"
     try:
-        print(f"[update] {msg}", file=sys.stderr, flush=True)
+        if sys.stderr:
+            print(f"[update] {line}", file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        f = app_data_dir() / "update.log"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        if f.is_file() and f.stat().st_size > 256 * 1024:
+            f.replace(f.with_suffix(".log.old"))
+        with open(f, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
     except Exception:  # noqa: BLE001
         pass
 
@@ -3327,6 +3339,8 @@ def _updates_enabled() -> bool:
 
 def _same_path(a, b) -> bool:
     try:
+        if os.path.exists(a) and os.path.exists(b):
+            return os.path.samefile(a, b)          # same file even when spelled differently (8.3 names, drives)
         return os.path.normcase(str(Path(a).resolve())) == os.path.normcase(str(Path(b).resolve()))
     except OSError:
         return False
@@ -3649,10 +3663,11 @@ def finish_update_mode(target, source=None, wait=90.0) -> bool:
                 except Exception:  # noqa: BLE001
                     pass
         time.sleep(_FINISH_RETRY_DELAY)
+    _ulog(f"finish-update: replaced {target} (installed copy: {_same_path(target, installed_exe())})")
     if _same_path(target, installed_exe()):
         try:
             if IS_WIN:
-                register_uninstaller(target)         # Installed apps shows the new version
+                refresh_shell_icons(target)          # new icon everywhere + Installed apps shows the new version
             info = target.parent / "install.json"
             if info.is_file():
                 d = json.loads(info.read_text(encoding="utf-8"))
@@ -5128,7 +5143,7 @@ def _com_method(ptr, index, *argtypes):
     return lambda *a: fn(ptr, *a)
 
 
-def _shell_link(lnk: str, exe: Path):
+def _shell_link(lnk: str, exe: Path, icon=None):
     """Create a .lnk with IShellLinkW (and stamp our AppUserModelID so the taskbar groups correctly)."""
     ole32 = ctypes.windll.ole32
     ole32.CoInitialize(None)
@@ -5142,7 +5157,7 @@ def _shell_link(lnk: str, exe: Path):
         _com_method(psl, 20, W)(str(exe))                                  # SetPath
         _com_method(psl, 9, W)(str(exe.parent))                            # SetWorkingDirectory
         _com_method(psl, 7, W)("Build Minecraft servers from modpacks")    # SetDescription
-        _com_method(psl, 17, W, ctypes.c_int)(str(exe), 0)                 # SetIconLocation
+        _com_method(psl, 17, W, ctypes.c_int)(str(icon or exe), 0)         # SetIconLocation
         try:   # IPropertyStore -> System.AppUserModel.ID
             pps = ctypes.c_void_p()
             _com_method(psl, 0, ctypes.c_void_p, ctypes.c_void_p)(
@@ -5170,7 +5185,7 @@ def _shell_link(lnk: str, exe: Path):
         _com_method(psl, 2)()
 
 
-def make_shortcuts(exe: Path, desktop=True):
+def make_shortcuts(exe: Path, desktop=True, icon=None):
     """Start menu (and desktop) shortcuts. -> list of created .lnk paths"""
     targets = [known_folder(FOLDER_PROGRAMS)] + ([known_folder(FOLDER_DESKTOP)] if desktop else [])
     made = []
@@ -5178,7 +5193,7 @@ def make_shortcuts(exe: Path, desktop=True):
         for folder in targets:
             if folder:
                 lnk = os.path.join(folder, APP_NAME + ".lnk")
-                _shell_link(lnk, exe)
+                _shell_link(lnk, exe, icon)
                 if os.path.isfile(lnk):
                     made.append(lnk)
         if made and len(made) == len([t for t in targets if t]):
@@ -5221,12 +5236,96 @@ def _shortcuts_via_script(exe: Path, desktop=True):
         shutil.rmtree(vbs.parent, ignore_errors=True)
 
 
-def register_uninstaller(exe: Path):
+# ---- keeping the icon fresh after an update ----------------------------------------------------
+# Windows caches icons by file path. An update replaces the exe at the same path, so shortcuts, pinned taskbar
+# buttons and Installed apps kept showing the old icon. Each version therefore writes its icon to a new file
+# (icons/app-<version>.ico), points every shortcut at it, and tells Explorer to redraw.
+
+def write_versioned_icon(folder: Path):
+    src = resource_path("app.ico")
+    if not src.is_file():
+        return None
+    d = Path(folder) / "icons"
+    d.mkdir(parents=True, exist_ok=True)
+    dst = d / f"app-{APP_VERSION}.ico"
+    if not dst.is_file() or dst.stat().st_size != src.stat().st_size:
+        shutil.copyfile(src, dst)
+    for old in d.glob("app-*.ico"):
+        if old != dst:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    return dst
+
+
+def pinned_taskbar_dir():
+    a = os.environ.get("APPDATA")
+    return Path(a) / "Microsoft" / "Internet Explorer" / "Quick Launch" / "User Pinned" / "TaskBar" if a else None
+
+
+def refresh_shell_icons(exe: Path):
+    """Re-point shortcuts (Start menu, desktop if present, pinned taskbar) at this version's icon. -> icon path"""
+    icon = None
+    try:
+        icon = write_versioned_icon(exe.parent)
+    except Exception as e:  # noqa: BLE001
+        _ulog(f"icons: couldn't write the icon file: {e!r}")
+    _ulog(f"icons: refreshing shortcuts for {exe} (icon {icon})")
+    links = []
+    for folder, always in ((known_folder(FOLDER_PROGRAMS), True), (known_folder(FOLDER_DESKTOP), False),
+                           (pinned_taskbar_dir(), False)):
+        if not folder:
+            continue
+        lnk = os.path.join(str(folder), APP_NAME + ".lnk")
+        if always or os.path.isfile(lnk):
+            try:
+                _shell_link(lnk, exe, icon)
+                links.append(lnk)
+            except Exception:  # noqa: BLE001
+                pass
+    try:
+        register_uninstaller(exe, icon)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        info = exe.parent / "install.json"
+        d = json.loads(info.read_text(encoding="utf-8")) if info.is_file() else {}
+        d["icons"] = APP_VERSION
+        write_file(info, json.dumps(d, indent=1))
+    except Exception:  # noqa: BLE001
+        pass
+    try:   # SHCNE_ASSOCCHANGED + SHCNF_FLUSH: Explorer drops its cached icons and redraws
+        ctypes.windll.shell32.SHChangeNotify(0x08000000, 0x1000, None, None)
+    except Exception:  # noqa: BLE001
+        pass
+    return icon
+
+
+def refresh_icons_if_needed():
+    """Installed copy started after an update: make sure Windows shows this version's icon."""
+    if not (IS_WIN and is_frozen()):
+        return
+    exe = Path(sys.executable)
+    try:
+        if not _same_path(exe, installed_exe()):
+            _ulog(f"icons: not the installed copy ({exe} vs {installed_exe()})")
+            return
+        info = exe.parent / "install.json"
+        d = json.loads(info.read_text(encoding="utf-8")) if info.is_file() else {}
+        if d.get("icons") == APP_VERSION:
+            return
+    except Exception:  # noqa: BLE001
+        return
+    threading.Thread(target=refresh_shell_icons, args=(exe,), daemon=True).start()
+
+
+def register_uninstaller(exe: Path, icon=None):
     import winreg
     size_kb = max(1, exe.stat().st_size // 1024)
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY) as k:
         for name, val in (("DisplayName", APP_NAME), ("DisplayVersion", APP_VERSION), ("Publisher", APP_NAME),
-                          ("DisplayIcon", f"{exe},0"), ("InstallLocation", str(exe.parent)),
+                          ("DisplayIcon", f"{icon or exe},0"), ("InstallLocation", str(exe.parent)),
                           ("UninstallString", f'"{exe}" --uninstall'),
                           ("QuietUninstallString", f'"{exe}" --uninstall --quiet'),
                           ("InstallDate", datetime.now().strftime("%Y%m%d"))):
@@ -5255,9 +5354,19 @@ def install_app(desktop=True) -> Path:
         else:
             tmp.unlink(missing_ok=True)
             raise RuntimeError("Modpack Server Builder is still open. Close it and try again.")
-    links = make_shortcuts(dst, desktop)
-    register_uninstaller(dst)
-    write_file(dst.parent / "install.json", json.dumps({"version": APP_VERSION, "shortcuts": links}, indent=1))
+    icon = None
+    try:
+        icon = write_versioned_icon(dst.parent)
+    except OSError:
+        pass
+    links = make_shortcuts(dst, desktop, icon)
+    register_uninstaller(dst, icon)
+    write_file(dst.parent / "install.json", json.dumps({"version": APP_VERSION, "shortcuts": links,
+                                                        "icons": APP_VERSION}, indent=1))
+    try:
+        ctypes.windll.shell32.SHChangeNotify(0x08000000, 0x1000, None, None)
+    except Exception:  # noqa: BLE001
+        pass
     save_settings({"desktop_shortcut": bool(desktop)})
     return dst
 
@@ -5405,6 +5514,7 @@ def run_web(port=0, open_browser=True, app_window=True, browser=None, browser_ar
     print(f"{APP_NAME} is running at: {url}", flush=True)
     dark = theme_is_dark(load_settings().get("theme"))
     if mode == "app":
+        refresh_icons_if_needed()
         try:
             app.updater = AutoUpdater()
             app.updater.start()

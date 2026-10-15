@@ -108,6 +108,7 @@ jobs:
           pyinstaller --noconfirm --clean --onefile --windowed --name "ModpackServerBuilder"
           --icon assets/app.ico --version-file build/version_info.txt
           --add-binary "vendor/webview.dll;."
+          --add-data "assets/app.ico;."
           --exclude-module tkinter --exclude-module unittest --exclude-module pydoc
           modpack_server_builder.py
 

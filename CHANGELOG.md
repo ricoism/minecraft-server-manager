@@ -11,6 +11,11 @@ How to write an entry (for whoever makes the next update):
   * One short sentence per line. Bold the thing they'll look for, e.g. **Fix it for me**.
 -->
 
+## 3.1.2 - October 15, 2026
+
+### Fixed
+- **The taskbar showed the old app icon after updating.** Windows remembers icons, so the taskbar, the Start menu, desktop shortcuts and Installed apps kept the old one. They now all show the grass-block icon, including a taskbar button you've pinned. It can take a few seconds to change after the update.
+
 ## 3.1.1 - October 15, 2026
 
 ### New
