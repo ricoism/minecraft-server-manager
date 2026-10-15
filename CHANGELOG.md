@@ -17,6 +17,9 @@ How to write an entry (for whoever makes the next update):
 - **One download, clearly named.** The downloads page now has a single installer, **MinecraftServerManager-Setup.exe**. The extra copies under the old name and the separate "portable" version are gone.
 - Updates now use the new installer name too. If you're on an older version, it still updates automatically as usual.
 
+### Please note
+- **On version 3.4 or older? Open the app before November 15, 2026** so it can update itself. After that date, older versions can't find updates on their own. If you miss it, just download the installer again from the [download page](https://github.com/ricoism/minecraft-server-manager/releases/latest) and run it. Your servers and settings are kept.
+
 ## 3.4.0 - October 15, 2026
 
 ### New

@@ -6,6 +6,10 @@ No knowledge of servers, Java or coding needed.
 **[Download for Windows](https://github.com/ricoism/minecraft-server-manager/releases/latest/download/MinecraftServerManager-Setup.exe)**
 · [What's new](CHANGELOG.md)
 
+> **Using version 3.4 or older?** Open the app before **November 15, 2026** so it can update itself.
+> After that date, older versions can't find updates on their own anymore. Just download the installer again
+> from the link above and run it. Your servers and settings are kept.
+
 https://github.com/user-attachments/assets/753af1eb-c239-4ea4-938b-2ffd6bcdaaf8
 
 ## Using it
