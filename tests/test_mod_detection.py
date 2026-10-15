@@ -1,4 +1,4 @@
-import json, os, sys, tempfile, zipfile, textwrap, hashlib
+import json, os, sys, tempfile, zipfile, textwrap
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(os.environ.get("MSB_SOURCE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "modpack_server_builder.py"))))

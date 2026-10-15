@@ -1,4 +1,3 @@
-import os, sys
 """Regression tests for the bugs found by the independent audits."""
 import json, os, sys, tempfile, threading, time, zipfile
 from pathlib import Path
