@@ -151,4 +151,32 @@ threading.Timer(1.5, m.SKIP_TEST.set).start()
 t0 = time.time(); r = m.test_and_fix(d, m.Ctx("1.20.1", "vanilla", log=log, online=False), max_attempts=3, timeout=60)
 assert r is None and time.time() - t0 < 10, r
 ok("skipping the test start returns quickly and keeps the server")
+# 15. Forge's user_jvm_args.txt examples ("# -Xmx3G") aren't mistaken for the real memory setting
+d = srv("forgemem"); (d / "user_jvm_args.txt").write_text("# For example, to set the maximum to 3GB: -Xmx3G\n# -Xmx4G\n-Xms4G\n-Xmx10G\n")
+assert m.read_ram_mb(d) == 10240, m.read_ram_mb(d)
+(d / "user_jvm_args.txt").write_text("# -Xmx4G\n"); m.save_state(d, m.Ctx("1.20.1", "forge", log=log), "My Pack")
+c = m.Ctx("1.20.1", "forge", log=log); c.ram_mb = 7168; m.save_state(d, c)
+assert m.read_ram_mb(d) == 7168 and json.loads((d / m.STATE_FILE).read_text())["pack"] == "My Pack"
+ok("memory is read from real settings only, and changing it keeps the modpack name")
+
+# 16. server icons: only real PNGs of the right size are accepted
+import base64, struct as _st, zlib as _z
+def _png(w, h):
+    raw = b"".join(b"\x00" + b"\x10\x20\x30" * w for _ in range(h))
+    ch = lambda t, dd: _st.pack(">I", len(dd)) + t + dd + _st.pack(">I", _z.crc32(t + dd) & 0xffffffff)
+    return "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\n" + ch(b"IHDR", _st.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + ch(b"IDAT", _z.compress(raw)) + ch(b"IEND", b"")).decode()
+d = srv("icon"); (d / "server.jar").write_bytes(b""); rec = m.add_server(d, "Icon test")
+for bad in ("not base64!!", "data:image/png;base64," + base64.b64encode(b"GIF89a....").decode()):
+    try:
+        m.set_server_icon(rec["id"], bad); raise AssertionError("accepted a bad picture")
+    except ValueError:
+        pass
+try:
+    m.set_server_icon(rec["id"], _png(256, 256), _png(32, 32)); raise AssertionError("accepted a wrong-size game icon")
+except ValueError:
+    pass
+r = m.set_server_icon(rec["id"], _png(256, 256), _png(64, 64))
+assert r["icon"].startswith("local:") and (d / "server-icon.png").is_file() and m.server_icon_bytes(r, "app")
+r = m.reset_server_icon(rec["id"]); assert r["icon"] == "" and not (d / "server-icon.png").exists()
+ok("custom icons: bad files are refused; saving and resetting work")
 print("ALL REGRESSION TESTS PASSED")

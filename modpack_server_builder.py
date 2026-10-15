@@ -479,6 +479,11 @@ class Ctx:
 
 
 def save_state(server_dir: Path, ctx: Ctx, pack_name=""):
+    if not pack_name:                       # keep the modpack name when only memory/Java changes
+        try:
+            pack_name = json.loads((server_dir / STATE_FILE).read_text(encoding="utf-8")).get("pack", "")
+        except Exception:  # noqa: BLE001
+            pass
     d = {"pack": pack_name, "mc": ctx.mc, "loader": ctx.loader, "loader_ver": ctx.loader_ver,
          "ram_mb": ctx.ram_mb, "java_script": ctx.java_script}
     try:
@@ -1262,12 +1267,23 @@ def launch_spec(server_dir: Path):
 
 
 def read_ram_mb(server_dir: Path) -> int:
+    """The server's memory limit. Comment lines are skipped: Forge's user_jvm_args.txt is full of examples
+    like "# -Xmx3G" that aren't the real setting. The last -Xmx wins, as it does for Java."""
     for f in ("user_jvm_args.txt", "start.sh"):
         p = server_dir / f
         if p.exists():
-            m = re.search(r"-Xmx(\d+)([MmGg])", p.read_text(encoding="utf-8", errors="ignore"))
-            if m:
-                return int(m.group(1)) * (1024 if m.group(2).upper() == "G" else 1)
+            text = "\n".join(l for l in p.read_text(encoding="utf-8", errors="ignore").splitlines()
+                             if not l.lstrip().startswith("#"))
+            found = re.findall(r"-Xmx(\d+)([MmGg])", text)
+            if found:
+                n, u = found[-1]
+                return int(n) * (1024 if u.upper() == "G" else 1)
+    try:
+        mb = int(json.loads((server_dir / STATE_FILE).read_text(encoding="utf-8")).get("ram_mb") or 0)
+        if mb:
+            return mb
+    except Exception:  # noqa: BLE001
+        pass
     return 4096
 
 
@@ -3899,13 +3915,17 @@ def update_server(sid: str, **fields) -> dict:
         servers = list_servers()
         for s in servers:
             if s["id"] == sid:
-                s.update({k: v for k, v in fields.items() if k in ("name", "icon", "mc", "loader", "pack", "setup")})
+                s.update({k: v for k, v in fields.items() if k in ("name", "icon", "mc", "loader", "pack", "setup", "pack_icon")})
                 save_settings({"servers": [{k: v for k, v in x.items() if k != "missing"} for x in servers]})
                 return s
     raise ValueError("That server isn't in your list any more.")
 
 
 def remove_server(sid: str):
+    try:
+        (app_data_dir() / "icons" / f"{sid}.png").unlink()
+    except OSError:
+        pass
     with _SERVERS_LOCK:
         servers = [s for s in list_servers() if s["id"] != sid]
         save_settings({"servers": [{k: v for k, v in x.items() if k != "missing"} for x in servers]})
@@ -4056,6 +4076,89 @@ def create_server(job, b: dict):
                skipped=res.test_ok is None and test)
 
 
+# ---- custom server icons ---------------------------------------------------------------------
+# The page crops the picture (canvas) into a 256 px PNG for the app and a 64 px PNG for Minecraft's
+# server list (server-icon.png). Here we only check and store them.
+
+PNG_SIG = b"\x89PNG\r\n\x1a\n"
+
+
+def icon_store() -> Path:
+    return app_data_dir() / "icons"
+
+
+def _png_from_b64(data, limit, want=None) -> bytes:
+    import base64 as _b64
+    try:
+        raw = _b64.b64decode(str(data or "").split(",")[-1], validate=True)
+    except Exception:  # noqa: BLE001
+        raise ValueError("That picture couldn't be read. Try a .png or .jpg file.")
+    if not raw.startswith(PNG_SIG) or len(raw) > limit or raw[12:16] != b"IHDR":
+        raise ValueError("That picture couldn't be used. Try a different .png or .jpg file.")
+    w, h = int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")
+    if want and (w, h) != (want, want):
+        raise ValueError("That picture couldn't be used. Try a different file.")
+    return raw
+
+
+def set_server_icon(sid: str, app_png_b64, game_png_b64=None) -> dict:
+    s = get_server(sid)
+    big = _png_from_b64(app_png_b64, 1 << 20)
+    d = icon_store()
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{sid}.png").write_bytes(big)
+    if game_png_b64:
+        small = _png_from_b64(game_png_b64, 256 * 1024, 64)
+        folder = Path(s["dir"])
+        cur, keep = folder / "server-icon.png", folder / "server-icon.original.png"
+        if cur.is_file() and not keep.exists() and not s.get("icon", "").startswith("local:"):
+            shutil.copy2(cur, keep)                # the modpack's own icon, so it can be put back
+        cur.write_bytes(small)
+    extra = {"icon": f"local:{int(time.time())}"}
+    if s.get("icon") and not s["icon"].startswith("local:"):
+        extra["pack_icon"] = s["icon"]             # remember the modpack's icon for "Use the original"
+    return update_server(sid, **extra)
+
+
+def reset_server_icon(sid: str) -> dict:
+    s = get_server(sid)
+    try:
+        (icon_store() / f"{sid}.png").unlink()
+    except OSError:
+        pass
+    folder = Path(s["dir"])
+    keep = folder / "server-icon.original.png"
+    if s.get("icon", "").startswith("local:"):
+        try:
+            if keep.is_file():
+                os.replace(keep, folder / "server-icon.png")
+            else:
+                (folder / "server-icon.png").unlink(missing_ok=True)
+        except OSError:
+            pass
+    return update_server(sid, icon=s.get("pack_icon", ""))
+
+
+def server_icon_bytes(s: dict, src: str):
+    if src == "folder":
+        p = Path(s["dir"]) / "server-icon.png"
+    else:
+        p = icon_store() / f"{s['id']}.png"
+    try:
+        raw = p.read_bytes()
+        return raw if raw.startswith(PNG_SIG) and len(raw) <= (2 << 20) else None
+    except OSError:
+        return None
+
+
+def _with_icon_info(s: dict) -> dict:
+    s = dict(s)
+    try:
+        s["folder_icon"] = (Path(s["dir"]) / "server-icon.png").is_file()
+    except OSError:
+        s["folder_icon"] = False
+    return s
+
 # ---- extra API routes for the app screens -------------------------------------------------------
 
 def _server_state(app, s):
@@ -4095,7 +4198,7 @@ def api_get_extra(h, app, path, q):
     if path == "/api/servers":
         out = []
         for s in list_servers():
-            out.append(dict(s, **_server_state(app, s)))
+            out.append(dict(_with_icon_info(s), **_server_state(app, s)))
         return h._json({"servers": out})
     if path == "/api/modpacks":
         return h._json(modrinth_search_packs(arg("q"), int(arg("offset", "0") or 0)))
@@ -4109,7 +4212,7 @@ def api_get_extra(h, app, path, q):
         s = get_server(arg("id"))
         st = app.runner.status() if app.runner and Path(app.runner.status().get("dir") or "/nonexistent") == Path(s["dir"]) \
             else {"state": "offline", "players": []}
-        return h._json({"server": s, "status": st, "join": join_info(Path(s["dir"]), fetch_public=False),
+        return h._json({"server": _with_icon_info(s), "status": st, "join": join_info(Path(s["dir"]), fetch_public=False),
                         "other_running": bool(app.runner and app.runner.status().get("dir") and
                                               Path(app.runner.status()["dir"]) != Path(s["dir"]) and
                                               app.runner.state in ("starting", "online", "stopping"))})
@@ -4122,6 +4225,11 @@ def api_get_extra(h, app, path, q):
         s = get_server(arg("id"))
         ip, port = public_ip(), join_info(Path(s["dir"]), fetch_public=False).get("port", 25565)
         return h._json(check_reachable(ip, port) if ip else {"reachable": None, "detail": "Couldn't find your internet address."})
+    if path == "/api/server/icon":
+        raw = server_icon_bytes(get_server(arg("id")), arg("src", "app"))
+        if raw is None:
+            return h._err("No icon.", 404)
+        return h._send(200, raw, "image/png", {"Cache-Control": "max-age=31536000, immutable"})
     if path == "/api/server/console":
         s = get_server(arg("id"))
         if app.runner and app.runner.status().get("dir") and Path(app.runner.status()["dir"]) == Path(s["dir"]):
@@ -4131,6 +4239,7 @@ def api_get_extra(h, app, path, q):
     if path == "/api/server/settings":
         s = get_server(arg("id"))
         return h._json({"fields": get_settings(Path(s["dir"])), "ram_mb": read_ram_mb(Path(s["dir"])),
+                        "rec_mb": recommended_ram_mb(Path(s["dir"]), system_ram_mb() or 8192),
                         "system_mb": system_ram_mb() or 8192})
     if path == "/api/server/diagnose":
         if not app.runner:
@@ -4159,6 +4268,11 @@ def api_post_extra(h, app, path, body):
             raise ValueError("Stop the server before removing it from the list.")
         remove_server(sid)
         return h._json({"ok": True})
+    if path == "/api/server/icon":
+        return h._json(set_server_icon(str(body.get("id") or ""), body.get("png"),
+                                       body.get("game_png") if body.get("to_game", True) else None))
+    if path == "/api/server/icon/reset":
+        return h._json(reset_server_icon(str(body.get("id") or "")))
     if path == "/api/servers/rename":
         name = str(body.get("name") or "").strip()[:80]
         if not name:
@@ -4506,7 +4620,7 @@ def make_handler(app: WebApp):
 
         def _body_json(self):
             n = int(self.headers.get("Content-Length") or 0)
-            if n > 1 << 20:
+            if n > 4 << 20:
                 raise ValueError("Request too large.")
             d = json.loads(self.rfile.read(n) or b"{}")
             if not isinstance(d, dict):
@@ -4532,7 +4646,7 @@ def make_handler(app: WebApp):
                     return self._send(200, PAGE_HTML, "text/html; charset=utf-8", {
                         "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; font-src 'self'; "
                                                    "script-src 'unsafe-inline'; connect-src 'self'; "
-                                                   "img-src 'self' data: https://cdn.modrinth.com https://mc-heads.net",
+                                                   "img-src 'self' data: blob: https://cdn.modrinth.com https://mc-heads.net",
                         "X-Frame-Options": "DENY"})
                 if u.path == "/api/ping":
                     return self._json({"ok": True})
@@ -5587,7 +5701,7 @@ PAGE_HTML = r"""<!doctype html>
 <meta name="theme-color" content="#121a3d" id="theme-color">
 <title>Modpack Server Builder</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='4 3 24 26'%3E%3Cpath d='M6.5 10.7L16 15.9v10.6l-9.5-5.2z' fill='%238a5a36'/%3E%3Cpath d='M25.5 10.7L16 15.9v10.6l9.5-5.2z' fill='%236b4428'/%3E%3Cpath d='M16 5.5l9.5 5.2L16 15.9 6.5 10.7z' fill='%235fe08c'/%3E%3C/svg%3E">
-<script>(function(){var m='auto';try{m=localStorage.getItem('msb-theme-mode')||'auto'}catch(e){}var h=new Date().getHours(),sky=h>=5&&h<8?'dawn':h>=8&&h<17?'day':h>=17&&h<20?'dusk':'night';var t=m==='auto'?(sky==='day'||sky==='dawn'?'light':'dark'):m;if(t==='dark'&&(sky==='day'||sky==='dawn'))sky='night';if(t==='light'&&(sky==='night'||sky==='dusk'))sky='day';var r=document.documentElement;r.dataset.theme=t;r.dataset.sky=sky})()</script>
+<script>(function(){var m='auto';try{m=localStorage.getItem('msb-theme-mode')||'auto'}catch(e){}var h=new Date().getHours(),sky=h>=5&&h<8?'dawn':h>=8&&h<17?'day':h>=17&&h<20?'dusk':'night';var t=m==='auto'?(sky==='day'||sky==='dawn'?'light':'dark'):m;if(t==='dark'&&(sky==='day'||sky==='dawn'))sky='night';if(t==='light'&&(sky==='night'||sky==='dusk'))sky='day';var r=document.documentElement;r.dataset.theme=t;r.dataset.sky=sky;var mo='on';try{mo=localStorage.getItem('msb-motion')||'on'}catch(e){}r.dataset.motion=mo==='off'?'off':'on'})()</script>
 <style>
 @font-face{font-family:"Brico";src:url(/font/brico.woff) format("woff");font-weight:200 800;font-display:swap}
 @font-face{font-family:"Pix";src:url(/font/pix.woff) format("woff");font-display:swap}
@@ -5638,6 +5752,17 @@ button,input,select,textarea{font:inherit;color:inherit}
 .scene .cloud::before,.scene .cloud::after{content:"";position:absolute;background:inherit;border-radius:2px}
 .scene .cloud::before{left:18%;width:44%;height:22px;top:-18px}
 .scene .cloud::after{left:52%;width:26%;height:12px;top:-10px}
+/* the sky moves: stars twinkle, clouds drift, now and then a shooting star. Steps keep the blur behind the glass cheap. */
+.scene .star.tw{opacity:var(--o,.7);animation:twinkle var(--d,4s) steps(6,jump-none) infinite var(--dl,0s)}
+@keyframes twinkle{0%,100%{opacity:var(--o,.7)}45%{opacity:.06}55%{opacity:.06}}
+.scene .cloud.drift{left:0;animation:drift var(--d,120s) steps(var(--st,1400)) infinite var(--dl,0s)}
+@keyframes drift{from{transform:translateX(-320px)}to{transform:translateX(calc(100vw + 40px))}}
+.scene .shoot{position:absolute;width:150px;height:3px;opacity:0;pointer-events:none;transform-origin:left center;
+  background:linear-gradient(90deg,rgba(255,255,255,0),rgba(255,255,255,.95));box-shadow:0 0 8px rgba(255,255,255,.6)}
+.scene .shoot.go{animation:shoot 1.2s steps(24) forwards}
+@keyframes shoot{0%{opacity:0;transform:rotate(18deg) translateX(0) scaleX(.3)}12%{opacity:1}100%{opacity:0;transform:rotate(18deg) translateX(420px) scaleX(1)}}
+[data-motion=off] .scene *{animation:none!important}
+@media (prefers-reduced-motion:reduce){.scene *{animation:none!important}}
 .dimmer{position:fixed;inset:0;z-index:-1;background:var(--dim);pointer-events:none}
 [data-sky=day]{--sky1:#3d8fe8;--sky2:#7cbcf3;--sky3:#cfe8fb;--sun:#fff3b0;--cloud-a:.6;--h1:#a7c8e6;--h2:#71b179;--h3:#4a944f;--h4:#2f6e3a;--grass:#8fd46a}
 [data-sky=dawn]{--sky1:#5b6fcf;--sky2:#e9a0a8;--sky3:#ffd6a6;--sun:#ffd08a;--cloud-a:.5;--h1:#b9a2c6;--h2:#7f8c86;--h3:#566c5b;--h4:#3a4c41;--grass:#a8b77a}
@@ -5815,6 +5940,11 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:24px;heigh
 .agree p{margin:0;color:var(--ink-2)}
 .wnav{display:flex;justify-content:space-between;gap:10px;margin-top:4px}
 .hint{color:var(--t-warn);font-size:13.5px;margin:6px 2px 0}
+.memwarn{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;padding:14px 16px;border-radius:15px;margin-top:10px;background:color-mix(in srgb,var(--gold) 13%,transparent);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--gold) 40%,transparent)}
+.memwarn>svg{width:20px;height:20px;color:var(--t-warn);grid-column:1;grid-row:1/span 4;margin-top:1px}.memwarn>:not(svg){grid-column:2}
+.memwarn b{color:var(--t-warn);font-size:14.5px}.memwarn p{margin:0;color:var(--ink-2);font-size:13.5px}
+.memwarn ul{margin:2px 0 4px;padding-left:18px;color:var(--ink-2);font-size:13.5px}.memwarn li{margin:3px 0}
+.memwarn .btn{justify-self:start;margin-top:4px}.set+.memwarn{margin:-4px 0 4px}
 
 /* ================= build / progress ================= */
 .progress{padding:30px;border-radius:var(--r-xl);margin-top:26px}
@@ -5852,6 +5982,16 @@ details.log summary::-webkit-details-marker{display:none}
 .back svg{width:16px;height:16px}
 .shead{display:flex;gap:18px;align-items:center;min-width:0}
 .shead .picon{width:64px;height:64px;border-radius:18px}
+.picon.editable{border:0;padding:0;cursor:pointer;position:relative;color:inherit;font:inherit}
+.picon.editable::after{content:"Change";position:absolute;inset:0;display:grid;place-items:end center;padding-bottom:6px;font:10px/1 var(--pix);letter-spacing:.04em;color:#fff;background:linear-gradient(transparent 40%,rgba(5,9,22,.7));opacity:0;transition:opacity .18s}
+.picon.editable:hover::after,.picon.editable:focus-visible::after{opacity:1}
+.iconpick{display:grid;grid-template-columns:auto 1fr;gap:18px;align-items:center}
+.iconpick .prev{width:112px;height:112px;border-radius:24px;overflow:hidden;display:grid;place-items:center;background:var(--field);box-shadow:inset 0 0 0 1px var(--line);transition:box-shadow .15s}
+.iconpick .prev.over{box-shadow:inset 0 0 0 2px var(--t-acc)}.iconpick .prev img{width:100%;height:100%;object-fit:cover}.iconpick .prev svg{width:56px;height:56px}
+.iconpick .acts{display:grid;gap:8px;justify-items:start}.iconpick p{margin:0;color:var(--ink-2);font-size:13.5px}
+.iconpick .game{grid-column:1/-1;display:flex;gap:12px;align-items:center;padding:12px 14px;border-radius:13px;background:var(--well)}
+.iconpick .game p{flex:1}.iconpick .game b{display:block;color:var(--ink);font-size:14px}
+@media (max-width:560px){.iconpick{grid-template-columns:1fr;justify-items:center;text-align:center}.iconpick .acts{justify-items:center}}
 .shead h1{overflow-wrap:anywhere}
 .shead .chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
 .banner{display:flex;gap:16px;align-items:center;padding:16px 18px;border-radius:var(--r-lg);margin-top:22px}
@@ -6065,7 +6205,7 @@ details.log summary::-webkit-details-marker{display:none}
       <div class="glass panel form" data-shine>
         <label class="field">Server name<small>Only you see this. Call it anything.</small><input type="text" id="w-name" maxlength="60" autocomplete="off"></label>
         <div class="kv"><div class="t"><b>Memory</b><span id="w-ram-text"></span></div><button class="btn quiet sm" id="w-ram-change">Change</button></div>
-        <div id="w-ram-box" hidden><input type="range" id="w-ram" min="2" max="16" step="1" aria-label="Memory in gigabytes"><div class="muted" style="display:flex;justify-content:space-between;font-size:12.5px"><span>Less for your PC</span><b id="w-ram-val" style="color:var(--ink)"></b><span>Faster server</span></div></div>
+        <div id="w-ram-box" hidden><input type="range" id="w-ram" min="2" max="16" step="1" aria-label="Memory in gigabytes"><div class="muted" style="display:flex;justify-content:space-between;font-size:12.5px"><span>Less for your PC</span><b id="w-ram-val" style="color:var(--ink)"></b><span>More for the server</span></div></div><div id="w-ram-warn" hidden></div>
         <div class="kv"><div class="t"><b>Where it’s saved</b><span id="w-dir-text"></span></div><button class="btn quiet sm" id="w-dir-change">Change</button></div>
       </div>
       <div class="wnav" style="margin-top:18px"><button class="btn quiet" id="w2-back"><svg><use href="#i-back"/></svg>Back</button><button class="btn primary" id="w2-next">Next<svg><use href="#i-chev"/></svg></button></div>
@@ -6085,6 +6225,7 @@ details.log summary::-webkit-details-marker{display:none}
 </section>
 
 <!-- ======================= progress ======================= -->
+<input type="file" id="icon-file" accept="image/png,image/jpeg,image/gif,image/webp,image/bmp" hidden>
 <section class="view" id="v-build" hidden>
   <div class="glass progress" data-shine aria-live="polite">
     <h2 id="b-title" tabindex="-1">Setting up your server</h2>
@@ -6104,7 +6245,7 @@ details.log summary::-webkit-details-marker{display:none}
 <!-- ======================= server control room ======================= -->
 <section class="view" id="v-server" hidden>
   <button class="back" id="srv-back"><svg><use href="#i-back"/></svg>All servers</button>
-  <div class="shead"><div class="picon" id="srv-icon"></div><div style="min-width:0"><h1 id="srv-name"></h1><div class="chips" id="srv-chips"></div></div></div>
+  <div class="shead"><button class="picon editable" id="srv-icon" title="Change icon" aria-label="Change this server’s icon"></button><div style="min-width:0"><h1 id="srv-name"></h1><div class="chips" id="srv-chips"></div></div></div>
   <div class="glass banner bad" id="srv-crash" hidden><span class="bi"><svg><use href="#i-alert"/></svg></span><div class="t"><b>Your server stopped because of a problem</b><span id="srv-crash-text">The app can usually fix this for you.</span></div><button class="btn primary" id="srv-fix"><svg><use href="#i-wrench"/></svg>Fix it for me</button></div>
   <div class="glass banner good" id="srv-ready" hidden><span class="bi"><svg><use href="#i-check"/></svg></span><div class="t"><b>Your server is ready</b><span>Press Start, then share the address with your friends.</span></div></div>
   <div class="room">
@@ -6141,7 +6282,7 @@ details.log summary::-webkit-details-marker{display:none}
   <div class="glass tabpanel" id="t-settings" hidden data-shine>
     <p class="sec-sub" style="margin-top:0">Changes take effect the next time the server starts.</p>
     <div class="setlist" id="setlist"></div>
-    <div class="pfoot"><button class="btn quiet sm" id="srv-remove">Remove from my list</button><div style="display:flex;gap:10px"><button class="btn sm" id="srv-rename">Rename</button><button class="btn primary" id="set-save">Save changes</button></div></div>
+    <div class="pfoot"><button class="btn quiet sm" id="srv-remove">Remove from my list</button><div style="display:flex;gap:10px"><button class="btn sm" id="srv-icon-btn">Change icon</button><button class="btn sm" id="srv-rename">Rename</button><button class="btn primary" id="set-save">Save changes</button></div></div>
   </div>
   <div class="glass tabpanel" id="t-problems" hidden data-shine>
     <div id="health"></div>
@@ -6161,6 +6302,7 @@ details.log summary::-webkit-details-marker{display:none}
   <div class="glass panel" style="margin-top:24px" data-shine>
     <div class="setlist">
       <div class="set"><div><b>Look</b><span>Automatic follows the time of day where you are.</span></div><div class="ctl"><div class="seg" id="theme-seg"><button data-v="auto">Automatic</button><button data-v="light">Light</button><button data-v="dark">Dark</button></div></div></div>
+      <div class="set"><div><b>Moving sky</b><span>Drifting clouds, twinkling stars and the odd shooting star. Turn it off on slower computers.</span></div><div class="ctl"><span class="sw"><input type="checkbox" id="motion-sw" aria-label="Moving sky"><span></span></span></div></div>
       <div class="set" id="tb-row"><div><b>Window frame</b><span>Use the app’s own glass title bar, or the standard Windows one. Takes effect next time the app opens.</span></div><div class="ctl"><div class="seg" id="tb-seg"><button data-v="custom">App</button><button data-v="standard">Windows</button></div></div></div>
       <div class="set"><div><b>Updates</b><span id="upd-text">Checking…</span></div><div class="ctl"><button class="btn sm" id="upd-check">Check now</button></div></div>
       <div class="set"><div><b>Stronger repairs</b><span>When a crash has no clear cause, also take out mods that are only suspected. Usually not needed.</span></div><div class="ctl"><span class="sw"><input type="checkbox" id="aggr" aria-label="Stronger repairs"><span></span></span></div></div>
@@ -6214,6 +6356,8 @@ function parentDir(p){var m=(p||'').match(/^(.*?[\\/])[^\\/]+[\\/]?$/);if(!m)ret
 function joinPath(b,n){if(!b)return n;return b.charAt(b.length-1)===S.sep?b+n:b+S.sep+n}
 function prettyDir(p){if(!p)return '';var h=S.home;if(h&&p.indexOf(h)===0)p=p.slice(h.length).replace(/^[\\/]/,'');return p.split(/[\\/]/).filter(Boolean).join('  \u203a  ')}
 function loaderName(l){return ({forge:'Forge',neoforge:'NeoForge',fabric:'Fabric',quilt:'Quilt',vanilla:'Plain Minecraft'})[l]||l||''}
+function iconUrl(s){if(s.icon&&s.icon.indexOf('local:')===0)return '/api/server/icon?id='+encodeURIComponent(s.id)+'&v='+s.icon.slice(6)+'&t='+TOKEN;
+  if(s.icon)return s.icon;if(s.folder_icon)return '/api/server/icon?id='+encodeURIComponent(s.id)+'&src=folder&t='+TOKEN;return ''}
 function packIcon(box,url){box.textContent='';if(url){var i=new Image();i.alt='';i.referrerPolicy='no-referrer';i.src=url;i.onerror=function(){box.textContent='';box.appendChild(icon('block'))};box.appendChild(i)}else box.appendChild(icon('block'))}
 
 /* ---------- the world: time-of-day sky + blocky hills ---------- */
@@ -6225,14 +6369,23 @@ function buildScene(){
   var hrs=new Date().getHours()+new Date().getMinutes()/60,sun=el('div','sun');
   var real=skyNow(),pos=sky!==real?.72:sky==='night'?((hrs+24-20)%24)/9:(hrs-5)/15;pos=Math.max(.04,Math.min(.96,pos));
   sun.style.left='calc('+(6+pos*84)+'% - 37px)';sun.style.top=(7+Math.pow(pos-.5,2)*56)+'%';sc.appendChild(sun);
-  if(sky==='night'||sky==='dusk'){for(var i=0;i<(sky==='night'?90:25);i++){var s=el('i','star');s.style.left=(r()*100)+'%';s.style.top=(r()*55)+'%';s.style.opacity=(.3+r()*.6).toFixed(2);if(r()>.85){s.style.width='4px';s.style.height='4px'}sc.appendChild(s)}}
-  for(var c=0;c<(sky==='night'?0:sky==='dusk'?3:6);c++){var cl=el('i','cloud');cl.style.left=(r()*92)+'%';cl.style.top=(8+r()*30)+'%';cl.style.width=(90+r()*170|0)+'px';sc.appendChild(cl)}
+  if(sky==='night'||sky==='dusk'){for(var i=0;i<(sky==='night'?90:25);i++){var s=el('i','star');s.style.left=(r()*100)+'%';s.style.top=(r()*55)+'%';var o=(.3+r()*.6).toFixed(2);s.style.opacity=o;if(r()>.85){s.style.width='4px';s.style.height='4px'}
+    if(r()<.45){var d=2.6+r()*4;s.className='star tw';s.style.setProperty('--o',o);s.style.setProperty('--d',d.toFixed(2)+'s');s.style.setProperty('--dl',(-r()*d).toFixed(2)+'s')}sc.appendChild(s)}}
+  var span=Math.round(innerWidth+360);
+  for(var c=0;c<(sky==='night'?0:sky==='dusk'?3:6);c++){var cl=el('i','cloud drift'),w=90+r()*170|0,dur=200-w*.35;cl.style.top=(8+r()*30)+'%';cl.style.width=w+'px';
+    cl.style.setProperty('--d',dur.toFixed(1)+'s');cl.style.setProperty('--dl',(-r()*dur).toFixed(1)+'s');cl.style.setProperty('--st',span);sc.appendChild(cl)}
+  if(sky==='night'){var sh=el('i','shoot');sh.id='shoot';sc.appendChild(sh)}
   var ns='http://www.w3.org/2000/svg',svg=document.createElementNS(ns,'svg');svg.setAttribute('viewBox','0 0 1600 400');svg.setAttribute('preserveAspectRatio','xMidYMax slice');
   [['var(--h1)',150,60,48],['var(--h2)',215,55,40],['var(--h3)',275,45,32],['var(--h4)',335,30,24]].forEach(function(L,i){
     var p=document.createElementNS(ns,'path');p.setAttribute('d',hills(r,1600,L[1],L[2],L[3]));p.setAttribute('fill',L[0]);svg.appendChild(p);
     if(i>=2){var g=document.createElementNS(ns,'path');g.setAttribute('d',hills(rng(99+i),1600,L[1]-4,L[2],L[3]));g.setAttribute('fill','none');g.setAttribute('stroke','var(--grass)');g.setAttribute('stroke-width','5');g.setAttribute('opacity','.55');svg.insertBefore(g,p.nextSibling)}});
   sc.appendChild(svg);
 }
+function motionOn(){try{return localStorage.getItem('msb-motion')!=='off'}catch(e){return true}}
+function setMotion(on){try{localStorage.setItem('msb-motion',on?'on':'off')}catch(e){}root.dataset.motion=on?'on':'off'}
+(function shootLoop(){setTimeout(function(){var s=$('#shoot');if(s&&motionOn()&&!document.hidden&&!matchMedia('(prefers-reduced-motion: reduce)').matches){
+  s.style.left=(8+Math.random()*55)+'%';s.style.top=(4+Math.random()*24)+'%';s.classList.remove('go');void s.offsetWidth;s.classList.add('go')}shootLoop()},14000+Math.random()*22000)})();
+var rsT=0;addEventListener('resize',function(){clearTimeout(rsT);rsT=setTimeout(function(){var span=Math.round(innerWidth+360);$$('.scene .cloud.drift').forEach(function(c){c.style.setProperty('--st',span)})},300)});
 function themeMode(){try{return localStorage.getItem('msb-theme-mode')||'auto'}catch(e){return 'auto'}}
 function applyTheme(mode,save){
   var sky=skyNow(),t=mode==='auto'?(sky==='day'||sky==='dawn'?'light':'dark'):mode;
@@ -6340,7 +6493,7 @@ function renderHome(){
   $('#home-empty').hidden=has;$('#home-new').hidden=!has;$('#home-title').hidden=!has;$('#home-lede').hidden=!has;
   S.servers.forEach(function(s){
     var c=el('button','glass scard'+(s.missing?' missing':''));c.dataset.shine='';
-    var top=el('div','top'),ic=el('div','picon');packIcon(ic,s.icon);top.appendChild(ic);var nm=el('div');nm.style.minWidth='0';nm.appendChild(el('h3',null,s.name));top.appendChild(nm);c.appendChild(top);
+    var top=el('div','top'),ic=el('div','picon');packIcon(ic,iconUrl(s));top.appendChild(ic);var nm=el('div');nm.style.minWidth='0';nm.appendChild(el('h3',null,s.name));top.appendChild(nm);c.appendChild(top);
     var chips=el('div','chips');if(s.mc)chips.appendChild(el('span','chip pix',s.mc));if(s.loader)chips.appendChild(el('span','chip',loaderName(s.loader)));if(s.pack&&s.pack!==s.name)chips.appendChild(el('span','chip',s.pack));c.appendChild(chips);
     var f=el('div','foot'),st=el('span','state'),d=el('i','dot '+(s.missing?'':s.state));st.appendChild(d);st.appendChild(document.createTextNode(s.missing?'Folder not found':stateText(s)));f.appendChild(st);f.appendChild(icon('chev'));f.lastChild.setAttribute('width','16');f.lastChild.setAttribute('height','16');c.appendChild(f);
     c.onclick=function(){if(s.missing){ask('Folder not found','The folder for \u201c'+s.name+'\u201d can\u2019t be found. It may have been moved or deleted. Remove it from your list?','Remove',true).then(function(ok){if(ok)api('/api/servers/remove',{id:s.id}).then(loadHome)});return}if(s.state==='setting_up'){go('build');return}go('server',s.id)};
@@ -6353,10 +6506,20 @@ function importServer(){pick({kind:'dir',title:'Choose your server folder'}).the
 function paintRunPill(){var r=S.servers.filter(function(s){return s.state&&s.state!=='offline'&&s.state!=='crashed'&&s.state!=='setting_up'})[0];var p=$('#run-pill');p.hidden=!r||(S.view==='server'&&S.sid===r.id);if(r){p.lastElementChild.textContent=r.name+': '+stateText(r);p.onclick=function(){go('server',r.id)}}}
 setInterval(function(){if(S.view==='home'||S.view==='settings'||S.view==='create')api('/api/servers').then(function(d){S.servers=d.servers;if(S.view==='home')renderHome();paintRunPill()}).catch(function(){})},4000);
 
+/* ---------- memory caution ---------- */
+function memWarn(gb,rec,sys,onUse){var high=gb>sys*0.7,much=gb>=Math.max(rec*2,rec+4);if(!(high||much)||gb<=rec)return null;
+  var w=el('div','memwarn');w.setAttribute('role','note');w.appendChild(icon('alert'));
+  w.appendChild(el('b',null,high?'That\u2019s most of your computer\u2019s memory':'That\u2019s more memory than this server needs'));
+  w.appendChild(el('p',null,'This server should run well with about '+rec+' GB. Giving it much more can make things worse, not better:'));
+  var ul=el('ul');
+  ul.appendChild(el('li',null,'For your computer: memory the server takes can\u2019t be used by Windows, Minecraft or your other apps. If you play on this computer too, the game and everything else can slow down, stutter or crash.'));
+  ul.appendChild(el('li',null,'For the server: Java tidies up memory in sweeps. With far more than it needs, each sweep takes longer, and players feel it as sudden lag spikes.'));
+  w.appendChild(ul);var b=el('button','btn sm','Use '+rec+' GB (recommended)');b.type='button';b.onclick=onUse;w.appendChild(b);return w}
+
 /* ---------- create wizard ---------- */
 function setStep(n){[1,2,3].forEach(function(i){$('#w'+i).hidden=i!==n;var s=$('#wsteps [data-s="'+i+'"]');s.className='s'+(i===n?' on':i<n?' done':'')});
   var f=$('#w'+n+' input,#w'+n+' button');}
-function startWizard(){S.src=null;S.dirTouched=false;$$('.choice').forEach(function(c){c.setAttribute('aria-pressed','false')});['modrinth','file','vanilla'].forEach(function(k){$('#src-'+k).hidden=true});
+function startWizard(){S.src=null;S.dirTouched=false;S.ramTouched=false;S.ramFor=null;$$('.choice').forEach(function(c){c.setAttribute('aria-pressed','false')});['modrinth','file','vanilla'].forEach(function(k){$('#src-'+k).hidden=true});
   $('#w-eula').checked=!!(S.info.settings&&S.info.settings.eula);$('#file-picked').hidden=true;$('#drop').hidden=false;setStep(1);validateW()}
 $$('.choice').forEach(function(c){c.onclick=function(){$$('.choice').forEach(function(x){x.setAttribute('aria-pressed',x===c)});var k=c.dataset.src;['modrinth','file','vanilla'].forEach(function(x){$('#src-'+x).hidden=x!==k});
   S.src=null;$$('.pack').forEach(function(p){p.setAttribute('aria-pressed','false')});
@@ -6383,11 +6546,12 @@ $('#pick-file').onclick=$('#fp-change').onclick=function(){pick({kind:'file',ext
 function validateW(){$('#w1-next').disabled=!S.src;var ok=$('#w-eula').checked;$('#w-create').disabled=!ok;$('#w3-hint').hidden=ok}
 $('#w-eula').onchange=validateW;
 $('#w1-next').onclick=function(){if(!S.src)return;var name=S.src.type==='vanilla'?'Minecraft '+S.src.version:S.src.title||'My server';$('#w-name').value=name;
-  api('/api/defaults?name='+encodeURIComponent(name)+'&mods='+(S.src.type==='vanilla'?0:(S.src.mods||120))).then(function(d){S.sysgb=Math.round(d.system_mb/1024);S.ram=Math.round(d.ram_mb/1024);if(!S.dirTouched)S.dir=d.dir;paintRam();paintDir()}).catch(function(){});setStep(2);$('#w-name').focus()};
+  api('/api/defaults?name='+encodeURIComponent(name)+'&mods='+(S.src.type==='vanilla'?0:(S.src.mods||120))).then(function(d){S.sysgb=Math.round(d.system_mb/1024);S.recRam=Math.round(d.ram_mb/1024);if(!S.ramTouched||S.ramFor!==S.src){S.ram=S.recRam;S.ramTouched=false}S.ramFor=S.src;if(!S.dirTouched)S.dir=d.dir;paintRam();paintDir()}).catch(function(){});setStep(2);$('#w-name').focus()};
 $('#w-name').addEventListener('change',function(){if(S.dirTouched)return;api('/api/defaults?name='+encodeURIComponent($('#w-name').value||'My server')).then(function(d){S.dir=d.dir;paintDir()}).catch(function(){})});
 function paintRam(){var r=$('#w-ram');r.max=Math.max(4,Math.floor(S.sysgb*.8));r.value=S.ram;r.style.setProperty('--p',((S.ram-2)/(r.max-2)*100)+'%');$('#w-ram-val').textContent=S.ram+' GB';
-  $('#w-ram-text').textContent='The server will use up to '+S.ram+' GB of your computer\u2019s '+S.sysgb+' GB.'+(S.src&&S.src.type!=='vanilla'?' That suits this modpack.':'')}
-$('#w-ram').oninput=function(){S.ram=+this.value;paintRam()};$('#w-ram-change').onclick=function(){$('#w-ram-box').hidden=!$('#w-ram-box').hidden};
+  $('#w-ram-text').textContent='The server will use up to '+S.ram+' GB of your computer\u2019s '+S.sysgb+' GB.'+(S.ram===S.recRam&&S.src&&S.src.type!=='vanilla'?' That suits this modpack.':'');
+  var box=$('#w-ram-warn');box.textContent='';var w=memWarn(S.ram,S.recRam||S.ram,S.sysgb,function(){S.ram=S.recRam;S.ramTouched=false;paintRam()});if(w)box.appendChild(w);box.hidden=!w}
+$('#w-ram').oninput=function(){S.ram=+this.value;S.ramTouched=true;paintRam()};$('#w-ram-change').onclick=function(){$('#w-ram-box').hidden=!$('#w-ram-box').hidden};
 function paintDir(){$('#w-dir-text').textContent=prettyDir(S.dir)}
 $('#w-dir-change').onclick=function(){pick({kind:'dir',title:'Choose where to save the server',start:parentDir(S.dir)}).then(function(p){if(p){S.dir=joinPath(p,$('#w-name').value.trim()||'My server');S.dirTouched=true;paintDir()}})};
 $('#w2-back').onclick=function(){setStep(1)};$('#w3-back').onclick=function(){setStep(2)};
@@ -6461,7 +6625,7 @@ function openServer(id){stopServerPolling();srv=null;conSince=0;lastState='';$('
 function refreshServer(first){var id=S.sid;api('/api/server/status?id='+id).then(function(d){if(S.view!=='server'||S.sid!==id)return;srv=d;paintServer(d,first);
   sPollT=setTimeout(function(){refreshServer(false)},d.status.state==='starting'||d.status.state==='stopping'?1000:2500)}).catch(function(e){if(S.view!=='server')return;toast(e.message,true);go('home')})}
 function paintServer(d,first){var s=d.server,st=d.status||{},state=st.state||'offline';
-  if(first){$('#srv-name').textContent=s.name;packIcon($('#srv-icon'),s.icon);var ch=$('#srv-chips');ch.textContent='';if(s.mc)ch.appendChild(el('span','chip pix',s.mc));if(s.loader)ch.appendChild(el('span','chip',loaderName(s.loader)));if(s.pack&&s.pack!==s.name)ch.appendChild(el('span','chip',s.pack));
+  if(first){$('#srv-name').textContent=s.name;packIcon($('#srv-icon'),iconUrl(s));var ch=$('#srv-chips');ch.textContent='';if(s.mc)ch.appendChild(el('span','chip pix',s.mc));if(s.loader)ch.appendChild(el('span','chip',loaderName(s.loader)));if(s.pack&&s.pack!==s.name)ch.appendChild(el('span','chip',s.pack));
     $('#stat-ver').textContent=s.mc||'-';$('#h-mods').hidden=s.loader==='vanilla'||!s.loader;var cr=$('#crumb span');if(cr)cr.textContent=s.name}
   var j=d.join||{};$('#a-local').textContent=j.local||'localhost';$('#a-lan').textContent=j.lan||'Not connected to a network';$('#h-port').textContent=j.port||25565;$('#h-lan').textContent=j.lan?j.lan.split(':')[0]:'this PC';
   var orb=$('#orb');orb.className='orb '+state;var n=(st.players||[]).length;
@@ -6509,6 +6673,8 @@ var setVals={};
 function loadSrvSettings(){api('/api/server/settings?id='+S.sid).then(function(d){var box=$('#setlist');box.textContent='';setVals={};
   var ram=el('div','set'),rl=el('div');rl.appendChild(el('b',null,'Memory'));rl.appendChild(el('span',null,'How much of your computer\u2019s memory the server can use. More helps big modpacks.'));ram.appendChild(rl);
   var rc=el('div','ctl'),rs=el('select');var sys=Math.max(4,Math.floor(d.system_mb/1024*.8));for(var g=2;g<=sys;g++){var o=el('option',null,g+' GB');o.value=g*1024;rs.appendChild(o)}rs.value=Math.max(2048,Math.round(d.ram_mb/1024)*1024);rs.setAttribute('aria-label','Memory');rc.appendChild(rs);ram.appendChild(rc);box.appendChild(ram);setVals.__ram=rs;
+  var rec=Math.max(2,Math.round((d.rec_mb||4096)/1024)),sysg=Math.round(d.system_mb/1024),warnBox=el('div');box.appendChild(warnBox);
+  var paintMem=function(){warnBox.textContent='';var w=memWarn(+rs.value/1024,rec,sysg,function(){rs.value=rec*1024;paintMem()});if(w)warnBox.appendChild(w)};rs.onchange=paintMem;paintMem();
   d.fields.forEach(function(f){var row=el('div','set'),l=el('div');l.appendChild(el('b',null,f.label));if(f.help)l.appendChild(el('span',null,f.help));row.appendChild(l);var c=el('div','ctl'),inp;
     if(f.type==='bool'){var w=el('span','sw');inp=el('input');inp.type='checkbox';inp.checked=String(f.value)==='true'||f.value===true;w.appendChild(inp);w.appendChild(el('span'));c.appendChild(w)}
     else if(f.type==='choice'){inp=el('select');(f.choices||[]).forEach(function(ch){var o=el('option',null,ch[1]);o.value=ch[0];inp.appendChild(o)});inp.value=f.value;c.appendChild(inp)}
@@ -6516,6 +6682,29 @@ function loadSrvSettings(){api('/api/server/settings?id='+S.sid).then(function(d
     inp.setAttribute('aria-label',f.label);setVals[f.key]=inp;row.appendChild(c);box.appendChild(row)})}).catch(function(e){toast(e.message,true)})}
 $('#set-save').onclick=function(){var vals={},ram=null;Object.keys(setVals).forEach(function(k){var i=setVals[k];if(k==='__ram'){ram=+i.value;return}vals[k]=i.type==='checkbox'?i.checked:i.value});
   api('/api/server/settings',{id:S.sid,values:vals,ram_mb:ram}).then(function(){toast(srv&&srv.status.state==='online'?'Saved. Restart the server to use the new settings.':'Saved.');$('#stat-ram').textContent=Math.round(ram/1024)+' GB'}).catch(function(e){toast(e.message,true)})};
+function squarePng(img,size){var c=document.createElement('canvas');c.width=c.height=size;var g=c.getContext('2d'),w=img.naturalWidth,h=img.naturalHeight,k=Math.max(size/w,size/h);
+  g.imageSmoothingEnabled=!(Math.max(w,h)<=64&&size>=Math.max(w,h));g.imageSmoothingQuality='high';g.drawImage(img,(size-w*k)/2,(size-h*k)/2,w*k,h*k);return c.toDataURL('image/png')}
+function openIconPicker(){if(!srv)return;var s=srv.server,picked=null;
+  var box=el('div','iconpick'),prev=el('div','prev');packIcon(prev,iconUrl(s));box.appendChild(prev);
+  var acts=el('div','acts');acts.appendChild(el('p',null,'Pick any picture: a logo, a screenshot, a photo. It\u2019s cropped to a square. You can also drop a picture on the preview.'));
+  var choose=el('button','btn sm','Choose a picture\u2026');choose.type='button';acts.appendChild(choose);
+  var orig=s.icon&&s.icon.indexOf('local:')===0;if(orig){var back=el('button','btn sm quiet',s.pack_icon?'Use the modpack\u2019s icon again':'Use the default icon');back.type='button';acts.appendChild(back);
+    back.onclick=function(){api('/api/server/icon/reset',{id:s.id}).then(function(r){srv.server.icon=r.icon;closeModal();packIcon($('#srv-icon'),iconUrl(srv.server));toast('Icon reset');loadHome()}).catch(function(e){toast(e.message,true)})}}
+  box.appendChild(acts);
+  var game=el('label','game'),gt=el('p');gt.appendChild(el('b',null,'Show it in Minecraft too'));gt.appendChild(document.createTextNode('Players see it next to your server in their multiplayer list.'));
+  var sw=el('span','sw'),cb=el('input');cb.type='checkbox';cb.checked=true;cb.setAttribute('aria-label','Show it in Minecraft too');sw.appendChild(cb);sw.appendChild(el('span'));game.appendChild(gt);game.appendChild(sw);box.appendChild(game);
+  var file=$('#icon-file');file.value='';
+  function take(f){if(!f)return;if(!/^image\//.test(f.type)){toast('That isn\u2019t a picture. Try a .png or .jpg file.',true);return}if(f.size>25*1024*1024){toast('That picture is too big. Try one under 25 MB.',true);return}
+    var url=URL.createObjectURL(f),img=new Image();img.onload=function(){try{picked={big:squarePng(img,256),small:squarePng(img,64)};prev.textContent='';var i=new Image();i.alt='';i.src=picked.big;prev.appendChild(i);var sv=$('#m-foot .primary');if(sv)sv.disabled=false}catch(e){toast('That picture couldn\u2019t be used. Try a different one.',true)}URL.revokeObjectURL(url)};
+    img.onerror=function(){URL.revokeObjectURL(url);toast('That picture couldn\u2019t be opened. Try a .png or .jpg file.',true)};img.src=url}
+  file.onchange=function(){take(file.files&&file.files[0])};choose.onclick=function(){file.click()};
+  ['dragenter','dragover'].forEach(function(t){prev.addEventListener(t,function(e){e.preventDefault();prev.classList.add('over')})});['dragleave','drop'].forEach(function(t){prev.addEventListener(t,function(e){e.preventDefault();prev.classList.remove('over')})});
+  prev.addEventListener('drop',function(e){take(e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0])});
+  modal('Server icon',box,[{t:'Cancel'},{t:'Save icon',primary:true,fn:function(){if(!picked)return false;
+    api('/api/server/icon',{id:s.id,png:picked.big,game_png:picked.small,to_game:cb.checked}).then(function(r){srv.server.icon=r.icon;packIcon($('#srv-icon'),iconUrl(srv.server));loadHome();
+      toast(cb.checked?(srv.status&&srv.status.state==='online'?'Icon saved. Players see it after the server restarts.':'Icon saved. Players will see it in their server list too.'):'Icon saved.')}).catch(function(e){toast(e.message,true)})}}]);
+  var sv=$('#m-foot .primary');if(sv)sv.disabled=true}
+$('#srv-icon').onclick=openIconPicker;$('#srv-icon-btn').onclick=openIconPicker;
 $('#srv-rename').onclick=function(){prompt2('Rename server','Give it a name you\u2019ll recognise.',srv.server.name,'Rename').then(function(n){if(!n)return;api('/api/servers/rename',{id:S.sid,name:n}).then(function(s){srv.server.name=s.name;$('#srv-name').textContent=s.name;var c=$('#crumb span');if(c)c.textContent=s.name;toast('Renamed')}).catch(function(e){toast(e.message,true)})})};
 $('#srv-remove').onclick=function(){ask('Remove from your list?','The server disappears from the app, but its folder and world stay on your computer. You can add it back any time.','Remove',true).then(function(ok){if(ok)api('/api/servers/remove',{id:S.sid}).then(function(){toast('Removed from your list');go('home')}).catch(function(e){toast(e.message,true)})})};
 /* health */
@@ -6530,11 +6719,12 @@ $('#srv-checklog').onclick=function(){pick({kind:'file',exts:['log','txt'],title
   api('/api/server/fixlog',{id:S.sid,log:p,aggressive:!!(S.info.settings&&S.info.settings.aggressive)}).then(function(){startProgress('fix')}).catch(function(e){toast(e.message,true)})})};
 
 /* ---------- app settings ---------- */
-function loadSettings(){applyTheme(themeMode(),false);var st=S.info.settings||{};$$('#tb-seg button').forEach(function(b){b.setAttribute('aria-pressed',b.dataset.v===(st.titlebar||'custom'))});$('#tb-row').hidden=!S.info.native_capable;
+function loadSettings(){applyTheme(themeMode(),false);$('#motion-sw').checked=motionOn();var st=S.info.settings||{};$$('#tb-seg button').forEach(function(b){b.setAttribute('aria-pressed',b.dataset.v===(st.titlebar||'custom'))});$('#tb-row').hidden=!S.info.native_capable;
   $('#aggr').checked=!!st.aggressive;$('#cfkey').value=st.cfkey||'';$('#about-text').textContent='Version '+S.info.version+'. Made to turn modpacks into servers without the headaches.';paintUpdate()}
 $$('#theme-seg button').forEach(function(b){b.onclick=function(){applyTheme(b.dataset.v,true)}});
 $$('#tb-seg button').forEach(function(b){b.onclick=function(){$$('#tb-seg button').forEach(function(x){x.setAttribute('aria-pressed',x===b)});S.info.settings.titlebar=b.dataset.v;api('/api/settings',{titlebar:b.dataset.v}).then(function(){toast('Saved. It changes the next time you open the app.')}).catch(function(){})}});
 $('#aggr').onchange=function(){S.info.settings.aggressive=this.checked;api('/api/settings',{aggressive:this.checked}).catch(function(){})};
+$('#motion-sw').onchange=function(){setMotion(this.checked)};
 $('#cfkey').onchange=function(){S.info.settings.cfkey=this.value.trim();api('/api/settings',{cfkey:this.value.trim()}).catch(function(){})};
 
 /* ---------- updates ---------- */

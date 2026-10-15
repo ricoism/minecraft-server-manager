@@ -11,6 +11,19 @@ How to write an entry (for whoever makes the next update):
   * One short sentence per line. Bold the thing they'll look for, e.g. **Fix it for me**.
 -->
 
+## 3.3.0 - October 15, 2026
+
+### New
+- **Your own server icons.** Click a server's icon (or **Change icon** in its Settings tab) and pick any picture. It's cropped to a square automatically. It can also show up next to your server in your friends' Minecraft multiplayer list.
+- Servers whose folder already has an icon (`server-icon.png`) now show it instead of the green cube.
+- **The sky comes alive.** Clouds drift by during the day, stars twinkle at night, and every so often a shooting star goes past. You can turn this off in Settings → **Moving sky** if your computer is on the slow side.
+- **A friendly warning about memory.** If you give a server much more memory than it needs, or most of your computer's memory, the app explains why that can make things worse and offers the recommended amount with one click.
+
+### Fixed
+- **Memory changes didn't stick for Forge and NeoForge servers.** The app could read an example line in the server's settings file instead of your choice, so it showed the wrong amount and could save it back. It now always shows and keeps what you picked.
+- The memory you pick while creating a server is no longer reset if you go back a step.
+- Changing a server's memory no longer forgets which modpack it came from.
+
 ## 3.2.0 - October 15, 2026
 
 ### New
