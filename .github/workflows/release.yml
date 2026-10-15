@@ -28,9 +28,11 @@ jobs:
       - uses: actions/checkout@v4
       - id: p
         name: Decide what to release
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            V="${{ inputs.version }}"; TAG="v${V#v}"
+            V="$INPUT_VERSION"; TAG="v${V#v}"
           elif [ "${{ github.ref_type }}" = "tag" ]; then
             TAG="${GITHUB_REF_NAME}"
           else
@@ -40,6 +42,9 @@ jobs:
             if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
               echo "$TAG is already released; nothing to do."; echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
             fi
+          fi
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Not a release version: $TAG (expected vX.Y.Z)"; exit 1
           fi
           echo "Releasing $TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"

@@ -11,6 +11,28 @@ How to write an entry (for whoever makes the next update):
   * One short sentence per line. Bold the thing they'll look for, e.g. **Fix it for me**.
 -->
 
+## 3.5.1 - October 15, 2026
+
+A big round of fixes after a full check-up of the app.
+
+### Fixed
+- **Pressing Stop on a setup could make your next Start fail** with "cancelled". Stop now only stops what's running.
+- **A server stopped from inside the game (`/stop`) showed up as a crash.** It's now shown as a normal stop.
+- **Old modpacks (Minecraft 1.16 and earlier) could keep starting with a Java that's too new.** The app now gets the exact Java they need, and explains it correctly if something goes wrong.
+- **Choosing your own save folder could build a new server on top of an existing one.** The app now always picks a free folder, and refuses folders that already have files.
+- **If the first start of a new server failed, the list of things left to do wasn't shown.** You now see it right after setup.
+- **The console could show the same lines several times** after stopping and starting a server.
+- **Uninstalling removed the Java your servers use**, so their start files stopped working. It's now kept. Uninstalling also cleans up properly, even if the app is still open.
+- A server with more memory than the Settings list offers no longer shows a blank memory setting (or "0 GB" after saving).
+- Settings → Back no longer shows an error after you remove a server.
+- The create wizard no longer reuses a modpack file from a previous attempt.
+- Folder names keep their dots, so "Minecraft 1.21.4" no longer becomes "Minecraft 1214".
+- Unusual characters in your server's message of the day (like "…") no longer break server.properties.
+- Port problems now mention the port your server actually uses.
+- A shaky internet connection no longer causes a scary "doesn't match its checksum" message when downloading an update; it simply tries again.
+- Stopping a setup during a download now stops right away.
+- Smaller fixes: "What's new" never covers the update prompt, the "Server ready" button clears once you've opened the server, and custom icons always refresh straight away.
+
 ## 3.5.0 - October 15, 2026
 
 ### Better

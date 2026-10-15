@@ -181,6 +181,7 @@ def download(url, dest: Path, headers=None, sha1=None, sha512=None, retries=3, s
     tmp = dest.with_name(dest.name + ".part")
     last = None
     for attempt in range(retries):
+        check_cancel()
         try:
             h1, h5, h2 = hashlib.sha1(), hashlib.sha512(), hashlib.sha256()
             with http_open(url, headers) as r, open(tmp, "wb") as f:
@@ -208,7 +209,8 @@ def download(url, dest: Path, headers=None, sha1=None, sha512=None, retries=3, s
             raise
         except Exception as e:  # noqa: BLE001
             last = e
-            time.sleep(1.5 * (attempt + 1))
+            if CANCEL.wait(1.5 * (attempt + 1)):
+                raise Cancelled("Stopped by you.")
     if tmp.exists():
         tmp.unlink()
     raise RuntimeError(f"{url}: {last}")
@@ -265,9 +267,10 @@ def java_major(path) -> int:
     """Major version of a java executable, or -1 if it can't be determined."""
     if path in _JAVA_CACHE:
         return _JAVA_CACHE[path]
-    major = -1
+    major, known = -1, False
     try:
         out = subprocess.run([str(path), "-version"], capture_output=True, text=True, timeout=30, **NOWIN)
+        known = True
         txt = out.stderr + out.stdout
         m = re.search(r'version "(\d+)(?:\.(\d+))?', txt)
         if m and IS_WIN and "64-bit" not in txt.lower():
@@ -277,8 +280,9 @@ def java_major(path) -> int:
             if major == 1 and m.group(2):
                 major = int(m.group(2))
     except Exception:  # noqa: BLE001
-        pass
-    _JAVA_CACHE[path] = major
+        pass                  # e.g. a slow first start while antivirus scans it: try again next time
+    if known:
+        _JAVA_CACHE[path] = major
     return major
 
 
@@ -414,6 +418,12 @@ def get_java(want: int, log=print, online=True):
     return found
 
 
+def java_fits(found, want: int) -> bool:
+    """Is this Java (from find_java) good enough? Old Minecraft (Java 8/11 era) needs that exact version;
+    newer Minecraft also runs fine on a newer Java."""
+    return bool(found) and (found[2] or want >= 17)
+
+
 def find_java(want: int):
     """-> (path, major, exact) or None. Prefers an exact match, else the nearest newer one."""
     javas = discover_javas()
@@ -525,12 +535,12 @@ def ctx_for_server(server_dir: Path, text="", accept_eula=False, aggressive=Fals
     env = detect_server_env(server_dir, text)
     ctx = Ctx(env.get("mc", ""), env.get("loader", ""), env.get("loader_ver", ""), accept_eula,
               aggressive, log=log, online=online)
-    ctx.ram_mb = env.get("ram_mb") or read_ram_mb(server_dir)
+    ctx.ram_mb = read_ram_mb(server_dir)              # what the files say (falls back to the saved state)
     ctx.java_script = env.get("java_script", "java")
     if ctx.mc:
         f = find_java(recommended_java(ctx.mc))
-        if f:
-            ctx.java = f[0]
+        if java_fits(f, recommended_java(ctx.mc)):
+            ctx.java = f[0]                     # otherwise "java": the runner fetches the right version
     elif shutil.which("java"):
         ctx.java = shutil.which("java")
     return ctx
@@ -1009,10 +1019,12 @@ def prune_client_mods(server_dir: Path, ctx: Ctx, excludes=()):
     index = ModIndex(mods)
     sides = modrinth_sides([i.jar for i in index.infos], ctx.log) if ctx.online else {}
     remove = decide_client_mods(index, excludes, sides, load_learned())
+    moved = 0
     for info, reason in sorted(remove.items(), key=lambda kv: kv[0].name.lower()):
         if move_mod(info.jar, server_dir, "client_only", reason):
             ctx.note(f"Removed {info.name}: {reason}")
-    return len(remove)
+            moved += 1
+    return moved
 
 
 # ============================================================================
@@ -1113,6 +1125,8 @@ def fetch_modrinth_file(f, server_dir: Path):
         try:
             download(url, dest, sha1=f.get("sha1"), sha512=f.get("sha512"))
             return dest.name
+        except Cancelled:
+            raise
         except Exception as e:  # noqa: BLE001
             last = e
     raise RuntimeError(f"{f['path']}: {last}")
@@ -1136,8 +1150,12 @@ def fetch_curseforge_file(f, mods_dir: Path, api_key):
                 try:
                     download(u, mods_dir / name, sha1=sha1)
                     return name
+                except Cancelled:
+                    raise
                 except Exception as e:  # noqa: BLE001
                     errors.append(str(e))
+        except Cancelled:
+            raise
         except Exception as e:  # noqa: BLE001
             errors.append(str(e))
     tmp = mods_dir / f".dl-{pid}-{fid}.tmp"
@@ -1156,6 +1174,8 @@ def fetch_curseforge_file(f, mods_dir: Path, api_key):
             name = Path(name).stem + ".jar" if name else f"{pid}-{fid}.jar"
         os.replace(tmp, mods_dir / Path(name).name)
         return name
+    except Cancelled:
+        raise
     except Exception as e:  # noqa: BLE001
         errors.append(str(e))
         if tmp.exists():
@@ -1172,6 +1192,7 @@ def run_installer(cmd, cwd: Path, log):
     log("  $ " + " ".join(str(c) for c in cmd))
     proc = subprocess.Popen([str(c) for c in cmd], cwd=cwd, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, errors="replace", **NOWIN)
+    _win_kill_with_app(proc)
 
     def watch():
         while proc.poll() is None:
@@ -1225,6 +1246,8 @@ def install_loader(pack: Pack, server_dir: Path, java: str, log):
         jar = server_dir / "forge-installer.jar"
         try:
             download(f"https://maven.minecraftforge.net/net/minecraftforge/forge/{full}/forge-{full}-installer.jar", jar)
+        except Cancelled:
+            raise
         except Exception:  # noqa: BLE001
             full = f"{mc}-{ver}-{mc}"
             download(f"https://maven.minecraftforge.net/net/minecraftforge/forge/{full}/forge-{full}-installer.jar", jar)
@@ -1482,9 +1505,6 @@ def analyze_text(text: str, server_dir: Path, ctx: Ctx):
         if not old or CONF_RANK[f.confidence] > CONF_RANK[old.confidence]:
             found[f.key] = f
 
-    def win(i):
-        return lines[max(0, i - 3): i + 70]
-
     def stack(i):
         """The exception at line i plus its stack trace (not unrelated lines further down)."""
         out = lines[max(0, i - 3): i + 1]
@@ -1605,9 +1625,14 @@ def analyze_text(text: str, server_dir: Path, ctx: Ctx):
                 add(Finding("wrong_loader", f"'{info.name}' isn't a valid mod for this loader", "remove",
                             "medium", info))
         # --- environment problems ---------------------------------------------------------------
-        m = RX_JAVA_VER.search(line) or RX_JAVA_VER2.search(line)
-        if m and ("UnsupportedClassVersion" in line or "Unsupported class file" in line or
-                  "more recent version of the Java" in line):
+        m2 = RX_JAVA_VER2.search(line)
+        m = RX_JAVA_VER.search(line)
+        if m2 and ctx.mc:
+            # "Unsupported class file major version N": the mod loader is older than this Java, so Java is too NEW
+            want = recommended_java(ctx.mc)
+            add(Finding("java_version", f"This server needs Java {want}; the Java it ran with is too new for it",
+                        "java", "high", java=want))
+        elif m and ("UnsupportedClassVersion" in line or "more recent version of the Java" in line):
             need = int(m.group(1)) - 44
             add(Finding("java_version", f"This server needs Java {need} or newer", "java", "high", java=need))
         if RX_OOM_UP.search(line):
@@ -1618,7 +1643,7 @@ def analyze_text(text: str, server_dir: Path, ctx: Ctx):
         if RX_EULA.search(line):
             add(Finding("eula", "The Minecraft EULA hasn't been accepted (eula.txt)", "eula", "high"))
         if RX_PORT.search(line):
-            add(Finding("port", "Port 25565 is already in use - another server is probably still running. "
+            add(Finding("port", f"Port {server_port(server_dir)} is already in use - another server is probably still running. "
                         "Close it, or change server-port in server.properties.", "manual", "high"))
 
     suspects = []
@@ -1686,6 +1711,8 @@ def apply_findings(findings, server_dir: Path, ctx: Ctx):
                 continue
             try:
                 res, val = install_dependency(modid, ctx, server_dir / "mods")
+            except Cancelled:
+                raise
             except Exception as e:  # noqa: BLE001
                 res, val = "error", str(e)
             if res == "installed":
@@ -1705,13 +1732,16 @@ def apply_findings(findings, server_dir: Path, ctx: Ctx):
         elif f.action == "java":
             need = f.data.get("java", 0)
             j = get_java(need, ctx.log, ctx.online) if need > 0 else None
-            if j and j[1] >= need and j[0] != ctx.java:
+            if j and java_fits(j, need) and j[1] >= need and j[0] != ctx.java:
                 ctx.java = j[0]
                 pj = shutil.which("java")
                 ctx.java_script = "java" if pj and java_major(pj) == j[1] else j[0]
                 set_ram(server_dir, ctx, ctx.ram_mb)          # rewrites the start scripts with the new Java
                 ctx.note(f"Switched to Java {j[1]} ({j[0]})")
                 changed = True
+            elif need < 17:
+                manual.append(f"This server needs Java {need} exactly (newer versions don't work with it). "
+                              f"Install Java {need} from https://adoptium.net and start the server again.")
             else:
                 manual.append(f"This server needs Java {need} or newer. Install it from https://adoptium.net "
                               f"and start the server again.")
@@ -1767,6 +1797,7 @@ def run_server_once(server_dir: Path, ctx: Ctx, timeout=1200):
     proc = subprocess.Popen(cmd, cwd=server_dir, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1,
                             **NOWIN)
+    _win_kill_with_app(proc)               # if the app dies, the test server goes with it
     q, lines = queue.Queue(), []
 
     def reader():
@@ -1819,6 +1850,15 @@ def run_server_once(server_dir: Path, ctx: Ctx, timeout=1200):
         proc.wait(timeout=60)
     except subprocess.TimeoutExpired:
         proc.kill()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+    for pipe in (proc.stdin, proc.stdout):
+        try:
+            pipe.close()
+        except Exception:  # noqa: BLE001
+            pass
     return ok, "\n".join(lines), start
 
 
@@ -1845,12 +1885,10 @@ def _fix_key(f):
 
 def server_port(server_dir: Path) -> int:
     try:
-        for line in (server_dir / "server.properties").read_text(encoding="utf-8", errors="ignore").splitlines():
-            if line.strip().startswith("server-port="):
-                return int(line.split("=", 1)[1].strip())
+        port = int(str(read_properties(server_dir).get("server-port", "")).strip() or 25565)
+        return port if 0 < port < 65536 else 25565
     except (OSError, ValueError):
-        pass
-    return 25565
+        return 25565
 
 
 def port_in_use(port: int) -> bool:
@@ -1909,10 +1947,18 @@ def test_and_fix(server_dir: Path, ctx: Ctx, max_attempts=8, timeout=1200):
                 m = f"Already tried: {f.message}. It didn't solve the problem."
                 if m not in all_manual:
                     all_manual.append(m)
-        tried.update(_fix_key(f) for f in fresh if f.action != "manual")
-        changed, manual = apply_findings(fresh, server_dir, ctx)
+        changed, manual = False, []
+        for f in fresh:                            # one at a time, so only fixes that really happened count as tried
+            c, mm = apply_findings([f], server_dir, ctx)
+            if c:
+                tried.add(_fix_key(f))
+                changed = True
+            manual += [m for m in mm if m not in manual]
         all_manual += [m for m in manual if m not in all_manual]
         if not changed:
+            if not all_manual:
+                all_manual.append("The server didn't finish starting: it took too long or closed without an error "
+                                  "message. Try pressing Start on its page; giving it more memory can help.")
             ctx.log("\nI couldn't fix the remaining problem automatically:")
             for m in all_manual:
                 ctx.log("  - " + m)
@@ -1954,7 +2000,7 @@ def fix_from_log(log_paths, server_dir, accept_eula=False, aggressive=False, rep
         if not accept_eula:
             log("\nSkipping the test launch: tick/accept the Minecraft EULA first.")
         elif changed or not manual:
-            if ctx.mc and not find_java(recommended_java(ctx.mc)):
+            if ctx.mc and not java_fits(find_java(recommended_java(ctx.mc)), recommended_java(ctx.mc)):
                 j = get_java(recommended_java(ctx.mc), log, online)
                 if j:
                     ctx.java = j[0]
@@ -2365,7 +2411,7 @@ class ServerRunner:
             self._exit_code = code
             self._players = {}
             self._expect_names = 0
-            if self._stop_requested:
+            if self._stop_requested or (code == 0 and self._state in ("online", "stopping")):
                 self._state = "offline"
                 msg = "The server has stopped."
             else:
@@ -2396,6 +2442,10 @@ class ServerRunner:
             if names:
                 self._players = {n: True for n in names}
                 return "info"
+        if level in (None, "INFO") and (msg.startswith("Stopping the server") or msg.startswith("Stopping server")) \
+                and self._state in ("online", "stopping"):
+            self._stop_requested = True          # a /stop typed in-game, or a restart/scheduler mod: a clean stop
+            self._state = "stopping"
         if RX_DONE.search(line):
             if self._state == "starting":
                 self._state = "online"
@@ -2930,6 +2980,15 @@ def _prop_escape(s, is_key=False):
     return "".join(out)
 
 
+def _prop_lines(text: str) -> list:
+    """Split on real line breaks only. str.splitlines() also splits on characters like \\x85 ("…" in a
+    Windows-1252 file) that Java treats as ordinary text, which would cut a motd in half."""
+    lines = re.split(r"\r\n|\r|\n", text)
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
 def read_properties(server_dir) -> dict:
     """server.properties as {key: value} (strings). Missing file -> {}."""
     p = _props_path(server_dir)
@@ -2937,7 +2996,7 @@ def read_properties(server_dir) -> dict:
         text = _props_text(p)
     except OSError:
         return {}
-    return {k: v for _, _, k, v in _prop_entries(text.splitlines())}
+    return {k: v for _, _, k, v in _prop_entries(_prop_lines(text))}
 
 
 def _prop_str(v):
@@ -2955,7 +3014,7 @@ def write_properties(server_dir, updates: dict):
     except FileNotFoundError:
         text = f"#Minecraft server properties\n#{datetime.now():%a %b %d %H:%M:%S %Y}\n"
     nl = "\r\n" if "\r\n" in text else "\n"
-    lines = text.splitlines()
+    lines = _prop_lines(text)
     upd = {str(k): _prop_str(v) for k, v in (updates or {}).items()}
     done, drop, repl = set(), set(), {}
     for start, end, k, _v in _prop_entries(lines):
@@ -3425,6 +3484,8 @@ def _fetch_file(url, dest: Path, sha256: str, size=0, progress=None, retries=3):
                             progress(min(1.0, n / total))
                         except Exception:  # noqa: BLE001
                             pass
+            if total and n < total:
+                raise IOError(f"incomplete download ({n} of {total} bytes)")      # retried below
             if h.hexdigest() != sha256.lower():
                 raise UpdateError("The downloaded update doesn't match its signed checksum; it was deleted.")
             os.replace(tmp, dest)
@@ -3603,9 +3664,10 @@ def _cleanup_updates():
     if not base.is_dir():
         return
     cur = version_tuple(APP_VERSION)
+    mine = Path(sys.executable).parent.resolve()       # the update helper runs from one of these folders
     for d in base.iterdir():
         try:
-            if d.is_dir() and version_tuple(d.name) <= cur:
+            if d.is_dir() and version_tuple(d.name) <= cur and d.resolve() != mine:
                 shutil.rmtree(d, ignore_errors=True)
         except OSError:
             pass
@@ -3859,11 +3921,41 @@ def documents_dir() -> Path:
     return d if d.is_dir() else Path.home()
 
 
-def default_server_dir(name: str) -> Path:
-    base = documents_dir() / "Minecraft Servers"
-    stem = _safe_name(name, "My server")[:60] or "My server"
+WIN_RESERVED = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
+
+
+def folder_name(name: str, fallback="My server") -> str:
+    """A folder name Windows accepts, keeping the name readable ("Minecraft 1.21.4" stays as it is)."""
+    n = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", str(name or "")).strip().rstrip(". ")[:60].rstrip(". ")
+    if not n:
+        n = fallback
+    if n.split(".")[0].lower() in WIN_RESERVED:
+        n += " server"
+    return n
+
+
+def folder_taken(p: Path) -> bool:
+    """Has files in it, or already belongs to a server in the list."""
+    try:
+        if p.exists() and (not p.is_dir() or any(p.iterdir())):
+            return True
+    except OSError:
+        return True
+    return any(_same_folder(s.get("dir", ""), p) for s in list_servers())
+
+
+def _same_folder(a, b) -> bool:
+    try:
+        return os.path.normcase(str(Path(a).resolve())) == os.path.normcase(str(Path(b).resolve()))
+    except (OSError, ValueError):
+        return False
+
+
+def default_server_dir(name: str, base=None) -> Path:
+    base = Path(base) if base else documents_dir() / "Minecraft Servers"
+    stem = folder_name(name)
     p, n = base / stem, 2
-    while p.exists() and any(p.iterdir()):
+    while folder_taken(p):
         p, n = base / f"{stem} ({n})", n + 1
     return p
 
@@ -3925,10 +4017,13 @@ def update_server(sid: str, **fields) -> dict:
 
 
 def remove_server(sid: str):
-    try:
-        (app_data_dir() / "icons" / f"{sid}.png").unlink()
-    except OSError:
-        pass
+    if not any(s["id"] == sid for s in list_servers()):
+        return
+    if re.fullmatch(r"[0-9a-f]{6,32}", sid):
+        try:
+            (app_data_dir() / "icons" / f"{sid}.png").unlink()
+        except OSError:
+            pass
     with _SERVERS_LOCK:
         servers = [s for s in list_servers() if s["id"] != sid]
         save_settings({"servers": [{k: v for k, v in x.items() if k != "missing"} for x in servers]})
@@ -4009,9 +4104,13 @@ def build_vanilla_server(version, out_dir, ram="4G", accept_eula=False, test_run
     ram_mb = parse_ram_mb(ram)
     want = recommended_java(mc)
     found = get_java(want, log, online)
-    if not found:
+    if not found and test_run and accept_eula:
         raise RuntimeError(f"Java {want} isn't installed and couldn't be downloaded. Install it from "
                            f"https://adoptium.net and try again.")
+    if not found:                                  # the files can still be made; Start fetches Java later
+        log(f"WARNING: Java {want} isn't available yet. The server is set up, and the app gets Java when you "
+            f"press Start.")
+        found = ("java", want, False)
     java_exec = found[0]
     pj = shutil.which("java")
     script_java = "java" if pj and java_major(pj) == found[1] else java_exec
@@ -4117,7 +4216,7 @@ def set_server_icon(sid: str, app_png_b64, game_png_b64=None) -> dict:
         if cur.is_file() and not keep.exists() and not s.get("icon", "").startswith("local:"):
             shutil.copy2(cur, keep)                # the modpack's own icon, so it can be put back
         cur.write_bytes(small)
-    extra = {"icon": f"local:{int(time.time())}"}
+    extra = {"icon": f"local:{int(time.time() * 1000)}"}
     if s.get("icon") and not s["icon"].startswith("local:"):
         extra["pack_icon"] = s["icon"]             # remember the modpack's icon for "Use the original"
     return update_server(sid, **extra)
@@ -4209,7 +4308,8 @@ def api_get_extra(h, app, path, q):
         return h._json({"versions": vanilla_versions()})
     if path == "/api/defaults":
         sysmb = system_ram_mb() or 8192
-        return h._json({"dir": str(default_server_dir(arg("name", "My server"))), "system_mb": sysmb,
+        base = user_path(arg("base")) if arg("base") else None
+        return h._json({"dir": str(default_server_dir(arg("name", "My server"), base)), "system_mb": sysmb,
                         "ram_mb": recommended_ram_mb(int(arg("mods", "0") or 0), sysmb)})
     if path == "/api/server/status":
         s = get_server(arg("id"))
@@ -4259,6 +4359,10 @@ def api_get_extra(h, app, path, q):
 
 def api_post_extra(h, app, path, body):
     if path == "/api/create":
+        out = user_path(body.get("dir"))
+        if folder_taken(out):
+            raise ValueError("That folder already has files in it (or another server uses it). Pick an empty "
+                             "folder, or press Change and choose where to save it again.")
         app.start_job("build", lambda job: create_server(job, body))
         return h._json({"ok": True})
     if path == "/api/servers/import":
@@ -4326,6 +4430,9 @@ def api_post_extra(h, app, path, body):
         return h._json(res)
     if path == "/api/server/fixlog":
         s = get_server(str(body.get("id") or ""))
+        st = app.runner.status() if app.runner else {}
+        if st.get("dir") and _same_folder(st["dir"], s["dir"]) and app.runner.state in ("starting", "online", "stopping"):
+            raise ValueError("Stop the server first, then check the log file.")
         log_path = user_path(body.get("log"), "file")
         eula = bool(load_settings().get("eula"))
 
@@ -4571,6 +4678,9 @@ class WebApp:
                 job.fail(str(e), cancelled=True)
             except Exception as e:  # noqa: BLE001
                 job.fail(str(e))
+            finally:
+                CANCEL.clear()          # a Stop must not linger and cancel the next Start or repair
+                SKIP_TEST.clear()
         threading.Thread(target=work, daemon=True).start()
 
 
@@ -4781,13 +4891,21 @@ def make_handler(app: WebApp):
                     threading.Thread(target=stop_then_quit, daemon=True).start()
                     return
                 if u.path == "/api/cancel":
-                    CANCEL.set()
+                    if app.busy():
+                        CANCEL.set()
                     return self._json({"ok": True})
                 if u.path == "/api/skiptest":
                     SKIP_TEST.set()
                     return self._json({"ok": True})
                 if u.path == "/api/settings":
-                    cur = save_settings(body if isinstance(body, dict) else {})
+                    # only what the page may change; the server list etc. are managed by their own routes
+                    allowed = {"theme": str, "titlebar": str, "aggressive": bool, "cfkey": str, "eula": bool}
+                    upd = {k: v for k, v in body.items() if k in allowed and isinstance(v, allowed[k])}
+                    if upd.get("theme") not in (None, "auto", "light", "dark"):
+                        upd.pop("theme")
+                    if upd.get("titlebar") not in (None, "custom", "standard"):
+                        upd.pop("titlebar")
+                    cur = save_settings(upd)
                     if "theme" in body and app.window:
                         app.window.set_theme(theme_is_dark(body.get("theme")))
                     return self._json(cur)
@@ -5312,6 +5430,12 @@ def make_shortcuts(exe: Path, desktop=True, icon=None):
     """Start menu (and desktop) shortcuts. -> list of created .lnk paths"""
     targets = [known_folder(FOLDER_PROGRAMS)] + ([known_folder(FOLDER_DESKTOP)] if desktop else [])
     made = []
+    for folder in (known_folder(FOLDER_PROGRAMS), known_folder(FOLDER_DESKTOP)):   # shortcuts under the old name
+        if folder and LEGACY_NAME != APP_NAME:
+            try:
+                os.remove(os.path.join(folder, LEGACY_NAME + ".lnk"))
+            except OSError:
+                pass
     try:
         for folder in targets:
             if folder:
@@ -5478,7 +5602,7 @@ def install_app(desktop=True) -> Path:
         quit_existing_instance()                     # an older copy may still be open
         tmp = dst.with_name(dst.name + ".new")
         shutil.copy2(src, tmp)
-        for _ in range(10):
+        for _ in range(120):                         # up to a minute: the old copy may be saving a world
             try:
                 os.replace(tmp, dst)
                 break
@@ -5508,7 +5632,7 @@ def uninstall_app(quiet=False):
     if not IS_WIN:
         raise RuntimeError("Uninstall is only available on Windows.")
     if not quiet and message_box(f"Remove {APP_NAME} from this PC?\n\n"
-                                 "Servers you built are not touched.", 0x4 | 0x20) != 6:
+                                 "Servers you built are not touched and keep working.", 0x4 | 0x20) != 6:
         return False
     quit_existing_instance()
     d = install_dir()
@@ -5532,16 +5656,46 @@ def uninstall_app(quiet=False):
         winreg.DeleteKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY)
     except OSError:
         pass
-    shutil.rmtree(app_data_dir(), ignore_errors=True)
+    # App data goes, except the Java it downloaded: servers' start.bat files may point at it.
+    data = app_data_dir()
+    if data.is_dir():
+        for item in data.iterdir():
+            if item.name.lower() == "java":
+                continue
+            if item.is_dir():
+                shutil.rmtree(item, ignore_errors=True)
+            else:
+                try:
+                    item.unlink()
+                except OSError:
+                    pass
+        try:
+            data.rmdir()                        # only succeeds when nothing (no Java) was kept
+        except OSError:
+            pass
     for n in (f"{APP_NAME}.exe", f"{APP_NAME} Setup.exe", f"{LEGACY_NAME}.exe", f"{LEGACY_NAME} Setup.exe",
-              "ModpackServerBuilder.exe", "ModpackServerBuilder-Setup.exe"):   # WebView2 keeps its data per exe name
+              "ModpackServerBuilder.exe", "ModpackServerBuilder-Setup.exe", UPDATE_SETUP_ASSET,
+              Path(sys.executable).name):                                       # WebView2 keeps its data per exe name
         shutil.rmtree(os.path.join(os.environ.get("APPDATA", ""), n), ignore_errors=True)
-    # This program is running from the folder being removed: let cmd finish the job after we exit.
-    subprocess.Popen(f'cmd /c ping 127.0.0.1 -n 4 >nul & rmdir /s /q "{d}"', shell=False,
-                     creationflags=0x08000000 | 0x00000008, close_fds=True)   # no window, detached
     if not quiet:
-        message_box(f"{APP_NAME} has been removed.", 0x40)
+        message_box(f"{APP_NAME} has been removed.\n\nYour servers are still in their folders, and the Java they "
+                    f"use was kept so they keep working.", 0x40)
+    _remove_folder_after_exit(d)
     return True
+
+
+def _remove_folder_after_exit(d: Path):
+    """This program runs from the folder being removed, so a small hidden script deletes it once we've exited
+    (retrying for up to a minute while Windows releases the exe), then deletes itself."""
+    script = Path(tempfile.gettempdir()) / f"msb-uninstall-{os.getpid()}.cmd"
+    script.write_text("@echo off\r\nchcp 65001 >nul\r\n"
+                      "for /l %%i in (1,1,60) do (\r\n"
+                      f'  rmdir /s /q "{d}" 2>nul\r\n'
+                      f'  if not exist "{d}" goto done\r\n'
+                      "  ping -n 2 127.0.0.1 >nul\r\n"
+                      ")\r\n:done\r\n(goto) 2>nul & del \"%~f0\"\r\n", encoding="utf-8")
+    subprocess.Popen(["cmd", "/c", str(script)], shell=False, creationflags=0x08000000, close_fds=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def launch_detached(exe: Path):
@@ -6496,11 +6650,12 @@ function go(v,arg){
   else if(v==='build'){crumb(S.jobKind==='fix'?'Fixing':'Setting up')}
   else if(v==='server'){S.sid=arg;var s=S.servers.filter(function(x){return x.id===arg})[0];crumb(s?s.name:'Server');openServer(arg)}
   else if(v==='settings'){crumb('Settings');loadSettings()}
+  if(v==='server'&&doneJob&&(doneJob.result||{}).server_id===arg)doneJob=null;
   paintJobPill();paintRunPill();
   var h=$('#v-'+v+' h1, #v-'+v+' h2');if(h&&v!=='home'){h.setAttribute('tabindex','-1');h.focus({preventScroll:true})}
 }
 $('#go-home').onclick=function(){if(S.view!=='install')go('home')};$('#go-settings').onclick=function(){go('settings')};
-$('#create-back').onclick=function(){go('home')};$('#srv-back').onclick=function(){go('home')};$('#set-back').onclick=function(){go(S.sid?'server':'home',S.sid)};
+$('#create-back').onclick=function(){go('home')};$('#srv-back').onclick=function(){go('home')};$('#set-back').onclick=function(){var ok=S.sid&&S.servers.some(function(x){return x.id===S.sid});go(ok?'server':'home',ok?S.sid:undefined)};
 document.addEventListener('contextmenu',function(e){if(!(e.target.closest&&e.target.closest('input,textarea,.feed,.console,code')))e.preventDefault()});
 
 /* ---------- home ---------- */
@@ -6537,7 +6692,7 @@ function memWarn(gb,rec,sys,onUse){var high=gb>sys*0.7,much=gb>=Math.max(rec*2,r
 /* ---------- create wizard ---------- */
 function setStep(n){[1,2,3].forEach(function(i){$('#w'+i).hidden=i!==n;var s=$('#wsteps [data-s="'+i+'"]');s.className='s'+(i===n?' on':i<n?' done':'')});
   var f=$('#w'+n+' input,#w'+n+' button');}
-function startWizard(){S.src=null;S.dirTouched=false;S.ramTouched=false;S.ramFor=null;$$('.choice').forEach(function(c){c.setAttribute('aria-pressed','false')});['modrinth','file','vanilla'].forEach(function(k){$('#src-'+k).hidden=true});
+function startWizard(){S.src=null;S.fileSrc=null;S.dirTouched=false;S.dirBase=null;S.ramTouched=false;S.ramFor=null;$$('.choice').forEach(function(c){c.setAttribute('aria-pressed','false')});['modrinth','file','vanilla'].forEach(function(k){$('#src-'+k).hidden=true});
   $('#w-eula').checked=!!(S.info.settings&&S.info.settings.eula);$('#file-picked').hidden=true;$('#drop').hidden=false;setStep(1);validateW()}
 $$('.choice').forEach(function(c){c.onclick=function(){$$('.choice').forEach(function(x){x.setAttribute('aria-pressed',x===c)});var k=c.dataset.src;['modrinth','file','vanilla'].forEach(function(x){$('#src-'+x).hidden=x!==k});
   S.src=null;$$('.pack').forEach(function(p){p.setAttribute('aria-pressed','false')});
@@ -6565,13 +6720,14 @@ function validateW(){$('#w1-next').disabled=!S.src;var ok=$('#w-eula').checked;$
 $('#w-eula').onchange=validateW;
 $('#w1-next').onclick=function(){if(!S.src)return;var name=S.src.type==='vanilla'?'Minecraft '+S.src.version:S.src.title||'My server';$('#w-name').value=name;
   api('/api/defaults?name='+encodeURIComponent(name)+'&mods='+(S.src.type==='vanilla'?0:(S.src.mods||120))).then(function(d){S.sysgb=Math.round(d.system_mb/1024);S.recRam=Math.round(d.ram_mb/1024);if(!S.ramTouched||S.ramFor!==S.src){S.ram=S.recRam;S.ramTouched=false}S.ramFor=S.src;if(!S.dirTouched)S.dir=d.dir;paintRam();paintDir()}).catch(function(){});setStep(2);$('#w-name').focus()};
-$('#w-name').addEventListener('change',function(){if(S.dirTouched)return;api('/api/defaults?name='+encodeURIComponent($('#w-name').value||'My server')).then(function(d){S.dir=d.dir;paintDir()}).catch(function(){})});
+$('#w-name').addEventListener('change',function(){api('/api/defaults?name='+encodeURIComponent($('#w-name').value||'My server')+(S.dirTouched&&S.dirBase?'&base='+encodeURIComponent(S.dirBase):'')).then(function(d){S.dir=d.dir;paintDir()}).catch(function(){})});
 function paintRam(){var r=$('#w-ram');r.max=Math.max(4,Math.floor(S.sysgb*.8));r.value=S.ram;r.style.setProperty('--p',((S.ram-2)/(r.max-2)*100)+'%');$('#w-ram-val').textContent=S.ram+' GB';
   $('#w-ram-text').textContent='The server will use up to '+S.ram+' GB of your computer\u2019s '+S.sysgb+' GB.'+(S.ram===S.recRam&&S.src&&S.src.type!=='vanilla'?' That suits this modpack.':'');
   var box=$('#w-ram-warn');box.textContent='';var w=memWarn(S.ram,S.recRam||S.ram,S.sysgb,function(){S.ram=S.recRam;S.ramTouched=false;paintRam()});if(w)box.appendChild(w);box.hidden=!w}
 $('#w-ram').oninput=function(){S.ram=+this.value;S.ramTouched=true;paintRam()};$('#w-ram-change').onclick=function(){$('#w-ram-box').hidden=!$('#w-ram-box').hidden};
 function paintDir(){$('#w-dir-text').textContent=prettyDir(S.dir)}
-$('#w-dir-change').onclick=function(){pick({kind:'dir',title:'Choose where to save the server',start:parentDir(S.dir)}).then(function(p){if(p){S.dir=joinPath(p,$('#w-name').value.trim()||'My server');S.dirTouched=true;paintDir()}})};
+$('#w-dir-change').onclick=function(){pick({kind:'dir',title:'Choose where to save the server',start:parentDir(S.dir)}).then(function(p){if(!p)return;S.dirBase=p;
+  api('/api/defaults?name='+encodeURIComponent($('#w-name').value.trim()||'My server')+'&base='+encodeURIComponent(p)).then(function(d){S.dir=d.dir;S.dirTouched=true;paintDir()}).catch(function(e){toast(e.message,true)})})};
 $('#w2-back').onclick=function(){setStep(1)};$('#w3-back').onclick=function(){setStep(2)};
 $('#w2-next').onclick=function(){if(!$('#w-name').value.trim()){$('#w-name').focus();return}var sm=$('#w-summary');sm.textContent='';var t=el('div','t');t.appendChild(el('b',null,$('#w-name').value.trim()));
   t.appendChild(el('span',null,(S.src.type==='vanilla'?'Minecraft '+S.src.version:S.src.title+(S.src.mc?', Minecraft '+S.src.mc:''))+', '+S.ram+' GB memory'));sm.appendChild(t);setStep(3);validateW()};
@@ -6588,7 +6744,7 @@ function jobName(){var s=S.servers.filter(function(x){return x.id===S.jobSid})[0
 function paintJobPill(){var p=$('#job-pill');if(!p)return;p.className='running-pill job';
   if(polling){p.hidden=S.view==='build';var n=jobName();p.lastElementChild.textContent=(S.jobKind==='fix'?'Fixing':'Setting up')+(n?' '+n:'')+(jobPct?' \u00b7 '+jobPct+'%':'');p.title='Show progress';p.onclick=function(){go('build')};return}
   if(doneJob&&S.view!=='build'){var r=doneJob.result||{},bad=doneJob.state==='error'||r.ok===false;p.classList.add(bad?'bad':'ready');p.hidden=false;
-    p.lastElementChild.textContent=r.cancelled?'Setup stopped':doneJob.state==='error'?'Setup didn\u2019t finish':bad?'Needs a fix':(S.jobKind==='fix'?'Fixed':'Server ready');p.title='Show the result';
+    var fx=S.jobKind==='fix';p.lastElementChild.textContent=r.cancelled?(fx?'Repair stopped':'Setup stopped'):doneJob.state==='error'?(fx?'Repair didn\u2019t finish':'Setup didn\u2019t finish'):bad?'Needs a fix':(fx?'Fixed':'Server ready');p.title='Show the result';
     p.onclick=function(){var d=doneJob;doneJob=null;go('build');showResult(d)};return}
   p.hidden=true}
 function startProgress(kind,srcType){S.jobKind=kind;stageKey=kind==='fix'?'fix':(srcType==='vanilla'?'vanilla':'build');cursor=0;todos=[];todoMode=false;jobPct=0;jobStage='';doneJob=null;$('#feed').textContent='';$('#b-skip').hidden=true;
@@ -6624,19 +6780,22 @@ function finishJob(d){paintStage(d.stage,d.dl,d.state==='error'?'error':'done');
   if(S.view!=='build'){doneJob=d;paintJobPill();var r=d.result||{};
     toast(r.cancelled?'Setup stopped.':d.state==='error'?'Setting up didn\u2019t finish. Click the button at the top for details.':r.ok===false?(jobName()||'Your server')+' needs a fix first. Click the button at the top.':(jobName()||'Your server')+' is ready!',d.state==='error'||r.ok===false);return}
   showResult(d)}
-function showResult(d){var r=d.result||{};paintJobPill();
-  if(d.state!=='error'&&r.server_id){loadHome().then(function(){S.justMade=r.ok!==false;go('server',r.server_id);if(r.ok===false)setTimeout(function(){selTab('problems')},300);
-    toast(d.kind==='fix'?(r.ok?'Fixed. Your server starts again.':'Some problems still need you. See Health.'):(r.ok===false?'Your server was made, but it needs a fix first.':r.skipped?'Your server is ready. Press Start to play.':'Your server is ready!'),r.ok===false)});return}
+function showResult(d){var r=d.result||{};doneJob=null;paintJobPill();
+  if(d.state!=='error'&&r.server_id&&r.ok!==false){loadHome().then(function(){S.justMade=true;go('server',r.server_id);
+    toast(d.kind==='fix'?'Fixed. Your server starts again.':r.skipped?'Your server is ready. Press Start to play.':'Your server is ready!')});return}
   $('.progress').hidden=true;$('#b-result').hidden=false;
-  var title,sub;if(r.cancelled){title='Stopped';sub='Nothing else will change. The server folder keeps what was done so far.'}else if(d.state==='error'){title='That didn\u2019t work';sub=r.error||'Something went wrong.'}else{title='Done';sub=''}
+  var title,sub;if(r.cancelled){title='Stopped';sub='Nothing else will change. The server folder keeps what was done so far.'}else if(d.state==='error'){title='That didn\u2019t work';sub=r.error||'Something went wrong.'}
+  else if(r.ok===false){title=d.kind==='fix'?'Some problems still need you':'Your server is made, but it needs a fix first';sub=todos.length?'Here\u2019s what\u2019s left to do:':'Its first start didn\u2019t work. Open it and press Start to see what happens; \u201cFix it for me\u201d can usually sort it out.'}
+  else{title='Done';sub=''}
   $('#r-title').textContent=title;$('#r-sub').textContent=sub;var td=$('#r-todos');td.textContent='';todos.forEach(function(t){var f=el('div','finding t-warn');f.appendChild(icon('alert'));f.appendChild(el('div',null,t));td.appendChild(f)});
-  var sid=r.server_id||(r.cancelled||d.state==='error'?S.jobSid:null),known=sid&&S.servers.some(function(x){return x.id===sid});
-  $('#r-open').hidden=!known;$('#r-open').onclick=function(){go('server',sid)};$('#r-title').focus()}
+  var sid=r.server_id||(r.cancelled||d.state==='error'?S.jobSid:null);$('#r-open').hidden=true;
+  loadHome().then(function(){var known=sid&&S.servers.some(function(x){return x.id===sid});$('#r-open').hidden=!known;$('#r-open').onclick=function(){go('server',sid)}});$('#r-title').focus()}
 $('#r-home').onclick=function(){go('home')};
 
 /* ---------- server control room ---------- */
-var srv=null,conSince=0,sPollT=null,conT=null,tab='console',lastState='';
-function stopServerPolling(){clearTimeout(sPollT);clearTimeout(conT);sPollT=conT=null}
+var srv=null,conSince=0,sPollT=null,conT=null,conBusy=false,conGen=0,tab='console',lastState='';
+function ensureConsole(){if(!conT&&!conBusy)pollConsole()}
+function stopServerPolling(){clearTimeout(sPollT);clearTimeout(conT);sPollT=conT=null;conGen++;conBusy=false}
 function openServer(id){stopServerPolling();srv=null;conSince=0;lastState='';$('#console').textContent='';var ce=el('div','empty-c','The server\u2019s messages appear here while it runs.');ce.id='console-empty';$('#console').appendChild(ce);
   $('#srv-crash').hidden=true;$('#srv-ready').hidden=!S.justMade;S.justMade=false;$('#a-pub').textContent='Finding your address\u2026';$('#reach').textContent='';selTab('console');
   refreshServer(true);api('/api/server/public?id='+id).then(function(d){$('#a-pub').textContent=d.address||'Not available right now'}).catch(function(){$('#a-pub').textContent='Not available right now'})}
@@ -6655,19 +6814,19 @@ function paintServer(d,first){var s=d.server,st=d.status||{},state=st.state||'of
   $('#srv-crash').hidden=state!=='crashed';$('#prob-badge').hidden=state!=='crashed';if(state==='crashed'&&lastState!=='crashed'){$('#srv-ready').hidden=true;api('/api/server/diagnose?id='+S.sid).then(function(dg){$('#srv-crash-text').textContent=dg.summary||'The app can usually fix this for you.';$('#srv-fix').hidden=!dg.fixable;S.diag=dg;if(tab==='problems')renderHealth()}).catch(function(){})}
   if(state==='online'&&lastState&&lastState!=='online')toast('Your server is online!');
   lastState=state;renderPlayers(st.players||[],state);
-  if(running&&!conT)pollConsole();
+  if(running)ensureConsole();
   if(first)api('/api/server/settings?id='+S.sid).then(function(x){$('#stat-ram').textContent=Math.round(x.ram_mb/1024)+' GB'}).catch(function(){})}
-function pollConsole(){var id=S.sid;api('/api/server/console?id='+id+'&since='+conSince).then(function(d){if(S.view!=='server'||S.sid!==id){conT=null;return}conSince=d.next;addConsole(d.lines);
-  var st=srv&&srv.status&&srv.status.state;conT=(st==='offline'||st==='crashed')&&!d.lines.length?null:setTimeout(pollConsole,document.hidden?2500:700)}).catch(function(){conT=setTimeout(pollConsole,2000)})}
+function pollConsole(){var id=S.sid,g=conGen;conBusy=true;api('/api/server/console?id='+id+'&since='+conSince).then(function(d){if(g!==conGen)return;conBusy=false;if(S.view!=='server'||S.sid!==id){conT=null;return}conSince=d.next;addConsole(d.lines);
+  var st=srv&&srv.status&&srv.status.state;conT=(st==='offline'||st==='crashed')&&!d.lines.length?null:setTimeout(pollConsole,document.hidden?2500:700)}).catch(function(){if(g!==conGen)return;conBusy=false;if(S.view==='server'&&S.sid===id)conT=setTimeout(pollConsole,2000)})}
 function addConsole(lines){if(!lines.length)return;var c=$('#console'),e=$('#console-empty');if(e)e.remove();var near=c.scrollHeight-c.scrollTop-c.clientHeight<80,frag=document.createDocumentFragment();
   lines.forEach(function(l){frag.appendChild(el('div','c '+(l.kind||'info'),l.t))});c.appendChild(frag);var extra=c.childElementCount-1500;if(extra>0){var r=document.createRange();r.setStartBefore(c.firstChild);r.setEndAfter(c.children[extra-1]);r.deleteContents()}if(near)c.scrollTop=c.scrollHeight}
 $('#srv-start').onclick=function(){startServer(false)};
-function startServer(eula){var b=$('#srv-start');b.disabled=true;api('/api/server/start',{id:S.sid,eula:eula}).then(function(){$('#srv-ready').hidden=true;conSince=0;clearTimeout(sPollT);refreshServer(false);if(!conT)pollConsole()})
+function startServer(eula){var b=$('#srv-start');b.disabled=true;api('/api/server/start',{id:S.sid,eula:eula}).then(function(){$('#srv-ready').hidden=true;clearTimeout(sPollT);refreshServer(false);ensureConsole()})
   .catch(function(e){b.disabled=false;if(e.data&&e.data.eula){ask('Agree to the Minecraft rules','To run a server you need to agree to the Minecraft EULA (Mojang\u2019s rules for servers). In short: don\u2019t sell things that change the game.','I agree',false).then(function(ok){if(ok)startServer(true)})}else toast(e.message,true)})}
 $('#srv-stop').onclick=function(){var n=srv&&srv.status&&(srv.status.players||[]).length;var go2=function(){api('/api/server/stop',{id:S.sid}).then(function(){clearTimeout(sPollT);refreshServer(false)}).catch(function(e){toast(e.message,true)})};
   if(n)ask('Stop the server?',n===1?'1 person is playing. They\u2019ll be disconnected. The world is saved first.':n+' people are playing. They\u2019ll be disconnected. The world is saved first.','Stop server',true).then(function(ok){if(ok)go2()});else go2()};
 $('#srv-restart').onclick=function(){api('/api/server/restart',{id:S.sid}).then(function(){toast('Restarting\u2026');clearTimeout(sPollT);refreshServer(false)}).catch(function(e){toast(e.message,true)})};
-$('#srv-folder').onclick=function(){api('/api/open',{dir:srv.server.dir}).catch(function(e){toast(e.message,true)})};
+$('#srv-folder').onclick=function(){if(!srv)return;api('/api/open',{dir:srv.server.dir}).catch(function(e){toast(e.message,true)})};
 $('#srv-fix').onclick=function(){var b=this;b.disabled=true;b.lastChild.textContent='Fixing\u2026';api('/api/server/fix',{id:S.sid}).then(function(r){b.disabled=false;b.lastChild.textContent='Fix it for me';
   if(r.changed){toast('Fixed. Starting your server again\u2026');$('#srv-crash').hidden=true}else{selTab('problems');toast('This one needs you. See Health.',true)}clearTimeout(sPollT);refreshServer(false)}).catch(function(e){b.disabled=false;b.lastChild.textContent='Fix it for me';toast(e.message,true)})};
 $$('[data-copy]').forEach(function(b){b.onclick=function(){var t=$('#'+b.dataset.copy).textContent;if(!/[0-9a-z]/i.test(t)||/Not |Finding/.test(t))return;(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(function(){toast('Copied: '+t)}).catch(function(){toast('Couldn\u2019t copy. Select the address and copy it.',true)})}});
@@ -6678,7 +6837,7 @@ function selTab(t){tab=t;$$('#tabs button').forEach(function(b){b.setAttribute('
   if(t==='settings')loadSrvSettings();if(t==='problems')renderHealth()}
 $$('#tabs button').forEach(function(b){b.onclick=function(){selTab(b.dataset.tab)}});
 $('#cmd-form').onsubmit=function(e){e.preventDefault();var c=$('#cmd').value.trim();if(!c)return;sendCmd(c);$('#cmd').value=''};
-function sendCmd(c){if(!srv||srv.status.state!=='online'){toast('Start the server first, then send commands.',true);return}api('/api/server/command',{id:S.sid,command:c}).then(function(){if(!conT)pollConsole()}).catch(function(e){toast(e.message,true)})}
+function sendCmd(c){if(!srv||srv.status.state!=='online'){toast('Start the server first, then send commands.',true);return}api('/api/server/command',{id:S.sid,command:c}).then(function(){ensureConsole()}).catch(function(e){toast(e.message,true)})}
 $$('[data-q]').forEach(function(b){b.onclick=function(){var q=b.dataset.q;
   if(q==='admin')prompt2('Make someone an admin','Admins can use commands in the game, like changing the time or giving items. Type their exact Minecraft name.','Minecraft name','Make admin').then(function(n){if(n)sendCmd('op '+n)});
   else if(q==='say')prompt2('Send a message','Everyone on the server sees this in their chat.','Your message','Send').then(function(m){if(m)sendCmd('say '+m)});
@@ -6690,7 +6849,7 @@ function renderPlayers(list,state){var box=$('#players');box.textContent='';if(!
 var setVals={};
 function loadSrvSettings(){api('/api/server/settings?id='+S.sid).then(function(d){var box=$('#setlist');box.textContent='';setVals={};
   var ram=el('div','set'),rl=el('div');rl.appendChild(el('b',null,'Memory'));rl.appendChild(el('span',null,'How much of your computer\u2019s memory the server can use. More helps big modpacks.'));ram.appendChild(rl);
-  var rc=el('div','ctl'),rs=el('select');var sys=Math.max(4,Math.floor(d.system_mb/1024*.8));for(var g=2;g<=sys;g++){var o=el('option',null,g+' GB');o.value=g*1024;rs.appendChild(o)}rs.value=Math.max(2048,Math.round(d.ram_mb/1024)*1024);rs.setAttribute('aria-label','Memory');rc.appendChild(rs);ram.appendChild(rc);box.appendChild(ram);setVals.__ram=rs;
+  var rc=el('div','ctl'),rs=el('select');var sys=Math.max(4,Math.floor(d.system_mb/1024*.8));for(var g=2;g<=sys;g++){var o=el('option',null,g+' GB');o.value=g*1024;rs.appendChild(o)}var curMb=Math.max(2048,Math.round(d.ram_mb/1024)*1024);if(!rs.querySelector('option[value="'+curMb+'"]')){var oc=el('option',null,Math.round(curMb/1024)+' GB');oc.value=curMb;rs.appendChild(oc)}rs.value=curMb;rs.setAttribute('aria-label','Memory');rc.appendChild(rs);ram.appendChild(rc);box.appendChild(ram);setVals.__ram=rs;
   var rec=Math.max(2,Math.round((d.rec_mb||4096)/1024)),sysg=Math.round(d.system_mb/1024),warnBox=el('div');box.appendChild(warnBox);
   var paintMem=function(){warnBox.textContent='';var w=memWarn(+rs.value/1024,rec,sysg,function(){rs.value=rec*1024;paintMem()});if(w)warnBox.appendChild(w)};rs.onchange=paintMem;paintMem();
   d.fields.forEach(function(f){var row=el('div','set'),l=el('div');l.appendChild(el('b',null,f.label));if(f.help)l.appendChild(el('span',null,f.help));row.appendChild(l);var c=el('div','ctl'),inp;
@@ -6699,7 +6858,7 @@ function loadSrvSettings(){api('/api/server/settings?id='+S.sid).then(function(d
     else{inp=el('input');inp.type='text';inp.value=f.value==null?'':f.value;if(f.type==='int')inp.inputMode='numeric';c.appendChild(inp)}
     inp.setAttribute('aria-label',f.label);setVals[f.key]=inp;row.appendChild(c);box.appendChild(row)})}).catch(function(e){toast(e.message,true)})}
 $('#set-save').onclick=function(){var vals={},ram=null;Object.keys(setVals).forEach(function(k){var i=setVals[k];if(k==='__ram'){ram=+i.value;return}vals[k]=i.type==='checkbox'?i.checked:i.value});
-  api('/api/server/settings',{id:S.sid,values:vals,ram_mb:ram}).then(function(){toast(srv&&srv.status.state==='online'?'Saved. Restart the server to use the new settings.':'Saved.');$('#stat-ram').textContent=Math.round(ram/1024)+' GB'}).catch(function(e){toast(e.message,true)})};
+  if(!(ram>0))ram=null;api('/api/server/settings',{id:S.sid,values:vals,ram_mb:ram}).then(function(){toast(srv&&srv.status.state==='online'?'Saved. Restart the server to use the new settings.':'Saved.');if(ram)$('#stat-ram').textContent=Math.round(ram/1024)+' GB'}).catch(function(e){toast(e.message,true)})};
 function squarePng(img,size){var c=document.createElement('canvas');c.width=c.height=size;var g=c.getContext('2d'),w=img.naturalWidth,h=img.naturalHeight,k=Math.max(size/w,size/h);
   g.imageSmoothingEnabled=!(Math.max(w,h)<=64&&size>=Math.max(w,h));g.imageSmoothingQuality='high';g.drawImage(img,(size-w*k)/2,(size-h*k)/2,w*k,h*k);return c.toDataURL('image/png')}
 function openIconPicker(){if(!srv)return;var s=srv.server,picked=null;
@@ -6724,7 +6883,7 @@ function openIconPicker(){if(!srv)return;var s=srv.server,picked=null;
   var sv=$('#m-foot .primary');if(sv)sv.disabled=true}
 $('#srv-icon').onclick=openIconPicker;$('#srv-icon-btn').onclick=openIconPicker;
 $('#srv-rename').onclick=function(){prompt2('Rename server','Give it a name you\u2019ll recognise.',srv.server.name,'Rename').then(function(n){if(!n)return;api('/api/servers/rename',{id:S.sid,name:n}).then(function(s){srv.server.name=s.name;$('#srv-name').textContent=s.name;var c=$('#crumb span');if(c)c.textContent=s.name;toast('Renamed')}).catch(function(e){toast(e.message,true)})})};
-$('#srv-remove').onclick=function(){ask('Remove from your list?','The server disappears from the app, but its folder and world stay on your computer. You can add it back any time.','Remove',true).then(function(ok){if(ok)api('/api/servers/remove',{id:S.sid}).then(function(){toast('Removed from your list');go('home')}).catch(function(e){toast(e.message,true)})})};
+$('#srv-remove').onclick=function(){ask('Remove from your list?','The server disappears from the app, but its folder and world stay on your computer. You can add it back any time.','Remove',true).then(function(ok){if(ok)api('/api/servers/remove',{id:S.sid}).then(function(){toast('Removed from your list');S.sid=null;go('home')}).catch(function(e){toast(e.message,true)})})};
 /* health */
 function renderHealth(){var h=$('#health');h.textContent='';var st=srv&&srv.status&&srv.status.state;
   if(st==='crashed'&&S.diag){h.appendChild(el('h3','sec-title','What went wrong'));h.appendChild(el('p','sec-sub',S.diag.summary||''));(S.diag.findings||[]).forEach(function(f){var x=el('div','finding '+(f.action==='manual'?'t-warn':'t-bad'));x.appendChild(icon('alert'));x.appendChild(el('div',null,f.message));h.appendChild(x)});
@@ -6790,7 +6949,8 @@ api('/api/info').then(function(d){S.info=d;S.home=d.home;S.sep=d.win?'\\':'/';va
     VIEWS.forEach(function(x){$('#v-'+x).hidden=x!=='install'});S.view='install';$('#go-settings').hidden=true;return}
   api('/api/events?since=0').then(function(ev){if(ev.state==='running'){S.jobKind=ev.kind;startProgress(ev.kind==='fix'?'fix':'build')}else go('home')}).catch(function(){go('home')}).then(function(){S.booted=true});
   pollUpdate();setInterval(pollUpdate,60000);
-  api('/api/whatsnew').then(function(w){if(w.notes)modal('What\u2019s new in '+w.version,renderNotes(w.notes),[{t:'Got it',primary:true,fn:function(){api('/api/whatsnew/seen',{}).catch(function(){})}}],function(){api('/api/whatsnew/seen',{}).catch(function(){})})}).catch(function(){});
+  api('/api/whatsnew').then(function(w){if(!w.notes)return;(function show(){if(!$('#veil').hidden){setTimeout(show,2500);return}   // never cover another dialog
+    modal('What\u2019s new in '+w.version,renderNotes(w.notes),[{t:'Got it',primary:true,fn:function(){api('/api/whatsnew/seen',{}).catch(function(){})}}],function(){api('/api/whatsnew/seen',{}).catch(function(){})})})()}).catch(function(){});
 }).catch(function(){buildScene();go('home')});
 setInterval(function(){if(!polling&&S.view!=='server')api('/api/ping').catch(function(){})},15000);
 buildScene();

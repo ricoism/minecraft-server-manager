@@ -178,4 +178,22 @@ r = m.set_server_icon(rec["id"], _png(256, 256), _png(64, 64))
 assert r["icon"].startswith("local:") and (d / "server-icon.png").is_file() and m.server_icon_bytes(r, "app")
 r = m.reset_server_icon(rec["id"]); assert r["icon"] == "" and not (d / "server-icon.png").exists()
 ok("custom icons: bad files are refused; saving and resetting work")
+# 17. "…" in a Windows-1252 server.properties (byte 0x85) doesn't split the line or corrupt the file on save
+d = srv("props"); (d / "server.properties").write_bytes(b"motd=Hello\x85 world\r\nmax-players=20\r\n")
+assert m.read_properties(d)["motd"] == "Hello\x85 world"
+m.write_properties(d, {"pvp": "false"})
+props = m.read_properties(d); assert props["motd"] == "Hello\x85 world" and props["max-players"] == "20", props
+ok("server.properties keeps lines intact with unusual characters")
+
+# 18. "Unsupported class file major version" means Java is too NEW: ask for the version the game needs
+fs = [f for f in m.analyze_text("java.lang.IllegalArgumentException: Unsupported class file major version 65", d,
+                                m.Ctx("1.12.2", "forge", log=log)) if f.kind == "java_version"]
+assert fs and fs[0].data["java"] == 8 and "too new" in fs[0].message, [f.message for f in fs]
+ok("too-new Java is recognised and the right Java (8) is requested")
+
+# 19. port messages use the server's own port
+(d / "server.properties").write_text("server-port = 25570\n")
+fs = [f for f in m.analyze_text("**** FAILED TO BIND TO PORT!", d, m.Ctx("1.20.1", "vanilla", log=log)) if f.kind == "port"]
+assert fs and "25570" in fs[0].message and m.server_port(d) == 25570, [f.message for f in fs]
+ok("port problems mention the server's real port")
 print("ALL REGRESSION TESTS PASSED")
