@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-APP_NAME = "Modpack Server Builder"
+APP_NAME = "Minecraft Server Manager"
 EXE_NAME = "ModpackServerBuilder"
 
 VERSION_INFO = """VSVersionInfo(

@@ -43,7 +43,7 @@ def changelog_section(version: str, path: Path) -> str:
 def notes_for(tag: str, changelog: Path) -> str:
     version = tag.lstrip("vV")
     return (tag_message(tag) or changelog_section(version, changelog)
-            or f"Modpack Server Builder {version}")
+            or f"Minecraft Server Manager {version}")
 
 
 def main():

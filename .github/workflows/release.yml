@@ -117,7 +117,12 @@ jobs:
           UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
         run: |
           cp dist/ModpackServerBuilder.exe dist/ModpackServerBuilder-Setup.exe
+          # Same program under the app's current name (for people downloading it); the old names stay
+          # because copies installed before the rename look for them when updating.
+          cp dist/ModpackServerBuilder.exe dist/MinecraftServerManager-Setup.exe
+          cp dist/ModpackServerBuilder.exe dist/MinecraftServerManager.exe
           python tools/write_sums.py --version "${{ steps.ver.outputs.version }}" --out dist/SHA256SUMS \
+            dist/MinecraftServerManager-Setup.exe dist/MinecraftServerManager.exe \
             dist/ModpackServerBuilder-Setup.exe dist/ModpackServerBuilder.exe
           python tools/release_sign.py dist/SHA256SUMS
           (cd dist && sha256sum -c SHA256SUMS)
@@ -137,7 +142,8 @@ jobs:
           fi
           # Create as a draft and publish once every asset is uploaded, so the app never sees a half release.
           gh release create "$TAG" "${WHERE[@]}" --draft \
-            --title "Modpack Server Builder ${{ steps.ver.outputs.version }}" \
+            --title "Minecraft Server Manager ${{ steps.ver.outputs.version }}" \
             --notes-file build/release_notes.md \
+            dist/MinecraftServerManager-Setup.exe dist/MinecraftServerManager.exe \
             dist/ModpackServerBuilder-Setup.exe dist/ModpackServerBuilder.exe dist/SHA256SUMS dist/SHA256SUMS.sig
           gh release edit "$TAG" --draft=false --latest

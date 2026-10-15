@@ -262,7 +262,7 @@ class TestCheck(Base):
         self.assertGreater(info["size"], 0)
         path, headers = self.gh.hits[0]
         self.assertEqual(path, f"/repos/{M.UPDATE_REPO}/releases/latest")
-        self.assertIn("ModpackServerBuilder", {k.lower(): v for k, v in headers.items()}["user-agent"])
+        self.assertIn("MinecraftServerManager", {k.lower(): v for k, v in headers.items()}["user-agent"])
 
     def test_not_newer(self):
         for tag in (f"v{M.APP_VERSION}", "v0.0.1"):

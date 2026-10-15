@@ -4,10 +4,10 @@ cd /d "%~dp0"
 set PY=python
 where py >nul 2>nul && set PY=py -3
 %PY% -m pip install --upgrade pyinstaller || goto :fail
-%PY% -m PyInstaller --noconfirm --clean --onefile --windowed --name "Modpack Server Builder" --icon assets\app.ico --add-binary "vendor\webview.dll;." --add-data "assets\app.ico;." --exclude-module tkinter --exclude-module unittest --exclude-module pydoc modpack_server_builder.py || goto :fail
-copy /y "dist\Modpack Server Builder.exe" "dist\Modpack Server Builder Setup.exe" >nul
+%PY% -m PyInstaller --noconfirm --clean --onefile --windowed --name "Minecraft Server Manager" --icon assets\app.ico --add-binary "vendor\webview.dll;." --add-data "assets\app.ico;." --exclude-module tkinter --exclude-module unittest --exclude-module pydoc modpack_server_builder.py || goto :fail
+copy /y "dist\Minecraft Server Manager.exe" "dist\Minecraft Server Manager Setup.exe" >nul
 echo.
-echo Done: dist\Modpack Server Builder Setup.exe  (installer)  and  dist\Modpack Server Builder.exe  (portable)
+echo Done: dist\Minecraft Server Manager Setup.exe  (installer)  and  dist\Minecraft Server Manager.exe  (portable)
 pause
 exit /b 0
 :fail

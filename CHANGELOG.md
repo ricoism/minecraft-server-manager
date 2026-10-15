@@ -11,6 +11,12 @@ How to write an entry (for whoever makes the next update):
   * One short sentence per line. Bold the thing they'll look for, e.g. **Fix it for me**.
 -->
 
+## 3.4.0 - October 15, 2026
+
+### New
+- **New name: Minecraft Server Manager.** The app used to be called Modpack Server Builder. Your Start menu and desktop shortcuts, the title bar and Installed apps now show the new name.
+- Nothing else changes: your servers, settings and downloads all stay exactly where they were. A taskbar button you pinned keeps working.
+
 ## 3.3.0 - October 15, 2026
 
 ### New

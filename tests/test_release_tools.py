@@ -95,7 +95,7 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(release_notes.changelog_section("3.1.0", cl), "- Auto updates\n- Faster")
         self.assertEqual(release_notes.changelog_section("3.0.0", cl), "- First")
         self.assertEqual(release_notes.changelog_section("3.0.1", cl), "")
-        self.assertEqual(release_notes.notes_for("v9.9.9-nope", cl), "Modpack Server Builder 9.9.9-nope")
+        self.assertEqual(release_notes.notes_for("v9.9.9-nope", cl), "Minecraft Server Manager 9.9.9-nope")
 
 
 if __name__ == "__main__":

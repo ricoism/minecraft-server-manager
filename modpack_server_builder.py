@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Modpack Server Builder  (v2)
-============================
+Minecraft Server Manager  (formerly Modpack Server Builder)
+==========================================================
 Turn a client-only Minecraft modpack into a ready-to-run dedicated server,
 and automatically work out which mods don't belong on a server.
 
@@ -56,7 +56,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-UA = "ModpackServerBuilder/2.0 (personal tool)"
+UA = "MinecraftServerManager/3 (+https://github.com/ricoism/minecraft-server-manager)"
 MODRINTH = "https://api.modrinth.com/v2"
 STATE_FILE = ".modpack_builder.json"
 REPORT_FILE = "SERVER_BUILD_REPORT.txt"
@@ -67,7 +67,8 @@ BUCKETS = {
 }
 CONF_RANK = {"low": 0, "medium": 1, "high": 2}
 IS_WIN = os.name == "nt"
-APP_NAME = "Modpack Server Builder"
+APP_NAME = "Minecraft Server Manager"
+LEGACY_NAME = "Modpack Server Builder"   # the app's old name: existing installs keep this folder and file name
 # Child processes (java, installers) must not flash console windows when running as a windowed .exe
 NOWIN = {"creationflags": 0x08000000} if IS_WIN else {}
 
@@ -3164,7 +3165,7 @@ def recommended_ram_mb(server_dir_or_mod_count, system_mb) -> int:
 # exe (handle_update_args at the top of main) waits for the old file to be released, swaps itself
 # in, re-registers Installed apps and relaunches the target with --updated <version>.
 
-UPDATE_REPO = "ricoism/modpack-server-builder"
+UPDATE_REPO = "ricoism/minecraft-server-manager"
 GITHUB_API = "https://api.github.com"
 UPDATE_PUBKEY = "bc5632337815cc7be10d669f2a77a72cf14ca90256608db0a429b4bbbbe1f9ef"   # Ed25519, release signing
 UPDATE_SETUP_ASSET = "ModpackServerBuilder-Setup.exe"
@@ -3615,7 +3616,8 @@ def _cleanup_leftovers(folder=None, min_age=300):
         if not is_frozen():
             return
         folder = Path(sys.executable).parent
-    names = {Path(sys.executable).name, f"{APP_NAME}.exe", "ModpackServerBuilder.exe", UPDATE_SETUP_ASSET}
+    names = {Path(sys.executable).name, f"{APP_NAME}.exe", f"{LEGACY_NAME}.exe", "ModpackServerBuilder.exe",
+             UPDATE_SETUP_ASSET}
     now = time.time()
     try:
         for f in Path(folder).iterdir():
@@ -3665,7 +3667,7 @@ def finish_update_mode(target, source=None, wait=90.0) -> bool:
             if waited >= wait:
                 new.unlink(missing_ok=True)
                 _ulog(f"finish-update: {target} stayed locked: {e}")
-                message_box("The update couldn't be installed because Modpack Server Builder is still "
+                message_box(f"The update couldn't be installed because {APP_NAME} is still "
                             "running.\n\nClose it and it will update next time.", 0x30)
                 try:
                     _spawn_detached([target], cwd=target.parent)
@@ -4965,7 +4967,7 @@ class NativeWindow:
         if runner is not None and getattr(runner, "state", "offline") in ("starting", "online", "stopping"):
             return "Your server is still running.\n\nStop it safely (saving the world) and close the app?"
         if self.app.busy():
-            return "A task is still running.\n\nStop it and close Modpack Server Builder?"
+            return f"A task is still running.\n\nStop it and close {APP_NAME}?"
         return None
 
     def _wndproc(self, hwnd, msg, wp, lp):
@@ -5205,11 +5207,15 @@ def run_native_window(app, url, dark) -> bool:
 # ---- install / uninstall (per user, no admin) ------------------------------------------------
 
 def install_dir() -> Path:
-    return Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Programs" / APP_NAME
+    """Installs made before the rename stay where they are (moving a running app is risky); new ones use the new name."""
+    base = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Programs"
+    legacy = base / LEGACY_NAME
+    return legacy if (legacy / f"{LEGACY_NAME}.exe").is_file() else base / APP_NAME
 
 
 def installed_exe() -> Path:
-    return install_dir() / f"{APP_NAME}.exe"
+    d = install_dir()
+    return d / (f"{LEGACY_NAME}.exe" if d.name == LEGACY_NAME else f"{APP_NAME}.exe")
 
 
 def is_install_mode(flag=False) -> bool:
@@ -5389,15 +5395,25 @@ def refresh_shell_icons(exe: Path):
         _ulog(f"icons: couldn't write the icon file: {e!r}")
     _ulog(f"icons: refreshing shortcuts for {exe} (icon {icon})")
     links = []
-    for folder, always in ((known_folder(FOLDER_PROGRAMS), True), (known_folder(FOLDER_DESKTOP), False),
-                           (pinned_taskbar_dir(), False)):
+    for folder, always in ((known_folder(FOLDER_PROGRAMS), True), (known_folder(FOLDER_DESKTOP), False)):
         if not folder:
             continue
-        lnk = os.path.join(str(folder), APP_NAME + ".lnk")
-        if always or os.path.isfile(lnk):
+        lnk, old = os.path.join(str(folder), APP_NAME + ".lnk"), os.path.join(str(folder), LEGACY_NAME + ".lnk")
+        had_old = os.path.isfile(old)
+        if always or had_old or os.path.isfile(lnk):
+            try:
+                _shell_link(lnk, exe, icon)                  # under the app's current name
+                links.append(lnk)
+                if had_old:
+                    os.remove(old)
+            except Exception:  # noqa: BLE001
+                pass
+    pin = pinned_taskbar_dir()
+    for name in (APP_NAME, LEGACY_NAME):                         # pinned buttons: refresh in place, never rename
+        lnk = os.path.join(str(pin), name + ".lnk") if pin else ""
+        if lnk and os.path.isfile(lnk):
             try:
                 _shell_link(lnk, exe, icon)
-                links.append(lnk)
             except Exception:  # noqa: BLE001
                 pass
     try:
@@ -5469,7 +5485,7 @@ def install_app(desktop=True) -> Path:
                 time.sleep(0.5)
         else:
             tmp.unlink(missing_ok=True)
-            raise RuntimeError("Modpack Server Builder is still open. Close it and try again.")
+            raise RuntimeError(f"{APP_NAME} is still open. Close it and try again.")
     icon = None
     try:
         icon = write_versioned_icon(dst.parent)
@@ -5490,7 +5506,7 @@ def install_app(desktop=True) -> Path:
 def uninstall_app(quiet=False):
     if not IS_WIN:
         raise RuntimeError("Uninstall is only available on Windows.")
-    if not quiet and message_box("Remove Modpack Server Builder from this PC?\n\n"
+    if not quiet and message_box(f"Remove {APP_NAME} from this PC?\n\n"
                                  "Servers you built are not touched.", 0x4 | 0x20) != 6:
         return False
     quit_existing_instance()
@@ -5504,7 +5520,7 @@ def uninstall_app(quiet=False):
                  os.environ.get("APPDATA", "") + r"\Microsoft\Windows\Start Menu\Programs",
                  os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")):
         if base:
-            links.append(os.path.join(base, APP_NAME + ".lnk"))
+            links += [os.path.join(base, n + ".lnk") for n in (APP_NAME, LEGACY_NAME)]
     for p in links:
         try:
             os.remove(p)
@@ -5516,13 +5532,14 @@ def uninstall_app(quiet=False):
     except OSError:
         pass
     shutil.rmtree(app_data_dir(), ignore_errors=True)
-    for n in (f"{APP_NAME}.exe", f"{APP_NAME} Setup.exe"):          # WebView2 keeps its data per exe name
+    for n in (f"{APP_NAME}.exe", f"{APP_NAME} Setup.exe", f"{LEGACY_NAME}.exe", f"{LEGACY_NAME} Setup.exe",
+              "ModpackServerBuilder.exe", "ModpackServerBuilder-Setup.exe"):   # WebView2 keeps its data per exe name
         shutil.rmtree(os.path.join(os.environ.get("APPDATA", ""), n), ignore_errors=True)
     # This program is running from the folder being removed: let cmd finish the job after we exit.
     subprocess.Popen(f'cmd /c ping 127.0.0.1 -n 4 >nul & rmdir /s /q "{d}"', shell=False,
                      creationflags=0x08000000 | 0x00000008, close_fds=True)   # no window, detached
     if not quiet:
-        message_box("Modpack Server Builder has been removed.", 0x40)
+        message_box(f"{APP_NAME} has been removed.", 0x40)
     return True
 
 
@@ -5699,7 +5716,7 @@ PAGE_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <meta name="theme-color" content="#121a3d" id="theme-color">
-<title>Modpack Server Builder</title>
+<title>Minecraft Server Manager</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='4 3 24 26'%3E%3Cpath d='M6.5 10.7L16 15.9v10.6l-9.5-5.2z' fill='%238a5a36'/%3E%3Cpath d='M25.5 10.7L16 15.9v10.6l9.5-5.2z' fill='%236b4428'/%3E%3Cpath d='M16 5.5l9.5 5.2L16 15.9 6.5 10.7z' fill='%235fe08c'/%3E%3C/svg%3E">
 <script>(function(){var m='auto';try{m=localStorage.getItem('msb-theme-mode')||'auto'}catch(e){}var h=new Date().getHours(),sky=h>=5&&h<8?'dawn':h>=8&&h<17?'day':h>=17&&h<20?'dusk':'night';var t=m==='auto'?(sky==='day'||sky==='dawn'?'light':'dark'):m;if(t==='dark'&&(sky==='day'||sky==='dawn'))sky='night';if(t==='light'&&(sky==='night'||sky==='dusk'))sky='day';var r=document.documentElement;r.dataset.theme=t;r.dataset.sky=sky;var mo='on';try{mo=localStorage.getItem('msb-motion')||'on'}catch(e){}r.dataset.motion=mo==='off'?'off':'on'})()</script>
 <style>
@@ -6136,7 +6153,7 @@ details.log summary::-webkit-details-marker{display:none}
 <!-- ======================= title bar ======================= -->
 <header class="tb" id="tb">
   <div class="drag" id="drag">
-    <button class="brand" id="go-home" title="All servers"><svg class="logo"><use href="#i-gblock"/></svg><b>Modpack Server Builder</b></button>
+    <button class="brand" id="go-home" title="All servers"><svg class="logo"><use href="#i-gblock"/></svg><b>Minecraft Server Manager</b></button>
     <nav class="crumb" id="crumb" aria-label="Where you are"></nav>
   </div>
   <button class="running-pill job" id="job-pill" hidden><i></i><span></span></button><button class="running-pill" id="run-pill" hidden><i></i><span></span></button>
@@ -6314,7 +6331,7 @@ details.log summary::-webkit-details-marker{display:none}
 
 <!-- ======================= installer ======================= -->
 <section class="view" id="v-install" hidden>
-  <h1>Install Modpack Server Builder</h1>
+  <h1>Install Minecraft Server Manager</h1>
   <p class="lede">Adds it to your Start menu so it opens like any other app. It installs for your Windows account only, so no administrator password is needed.</p>
   <div class="glass panel form" style="margin-top:26px" data-shine>
     <div class="kv"><div class="t"><b id="inst-title">Ready to install</b><span id="inst-sub"></span></div><svg width="44" height="44"><use href="#i-block"/></svg></div>
@@ -6743,7 +6760,7 @@ $('#upd-pill').onclick=function(){installUpdate(false)};
 $('#upd-check').onclick=function(){if(upd.state==='ready'){installUpdate(false);return}api('/api/update/check',{}).then(function(d){upd=d;paintUpdate();setTimeout(pollUpdate,1500)}).catch(function(){})};
 function installUpdate(auto){api('/api/servers').then(function(d){S.servers=d.servers}).catch(function(){}).then(function(){showUpdate(auto)})}
 function showUpdate(auto){var box=el('div','notes'),cur=upd.current||S.info.version,rs=runningServer();
-  box.appendChild(el('p',null,'Version '+upd.version+' of Modpack Server Builder is ready'+(cur?'. You have version '+cur+'.':'.')+' Updating takes a few seconds: the app closes, updates and opens again.'));
+  box.appendChild(el('p',null,'Version '+upd.version+' of Minecraft Server Manager is ready'+(cur?'. You have version '+cur+'.':'.')+' Updating takes a few seconds: the app closes, updates and opens again.'));
   if(rs){var w=el('p',null,'\u201c'+rs.name+'\u201d is running. Updating stops it safely first (your world is saved). You can start it again afterwards.');w.style.color='var(--t-warn)';box.appendChild(w)}
   if(upd.notes){box.appendChild(el('h4',null,'What\u2019s new'));box.appendChild(renderNotes(upd.notes))}
   modal('Update available',box,[{t:'Remind me later',fn:function(){if(auto)toast('No problem. Click \u201cUpdate ready\u201d at the top whenever you like.')}},
@@ -6759,7 +6776,7 @@ $('#whats-new').onclick=function(){api('/api/whatsnew?force=1').then(function(d)
 var installed=false;
 $('#skip-install').onclick=function(){go('home')};
 $('#go-install').onclick=function(){var b=this;if(installed){b.disabled=true;api('/api/launch_installed',{}).then(function(){document.body.textContent=''}).catch(function(e){b.disabled=false;toast(e.message,true)});return}
-  b.disabled=true;b.textContent='Installing\u2026';api('/api/install',{desktop:$('#i-desktop').checked}).then(function(){installed=true;b.disabled=false;b.textContent='Open Modpack Server Builder';$('#inst-title').textContent='Installed';
+  b.disabled=true;b.textContent='Installing\u2026';api('/api/install',{desktop:$('#i-desktop').checked}).then(function(){installed=true;b.disabled=false;b.textContent='Open Minecraft Server Manager';$('#inst-title').textContent='Installed';
     $('#inst-sub').textContent='You\u2019ll find it in your Start menu'+($('#i-desktop').checked?' and on your desktop.':'.')}).catch(function(e){b.disabled=false;b.textContent='Install';toast(e.message,true)})};
 
 /* ---------- close protection (browser/Edge window only; the native window asks itself) ---------- */

@@ -1,14 +1,14 @@
-# Modpack Server Builder
+# Minecraft Server Manager
 
 Turn any Minecraft modpack into a working server in a few clicks, even when the modpack has no server files.
 No knowledge of servers, Java or coding needed.
 
-**[Download for Windows](https://github.com/ricoism/modpack-server-builder/releases/latest/download/ModpackServerBuilder-Setup.exe)**
+**[Download for Windows](https://github.com/ricoism/minecraft-server-manager/releases/latest/download/MinecraftServerManager-Setup.exe)**
 · [What's new](CHANGELOG.md)
 
 ## Using it
 
-1. Download and open **ModpackServerBuilder-Setup.exe**. It installs itself (no admin needed) and adds a Start menu shortcut.
+1. Download and open **MinecraftServerManager-Setup.exe**. It installs itself (no admin needed) and adds a Start menu shortcut.
    - Windows may show "Windows protected your PC" the first time. Click **More info**, then **Run anyway**.
 2. Click **Create a server**, search for a modpack (or pick a file you downloaded, or plain Minecraft) and follow the three steps.
 3. Press **Start**. Share the address shown under "How to join" with your friends.
@@ -49,4 +49,4 @@ with the changelog entry as its notes. Installed apps pick it up within a few ho
 - Fonts: Bricolage Grotesque and Silkscreen (SIL Open Font License), see `licenses/`.
 - Mod data: [Modrinth](https://modrinth.com). Java: [Eclipse Temurin](https://adoptium.net).
 
-Not affiliated with Mojang or Microsoft.
+Formerly called Modpack Server Builder. Not an official Minecraft product; not approved by or associated with Mojang or Microsoft.
