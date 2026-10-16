@@ -196,4 +196,62 @@ ok("too-new Java is recognised and the right Java (8) is requested")
 fs = [f for f in m.analyze_text("**** FAILED TO BIND TO PORT!", d, m.Ctx("1.20.1", "vanilla", log=log)) if f.kind == "port"]
 assert fs and "25570" in fs[0].message and m.server_port(d) == 25570, [f.message for f in fs]
 ok("port problems mention the server's real port")
+# 20. modpack file names with characters Windows forbids (":" in "Technical Electrical: Striking Surprise") are made safe
+assert m.win_safe_filename("Technical Electrical: Striking Surprise-6.2.12.mrpack") == "Technical Electrical_ Striking Surprise-6.2.12.mrpack"
+assert m.win_safe_filename('a<b>c"d|e?f*.zip') == "a_b_c_d_e_f_.zip" and m.win_safe_filename("CON.jar").lower() != "con.jar"
+assert m.win_safe_filename("trailing. ") == "trailing" and m.win_safe_filename("") == "download"
+ok("download names are made safe for Windows")
+
+# 21. errors while creating a server come with plain steps
+e = OSError("[WinError 87] The parameter is incorrect: 'C:\\x\\Pack: 1.mrpack.part' -> 'C:\\x\\Pack: 1.mrpack'")
+x = m.explain_error(e); assert x["title"] and len(x["steps"]) >= 2 and "WinError 87" in x["details"], x
+x = m.explain_error(OSError("[Errno 28] No space left on device")); assert "space" in (x["title"] + " ".join(x["steps"])).lower(), x
+x = m.explain_error(RuntimeError("something odd")); assert x["steps"] and "github" in " ".join(x["steps"]).lower(), x
+ok("errors are explained step by step")
+
+# 22. Mods tab checks: client-only, wrong loader, wrong Minecraft version, plugins, duplicates, missing dependencies
+assert m.mc_req_matches(("fabric", "~1.20.1"), "1.20.4") is True and m.mc_req_matches(("fabric", "1.21.x"), "1.20.1") is False
+assert m.mc_req_matches(("maven", "[1.20.1,1.21)"), "1.21") is False and m.mc_req_matches(("maven", "1.20.1"), "1.19") is None
+d = srv("modtab"); (d / "server.properties").write_text("")
+forge(d / "mods/create.jar", "create")
+src = TMP / "newmods"
+a = jar(src / "sodium.jar", {"fabric.mod.json": json.dumps({"id": "sodium", "name": "Sodium", "environment": "client", "depends": {"minecraft": "1.21.x"}})})
+b = forge(src / "create-copy.jar", "create", deps=["flywheel"])
+c = jar(src / "Essentials.jar", {"plugin.yml": "name: x"})
+r = m.add_mods(d, [a, b, c, src / "missing.jar"], {"mc": "1.20.1", "loader": "forge"}, online=False)
+kinds = {x["file"]: sorted(w["kind"] for w in x["warnings"]) for x in r["added"]}
+assert kinds == {"sodium.jar": ["client", "loader", "version"], "create-copy.jar": ["deps", "duplicate"], "Essentials.jar": ["plugin"]}, kinds
+assert r["skipped"] and r["skipped"][0]["file"] == "missing.jar"
+m.set_mod_enabled(d, "sodium.jar", False); assert (d / "mods/sodium.jar.disabled").exists()
+m.remove_user_mod(d, "Essentials.jar"); assert [x["jar"] for x in m.summarize_server(d)["removed"]] == ["Essentials.jar"]
+for bad in ("../x.jar", "create.txt"):
+    try:
+        m.set_mod_enabled(d, bad, True); raise AssertionError("accepted " + bad)
+    except ValueError:
+        pass
+ok("mods are checked when added; turn off/remove work and refuse odd names")
+
+# 23. deleting a server refuses folders that aren't just a server
+home_rec = m.add_server(Path.home(), "home as server", {})
+try:
+    m.delete_server_folder(home_rec["id"]); raise AssertionError("deleted the home folder")
+except ValueError:
+    pass
+d = srv("todelete"); (d / "server.properties").write_text(""); rec = m.add_server(d, "del", {})
+m.delete_server_folder(rec["id"]); assert not d.exists() and all(x["id"] != rec["id"] for x in m.list_servers())
+ok("Delete server removes a server folder but never the home folder")
+
+# 24. player names and offline UUIDs
+m.check_player_name("Steve_2")
+try:
+    m.check_player_name("bad name!"); raise AssertionError("accepted a bad name")
+except ValueError:
+    pass
+assert m.offline_uuid("Notch") == "b50ad385-829d-3141-a216-7e7d7539ba7f"
+ok("offline-mode UUIDs match Minecraft's")
+
+# 25. the tick probe command for each kind of server
+assert m.tick_probe_command("1.21.4", "fabric") == "tick query" and m.tick_probe_command("1.20.1", "forge") == "forge tps"
+assert m.tick_probe_command("1.20.4", "neoforge") == "tick query" and m.tick_probe_command("1.12.2", "vanilla") is None
+ok("the right tick-speed command is used for each server")
 print("ALL REGRESSION TESTS PASSED")

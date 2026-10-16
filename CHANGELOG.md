@@ -11,6 +11,33 @@ How to write an entry (for whoever makes the next update):
   * One short sentence per line. Bold the thing they'll look for, e.g. **Fix it for me**.
 -->
 
+## 3.6.0 - October 15, 2026
+
+A big update with lots of things you asked for.
+
+### New
+- **A Mods tab for each modded server.** See every mod, add more with **Add mods** (or drop .jar files on it), turn mods off without deleting them, remove them and put them back. **Open mods folder** takes you straight there.
+- **Mods are checked when you add them.** The app warns you if a mod only works inside the game (client-side), is made for a different loader (like a Fabric mod on a Forge server), is for another Minecraft version, is a plugin rather than a mod, is already installed, or needs another mod you don't have.
+- **Live memory and tick speed.** Start a server and the Health tab shows how much memory it uses and its average tick time (and TPS), with small graphs, like Minecraft's own server window.
+- **Make someone an operator in one click.** The Players tab has an **Operators** list. If your server uses a whitelist, you can add and remove players there too, or turn the whitelist on. It works whether the server is running or not.
+- **Right-click a server** on the home screen to start or stop it, edit its settings, manage mods or players, open its folder, change its icon, rename it, remove it from the list or delete it.
+- **Delete a server.** Deleting moves its folder to the Recycle Bin, so you can still get it back.
+- **All the important server settings** are now in Settings, grouped into Basics, Players, World, Performance and Advanced. Any other lines in your server.properties are listed too.
+- **Edit server.properties yourself.** A button opens the file in Notepad. Save it (Ctrl+S) before you close Notepad.
+
+### Better
+- **Your IP addresses are hidden by default**, so they don't end up in screenshots or streams. Press **Show** to see them. **Copy** always copies the real address, even while it's hidden.
+- **The Save button in server settings is always on screen.** No more scrolling to the bottom. If you try to leave with unsaved changes, the app asks whether to save them.
+- "Server name in the list" is now called **Server MOTD**.
+- **Choosing files and folders uses the normal Windows "Open" window.** Prefer the one built into the app? Pick it in Settings → **Choosing files and folders**. The built-in one now looks and works like File Explorer.
+- **Creating a server: the Next button is always visible**, and shows what you picked. Double-click a modpack to go straight to the next step.
+- **When creating a server fails, the app tells you what to do, step by step**, with **Try again** and **Copy details** buttons.
+
+### Fixed
+- **Some modpacks couldn't be downloaded** ("The parameter is incorrect") because their name contains a character Windows doesn't allow in file names, like ":". Those names are now made safe.
+- A failed setup no longer leaves an empty server behind in your list.
+- The app could sometimes show an error or a blank list for a moment, because one of its answers got mixed up with the next one. That's fixed.
+
 ## 3.5.1 - October 15, 2026
 
 A big round of fixes after a full check-up of the app.

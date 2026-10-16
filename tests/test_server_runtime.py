@@ -596,9 +596,13 @@ class PropertiesTests(unittest.TestCase):
 class SettingsTests(unittest.TestCase):
     def test_schema(self):
         keys = [s["key"] for s in m.PROPERTY_SCHEMA]
-        self.assertEqual(keys, ["motd", "max-players", "difficulty", "gamemode", "pvp", "white-list",
-                                "online-mode", "allow-flight", "view-distance", "spawn-protection",
-                                "server-port", "level-seed"])
+        important = ["motd", "max-players", "difficulty", "gamemode", "hardcore", "pvp", "white-list",
+                     "enforce-whitelist", "online-mode", "allow-flight", "view-distance", "simulation-distance",
+                     "spawn-protection", "server-port", "level-seed", "level-name", "level-type", "allow-nether",
+                     "max-tick-time", "enable-command-block", "op-permission-level", "player-idle-timeout"]
+        self.assertEqual([k for k in important if k not in keys], [])
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertEqual(keys[0], "motd")
         for s in m.PROPERTY_SCHEMA:
             self.assertTrue({"key", "label", "help", "type", "default"} <= set(s), s["key"])
             self.assertIn(s["type"], ("text", "int", "bool", "choice"))
@@ -607,8 +611,8 @@ class SettingsTests(unittest.TestCase):
             if s["type"] == "choice":
                 self.assertTrue(all(len(c) == 2 for c in s["choices"]))
         by = {s["key"]: s for s in m.PROPERTY_SCHEMA}
-        self.assertEqual(by["motd"]["label"], "Server name in the list")
-        self.assertEqual(by["white-list"]["label"], "Only let people I approve join")
+        self.assertEqual(by["motd"]["label"], "Server MOTD")
+        self.assertTrue(by["white-list"]["label"].startswith("Only let people I approve join"))
         self.assertIn("unsafe", by["online-mode"]["help"])
         self.assertIn("flying", by["allow-flight"]["help"])
         json.dumps(m.PROPERTY_SCHEMA)

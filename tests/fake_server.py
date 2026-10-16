@@ -35,7 +35,7 @@ if mode == "crash" and os.path.exists("mods/fancyhud.jar"):
         f.write("\n".join(trace) + "\n")
     sys.exit(1)
 
-srv("Starting minecraft server version 1.20.1")
+srv("Starting minecraft server version " + (open("fake_version.txt").read().strip() if os.path.exists("fake_version.txt") else "1.20.1"))
 srv("Starting Minecraft server on *:" + os.environ.get("FAKE_PORT", "25570"))
 srv("\x1b[33mLoading properties\x1b[m")
 if mode == "slow":
@@ -49,6 +49,11 @@ for line in sys.stdin:
     word, _, rest = cmd.partition(" ")
     if word == "list":
         srv(f"There are {len(players)} of a max of 20 players online: {', '.join(players)}", logger="minecraft/MinecraftServer")
+    elif cmd == "tick query":
+        srv("The game is running normally", logger="minecraft/MinecraftServer")
+        srv("Target tick rate: 20.0 per second.", logger="minecraft/MinecraftServer")
+        srv("Average time per tick: 7.4ms (Target: 50.0ms)", logger="minecraft/MinecraftServer")
+        srv("Percentiles: P50: 7.1ms P95: 9.8ms P99: 12.0ms, sample: 100", logger="minecraft/MinecraftServer")
     elif word == "say":
         srv(f"[Server] {rest}", logger="minecraft/MinecraftServer")
     elif word == "join":

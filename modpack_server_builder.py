@@ -64,6 +64,7 @@ BUCKETS = {
     "client_only": "mods_removed_client_only",
     "problem": "mods_removed_problem_mods",
     "duplicates": "mods_removed_duplicates",
+    "user": "mods_removed_by_you",
 }
 CONF_RANK = {"low": 0, "medium": 1, "high": 2}
 IS_WIN = os.name == "nt"
@@ -102,7 +103,7 @@ def check_cancel():
 
 _SETTINGS_LOCK = threading.Lock()
 SETTINGS_KEYS = {"theme", "ram", "eula", "test", "aggressive", "cfkey", "desktop_shortcut", "recent",
-                 "servers", "titlebar", "seen_version", "updates", "update_skip"}
+                 "servers", "titlebar", "seen_version", "updates", "update_skip", "showprivate", "picker"}
 
 
 def load_settings() -> dict:
@@ -216,8 +217,25 @@ def download(url, dest: Path, headers=None, sha1=None, sha512=None, retries=3, s
     raise RuntimeError(f"{url}: {last}")
 
 
+_WIN_BAD_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
+_WIN_DEVICES = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
+
+
+def win_safe_filename(name: str, fallback="download") -> str:
+    """A file name every Windows PC accepts. Modpack and mod names can contain characters such as ':' that
+    Windows refuses (a name with ':' fails with "[WinError 87] The parameter is incorrect")."""
+    n = _WIN_BAD_CHARS.sub("_", str(name or "")).replace("/", "_").replace("\\", "_").strip().rstrip(". ")
+    if not n:
+        n = fallback
+    if n.split(".")[0].strip().lower() in _WIN_DEVICES:
+        n = "_" + n
+    return n[:200]
+
+
 def safe_join(base: Path, rel: str) -> Path:
     base_r = base.resolve()
+    parts = [x for x in re.split(r"[\\/]+", str(rel)) if x and x != "."]
+    rel = "/".join(x if x == ".." else win_safe_filename(x) for x in parts)
     p = (base / rel).resolve()
     if p != base_r and base_r not in p.parents:
         raise ValueError(f"Unsafe path in modpack: {rel}")
@@ -592,6 +610,8 @@ class ModInfo:
         self.packages, self.mixins = set(), set()
         self.dup_ids = set()      # ids from modern metadata only (mcmod.info ids are often copied boilerplate)
         self.broken = False
+        self.title = ""           # the mod's display name
+        self.mc_req = None        # ("fabric", spec) or ("maven", range): which Minecraft versions it says it supports
 
     @property
     def name(self):
@@ -601,16 +621,20 @@ class ModInfo:
         return f"<ModInfo {self.name} {sorted(self.own_ids)}>"
 
 
-def parse_mods_toml(text):
+def parse_mods_toml(text, extra=None):
     ids, deps, version = [], [], ""
     section, cur, multiline = None, {}, None
+    extra = {} if extra is None else extra
 
     def flush():
         nonlocal version
         if section == "mods" and cur.get("modId"):
             ids.append(cur["modId"])
             version = version or cur.get("version", "")
+            extra.setdefault("title", cur.get("displayName", ""))
         elif section and section.startswith("dependencies.") and cur.get("modId"):
+            if cur["modId"] == "minecraft" and cur.get("versionRange"):
+                extra.setdefault("mc", cur["versionRange"])
             mand = str(cur.get("mandatory", "")).lower()
             client_only = str(cur.get("side", "")).upper() == "CLIENT"
             if not client_only and (mand == "true" or str(cur.get("type", "")).lower() == "required"):
@@ -666,10 +690,13 @@ def _scan_zip(z, info, depth):
                 if pid:
                     info.provided.add(pid)
             info.version = info.version or str(d.get("version", ""))
+            info.title = info.title or str(d.get("name") or "")
             if str(d.get("environment", "*")).lower() == "client":
                 info.env = "client"
             if isinstance(d.get("depends"), dict):
                 info.deps |= set(d["depends"].keys())
+                if d["depends"].get("minecraft") and depth == 0:
+                    info.mc_req = info.mc_req or ("fabric", d["depends"]["minecraft"])
     except Exception:  # noqa: BLE001
         pass
     try:
@@ -686,6 +713,7 @@ def _scan_zip(z, info, depth):
                 if pid:
                     info.provided.add(pid)
             info.version = info.version or str(ql.get("version", ""))
+            info.title = info.title or str((ql.get("metadata") or {}).get("name") or "")
             if str((d.get("minecraft") or {}).get("environment", "*")).lower() == "client":
                 info.env = "client"
             for dep in ql.get("depends") or []:
@@ -698,7 +726,11 @@ def _scan_zip(z, info, depth):
     for tn in ("META-INF/mods.toml", "META-INF/neoforge.mods.toml"):
         try:
             if tn in nameset:
-                ids, deps, ver = parse_mods_toml(rd(tn))
+                ex = {}
+                ids, deps, ver = parse_mods_toml(rd(tn), ex)
+                info.title = info.title or ex.get("title", "")
+                if ex.get("mc") and depth == 0:
+                    info.mc_req = info.mc_req or ("maven", ex["mc"])
                 info.loader = info.loader or ("neoforge" if "neoforge" in tn else "forge")
                 info.own_ids |= set(ids)
                 info.dup_ids |= set(ids)
@@ -713,6 +745,7 @@ def _scan_zip(z, info, depth):
             lst = d.get("modList", []) if isinstance(d, dict) else d
             for e in lst or []:
                 if e.get("modid"):
+                    info.title = info.title or str(e.get("name") or "")
                     info.own_ids.add(e["modid"])
                     info.provided.add(e["modid"])
                     info.version = info.version or str(e.get("version", ""))
@@ -1139,7 +1172,7 @@ def fetch_curseforge_file(f, mods_dir: Path, api_key):
         try:
             data = get_json(f"https://api.curseforge.com/v1/mods/{pid}/files/{fid}",
                             {"x-api-key": api_key})["data"]
-            name = data["fileName"]
+            name = win_safe_filename(data["fileName"], f"{pid}-{fid}.jar")
             if not name.lower().endswith(".jar"):
                 return f"skipped {name} (not a mod)"
             urls = [data.get("downloadUrl"),
@@ -1172,7 +1205,7 @@ def fetch_curseforge_file(f, mods_dir: Path, api_key):
                 tmp.unlink(missing_ok=True)
                 return f"skipped {name} (not a mod)"
             name = Path(name).stem + ".jar" if name else f"{pid}-{fid}.jar"
-        os.replace(tmp, mods_dir / Path(name).name)
+        os.replace(tmp, mods_dir / win_safe_filename(Path(name).name, f"{pid}-{fid}.jar"))
         return name
     except Cancelled:
         raise
@@ -1425,7 +1458,7 @@ def install_dependency(modid, ctx: Ctx, mods_dir: Path):
     versions.sort(key=lambda v: (v.get("version_type") == "release", v.get("date_published", "")), reverse=True)
     v = versions[0]
     f = next((x for x in v["files"] if x.get("primary")), v["files"][0])
-    download(f["url"], mods_dir / f["filename"], sha1=(f.get("hashes") or {}).get("sha1"),
+    download(f["url"], mods_dir / win_safe_filename(f["filename"], f"{modid}.jar"), sha1=(f.get("hashes") or {}).get("sha1"),
              sha512=(f.get("hashes") or {}).get("sha512"))
     return "installed", f["filename"]
 
@@ -2234,6 +2267,67 @@ def _win_kill_with_app(proc):
 _WIN_JOB = None
 
 
+# ---- live stats: memory and tick speed ---------------------------------------------------------
+
+def process_rss_mb(pid):
+    """Memory the process is using (working set), in MB, or None."""
+    try:
+        if IS_WIN:
+            import ctypes
+            from ctypes import wintypes
+
+            class PMC(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                            ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k32.K32GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            h = k32.OpenProcess(0x1000, False, int(pid))            # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return None
+            try:
+                c = PMC()
+                c.cb = ctypes.sizeof(PMC)
+                if not k32.K32GetProcessMemoryInfo(h, ctypes.byref(c), c.cb):
+                    return None
+                return int(c.WorkingSetSize // (1024 * 1024))
+            finally:
+                k32.CloseHandle(h)
+        with open(f"/proc/{int(pid)}/status", encoding="ascii", errors="ignore") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def tick_probe_command(mc: str, loader: str):
+    """A command that reports tick speed on this server, or None if it has none."""
+    v = version_tuple(mc or "")
+    if v and (v >= (1, 20, 3) or v[0] >= 26):
+        return "tick query"                      # built into Minecraft 1.20.3 and newer
+    loader = (loader or "").lower()
+    if loader == "neoforge" and v and v >= (1, 20, 2):
+        return "neoforge tps"
+    if loader in ("forge", "neoforge") and v and v >= (1, 13):
+        return "forge tps"
+    return None
+
+
+RX_MC_VERSION_LINE = re.compile(r"Starting minecraft server version (\S+)", re.I)
+RX_TQ_AVG = re.compile(r"Average time per tick:\s*([\d.,]+)\s*ms", re.I)
+RX_FORGE_TPS = re.compile(r"Overall\s*:\s*Mean tick time:\s*([\d.,]+)\s*ms\.?\s*Mean TPS:\s*([\d.,]+)", re.I)
+RX_NEO_TPS = re.compile(r"Overall\s*:\s*([\d.,]+)\s*TPS\s*\(([\d.,]+)\s*ms/tick\)", re.I)
+RX_PROBE_NOISE = re.compile(r"^(Dim(ension)?\s|Target tick rate|Average time per tick|Percentiles|The game is running|"
+                            r"The game is (frozen|sprinting)|Overall\s*:|Tick ?rate|Mean tick time)", re.I)
+
+
 class ServerRunner:
     """Runs one Minecraft server at a time. Every public method is safe to call from any thread."""
 
@@ -2262,6 +2356,14 @@ class ServerRunner:
         self._java_for = {}                # server dir -> Java chosen by a fix (used on the next start)
         self._diag_cache = None
         self._launch_failed = False
+        self._probe_cmd = None             # live stats (Health tab)
+        self._probe_loader = ""
+        self._ram_limit = None
+        self._stats_wanted = 0.0
+        self._probe_until = 0.0
+        self._mem_hist = deque(maxlen=90)
+        self._tick_hist = deque(maxlen=90)
+        self._tick_ms = None
         atexit.register(self._atexit)
 
     # ---- small internals -------------------------------------------------------------------
@@ -2374,7 +2476,66 @@ class ServerRunner:
             _win_kill_with_app(proc)
             self._proc = proc
             self._started_at = time.time()
+            self._probe_cmd = tick_probe_command(ctx.mc, ctx.loader)
+            self._probe_loader = ctx.loader
+            self._ram_limit = ctx.ram_mb
+            self._mem_hist.clear()
+            self._tick_hist.clear()
+            self._tick_ms = None
+        threading.Thread(target=self._sampler, args=(proc, run_id), daemon=True).start()
         self._read(proc, d, run_id)
+
+    # ---- live stats -----------------------------------------------------------------------
+    def stats(self) -> dict:
+        """Memory and tick speed for the Health tab. Asking for it keeps the tick probe running for a while."""
+        with self._lock:
+            self._stats_wanted = time.time() + 15
+            t = self._tick_ms
+            return {"state": self._state, "mem_mb": self._mem_hist[-1] if self._mem_hist else None,
+                    "limit_mb": self._ram_limit, "mem_hist": list(self._mem_hist),
+                    "tick_ms": t, "tps": round(min(20.0, 1000.0 / max(t, 0.01)), 1) if t is not None else None,
+                    "tick_hist": list(self._tick_hist), "tick_supported": bool(self._probe_cmd)}
+
+    def _sampler(self, proc, run_id):
+        next_probe = 0.0
+        while run_id == self._run_id and proc.poll() is None:
+            time.sleep(2)
+            mb = process_rss_mb(proc.pid)
+            now = time.time()
+            with self._lock:
+                if run_id != self._run_id:
+                    return
+                if mb is not None:
+                    self._mem_hist.append(mb)
+                want = self._state == "online" and self._probe_cmd and now < self._stats_wanted and now >= next_probe
+                if want:
+                    self._probe_until = now + 4
+                    next_probe = now + 5
+                    try:
+                        proc.stdin.write(self._probe_cmd + "\n")
+                        proc.stdin.flush()
+                    except (OSError, ValueError):
+                        pass
+
+    def _probe_reply(self, line) -> bool:
+        """Lock held. True when the line is an answer to our tick probe (kept out of the console)."""
+        if time.time() > self._probe_until:
+            return False
+        cut = line.find("]: ")
+        msg = line[cut + 3:] if cut >= 0 else line
+        m = RX_TQ_AVG.search(msg) or RX_FORGE_TPS.search(msg)
+        ms = None
+        if m:
+            ms = float(m.group(1).replace(",", "."))
+        else:
+            m = RX_NEO_TPS.search(msg)
+            if m:
+                ms = float(m.group(2).replace(",", "."))
+        if ms is not None:
+            self._tick_ms = round(ms, 1)
+            self._tick_hist.append(self._tick_ms)
+            return True
+        return bool(RX_PROBE_NOISE.match(msg.strip()))
 
     def _launch_fail(self, run_id, msg):
         with self._lock:
@@ -2391,6 +2552,12 @@ class ServerRunner:
             for raw in proc.stdout:
                 line = RX_ANSI.sub("", raw.rstrip("\r\n"))
                 with self._lock:
+                    if self._probe_reply(line):
+                        continue
+                    if not self._probe_cmd and "server version" in line:     # version wasn't known before the start
+                        mv = RX_MC_VERSION_LINE.search(line)
+                        if mv:
+                            self._probe_cmd = tick_probe_command(mv.group(1), self._probe_loader)
                     self._capture.append(line)
                     self._add(line, self._classify(line))
         except (OSError, ValueError):
@@ -3041,46 +3208,122 @@ def write_properties(server_dir, updates: dict):
     os.replace(tmp, p)
 
 
+def _B(key, label, default, help, group):
+    return {"key": key, "label": label, "type": "bool", "default": default, "help": help, "group": group}
+
+
+def _I(key, label, default, lo, hi, help, group):
+    return {"key": key, "label": label, "type": "int", "default": default, "min": lo, "max": hi, "help": help,
+            "group": group}
+
+
+def _T(key, label, default, help, group, max_length=200):
+    return {"key": key, "label": label, "type": "text", "default": default, "max_length": max_length, "help": help,
+            "group": group}
+
+
+def _C(key, label, default, choices, help, group):
+    return {"key": key, "label": label, "type": "choice", "default": default, "choices": choices, "help": help,
+            "group": group}
+
+
+PROPERTY_GROUPS = ["Basics", "Players", "World", "Performance", "Advanced"]
 PROPERTY_SCHEMA = [
-    {"key": "motd", "label": "Server name in the list", "type": "text", "default": "A Minecraft Server",
-     "max_length": 150,
-     "help": "The message players see under your server's name in their multiplayer list."},
-    {"key": "max-players", "label": "Most players at once", "type": "int", "default": 20, "min": 1, "max": 500,
-     "help": "How many people can be on the server at the same time. More players need more memory."},
-    {"key": "difficulty", "label": "Difficulty", "type": "choice", "default": "easy",
-     "choices": [["peaceful", "Peaceful (no monsters)"], ["easy", "Easy"], ["normal", "Normal"], ["hard", "Hard"]],
-     "help": "How dangerous the world is. Peaceful has no monsters at all."},
-    {"key": "gamemode", "label": "Game mode for new players", "type": "choice", "default": "survival",
-     "choices": [["survival", "Survival (gather and build)"], ["creative", "Creative (unlimited blocks, can fly)"],
-                 ["adventure", "Adventure (can't break blocks)"], ["spectator", "Spectator (only watch)"]],
-     "help": "The mode people play in when they first join."},
-    {"key": "pvp", "label": "Players can hurt each other", "type": "bool", "default": True,
-     "help": "Turn this off if you don't want players to be able to attack each other."},
-    {"key": "white-list", "label": "Only let people I approve join", "type": "bool", "default": False,
-     "help": "When this is on, only players on your approved list can join. Add someone by typing "
-             "'whitelist add TheirName' in the console."},
-    {"key": "online-mode", "label": "Check that players own Minecraft", "type": "bool", "default": True,
-     "help": "Keep this on. It checks with Minecraft that every player really owns the game and really is who "
-             "they say they are. Turning it off is unsafe: anyone could join using anybody's name, "
-             "including yours."},
-    {"key": "allow-flight", "label": "Don't kick players for flying", "type": "bool", "default": False,
-     "help": "Some modpacks have jetpacks, wings or magic that let players fly. With this off, the server may "
-             "think they're cheating and kick them for 'flying'. Turn it on if your modpack has any way to fly."},
-    {"key": "view-distance", "label": "How far players can see (in chunks)", "type": "int", "default": 10,
-     "min": 3, "max": 32,
-     "help": "How much of the world the server sends to each player. One chunk is 16 blocks. Lower numbers "
-             "make the server run faster; 8 to 10 is a good choice for modpacks."},
-    {"key": "spawn-protection", "label": "Protected area around spawn (blocks)", "type": "int", "default": 16,
-     "min": 0, "max": 1000,
-     "help": "Only server operators can build or break blocks this close to where players first appear. "
-             "Set it to 0 to let everyone build there."},
-    {"key": "server-port", "label": "Port (door number players connect to)", "type": "int",
-     "default": DEFAULT_PORT, "min": 1024, "max": 65535,
-     "help": "Leave this at 25565 unless you know you need something else. If you change it, players have to "
-             "add ':' and the number to the address, and any router port forward has to use the new number."},
-    {"key": "level-seed", "label": "World seed", "type": "text", "default": "", "max_length": 100,
-     "help": "A word or number that decides what a new world looks like. Leave it empty for a random world. "
-             "It only matters when a new world is created, not for a world that already exists."},
+    # ---- Basics
+    _T("motd", "Server MOTD", "A Minecraft Server",
+       "The \u201cmessage of the day\u201d: the text players see under your server's name in their multiplayer list.",
+       "Basics", 150),
+    _I("max-players", "Most players at once", 20, 1, 500,
+       "How many people can be on the server at the same time. More players need more memory.", "Basics"),
+    _C("difficulty", "Difficulty", "easy",
+       [["peaceful", "Peaceful (no monsters)"], ["easy", "Easy"], ["normal", "Normal"], ["hard", "Hard"]],
+       "How dangerous the world is. Peaceful has no monsters at all.", "Basics"),
+    _C("gamemode", "Game mode for new players", "survival",
+       [["survival", "Survival (gather and build)"], ["creative", "Creative (unlimited blocks, can fly)"],
+        ["adventure", "Adventure (can't break blocks)"], ["spectator", "Spectator (only watch)"]],
+       "The mode people play in when they first join.", "Basics"),
+    _B("hardcore", "Hardcore", False,
+       "One life only: players who die can only watch. Set this before the world is created.", "Basics"),
+    _B("pvp", "Players can hurt each other", True,
+       "Turn this off if you don't want players to be able to attack each other.", "Basics"),
+    # ---- Players
+    _B("white-list", "Only let people I approve join (whitelist)", False,
+       "When this is on, only players on your whitelist can join. Add them in the Players tab.", "Players"),
+    _B("enforce-whitelist", "Kick people who aren't on the whitelist", False,
+       "When the whitelist is on, also remove anyone already online who isn't on it.", "Players"),
+    _B("online-mode", "Check that players own Minecraft", True,
+       "Keep this on. It checks with Minecraft that every player really owns the game and really is who they say "
+       "they are. Turning it off is unsafe: anyone could join using anybody's name, including yours.", "Players"),
+    _B("allow-flight", "Don't kick players for flying", False,
+       "Some modpacks have jetpacks, wings or magic that let players fly. With this off, the server may think "
+       "they're cheating and kick them for 'flying'. Turn it on if your modpack has any way to fly.", "Players"),
+    _B("force-gamemode", "Always use the game mode above", False,
+       "Puts everyone back into the server's game mode each time they join.", "Players"),
+    _I("spawn-protection", "Protected area around spawn (blocks)", 16, 0, 1000,
+       "Only operators can build or break blocks this close to where players first appear. 0 lets everyone build "
+       "there.", "Players"),
+    _I("player-idle-timeout", "Kick players who are away (minutes)", 0, 0, 10080,
+       "Players who don't move for this many minutes are kicked. 0 means never.", "Players"),
+    _C("op-permission-level", "What operators can do", "4",
+       [["1", "1: build in the spawn area"], ["2", "2: also use cheats and command blocks"],
+        ["3", "3: also kick and ban players"], ["4", "4: everything, including stopping the server"]],
+       "How much power players you make operator (in the Players tab) get.", "Players"),
+    _B("hide-online-players", "Hide who's online in the server list", False,
+       "Stops the multiplayer list from showing the names of players who are online.", "Players"),
+    _B("enforce-secure-profile", "Require signed chat", True,
+       "Part of Minecraft's chat reporting. Some players with older or modded clients can only join if this is "
+       "off.", "Players"),
+    # ---- World
+    _T("level-name", "World folder name", "world",
+       "The folder your world is saved in. Change it to start a fresh world (the old one stays in its folder).",
+       "World", 100),
+    _T("level-seed", "World seed", "",
+       "A word or number that decides what a new world looks like. Leave it empty for a random world. It only "
+       "matters when a new world is created.", "World", 100),
+    _C("level-type", "World type", "minecraft:normal",
+       [["minecraft:normal", "Normal"], ["minecraft:flat", "Superflat"], ["minecraft:large_biomes", "Large biomes"],
+        ["minecraft:amplified", "Amplified (huge mountains)"]],
+       "The shape of a new world. Only matters when a new world is created.", "World"),
+    _B("generate-structures", "Villages, temples and other structures", True,
+       "Whether new parts of the world get villages, temples, strongholds and so on.", "World"),
+    _B("allow-nether", "Allow the Nether", True, "Lets players travel to the Nether.", "World"),
+    _B("spawn-monsters", "Monsters", True, "Whether hostile mobs like zombies and creepers appear.", "World"),
+    _B("spawn-animals", "Animals", True, "Whether animals like cows and sheep appear (older versions).", "World"),
+    _B("spawn-npcs", "Villagers", True, "Whether villagers appear (older versions).", "World"),
+    _I("max-world-size", "World border radius (blocks)", 29999984, 1, 29999984,
+       "How far from the centre the world goes. The default is practically endless.", "World"),
+    # ---- Performance
+    _I("view-distance", "How far players can see (in chunks)", 10, 3, 32,
+       "How much of the world the server sends to each player. One chunk is 16 blocks. Lower numbers make the "
+       "server run faster; 8 to 10 is a good choice for modpacks.", "Performance"),
+    _I("simulation-distance", "How far the world stays active (in chunks)", 10, 3, 32,
+       "How far around players crops grow, machines run and mobs move. Lower numbers make the server faster.",
+       "Performance"),
+    _I("entity-broadcast-range-percentage", "How far players see mobs (%)", 100, 10, 1000,
+       "Lower values hide far-away mobs and items from players, which can reduce lag.", "Performance"),
+    _I("max-tick-time", "Freeze watchdog (milliseconds)", 60000, -1, 2147483647,
+       "If the server is frozen for this long, it stops itself. Big modpacks sometimes need -1 (off).",
+       "Performance"),
+    _B("sync-chunk-writes", "Save the world safely (slower)", True,
+       "Writes world changes to disk right away. Turning it off can be faster but risks losing progress if the "
+       "computer crashes.", "Performance"),
+    # ---- Advanced
+    _I("server-port", "Port (door number players connect to)", DEFAULT_PORT, 1024, 65535,
+       "Leave this at 25565 unless you know you need something else. If you change it, players have to add ':' "
+       "and the number to the address, and any router port forward has to use the new number.", "Advanced"),
+    _T("server-ip", "Network address to use", "",
+       "Leave this empty. It's only for computers with several network connections.", "Advanced", 100),
+    _B("enable-status", "Show the server as online in the list", True,
+       "When off, the server looks offline in the multiplayer list, but people can still join.", "Advanced"),
+    _B("log-ips", "Write players' IP addresses to the log", True,
+       "Turn off to keep players' IP addresses out of the server's log files (newer versions).", "Advanced"),
+    _T("resource-pack", "Resource pack link", "",
+       "A direct download link to a resource pack players are offered when they join. Leave empty for none.",
+       "Advanced", 500),
+    _B("require-resource-pack", "Require the resource pack", False,
+       "Players who decline the resource pack can't join.", "Advanced"),
+    _B("enable-command-block", "Allow command blocks", False,
+       "Lets operators use command blocks (some maps need them).", "Advanced"),
 ]
 _SCHEMA_BY_KEY = {s["key"]: s for s in PROPERTY_SCHEMA}
 _NUMERIC_CHOICES = {"difficulty": ["peaceful", "easy", "normal", "hard"],
@@ -3124,7 +3367,15 @@ def get_settings(server_dir) -> list:
     for spec in PROPERTY_SCHEMA:
         item = {k: (list(map(list, v)) if k == "choices" else v) for k, v in spec.items()}
         item["value"] = _setting_value(spec, cur.get(spec["key"]))
+        raw = str(cur.get(spec["key"], "")).strip()
+        if spec["type"] == "choice" and raw and not raw.isdigit() and raw.lower() not in [c[0] for c in spec["choices"]]:
+            item["choices"].append([raw.lower(), raw])        # e.g. an older version's world type: keep it
+            item["value"] = raw.lower()
+        item["present"] = spec["key"] in cur
         out.append(item)
+    for key in sorted(k for k in cur if k not in _SCHEMA_BY_KEY):   # everything else in the file, as plain text
+        out.append({"key": key, "label": key, "type": "text", "default": "", "max_length": 1000,
+                    "help": "", "group": "Other settings", "value": cur[key], "present": True})
     return out
 
 
@@ -3139,7 +3390,10 @@ def apply_settings(server_dir, values: dict) -> dict:
     for key, v in values.items():
         spec = _SCHEMA_BY_KEY.get(key)
         if not spec:
-            continue
+            if key in cur and re.fullmatch(r"[A-Za-z0-9_.\-]{1,80}", key):
+                spec = {"key": key, "label": key, "type": "text", "max_length": 1000}   # another setting from the file
+            else:
+                continue
         label, t = spec["label"], spec["type"]
         if t == "bool":
             b = _parse_bool(v)
@@ -3159,7 +3413,7 @@ def apply_settings(server_dir, values: dict) -> dict:
             upd[key] = str(n)
         elif t == "choice":
             s = str(v).strip().lower()
-            allowed = [c[0] for c in spec["choices"]]
+            allowed = [c[0] for c in spec["choices"]] + [str(cur.get(key, "")).strip().lower()]
             if s not in allowed:
                 raise ValueError(f"'{label}' must be one of: " + ", ".join(c[1] for c in spec["choices"]) + ".")
             nums = _NUMERIC_CHOICES.get(key)
@@ -4016,6 +4270,46 @@ def update_server(sid: str, **fields) -> dict:
     raise ValueError("That server isn't in your list any more.")
 
 
+def send_to_recycle_bin(path: Path):
+    """Move a folder to the Recycle Bin (Windows), so a deleted server can still be brought back."""
+    path = Path(path)
+    if IS_WIN:
+        import ctypes
+        from ctypes import wintypes
+
+        class SHFILEOPSTRUCTW(ctypes.Structure):
+            _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", wintypes.LPCWSTR),
+                        ("pTo", wintypes.LPCWSTR), ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL),
+                        ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
+        FO_DELETE, FOF_SILENT, FOF_NOCONFIRMATION, FOF_ALLOWUNDO, FOF_NOERRORUI, FOF_WANTNUKEWARNING = 3, 0x4, 0x10, 0x40, 0x400, 0x4000
+        op = SHFILEOPSTRUCTW(None, FO_DELETE, str(path.resolve()) + "\0\0", None,
+                             FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI | FOF_WANTNUKEWARNING, False, None, None)
+        rc = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+        if rc or op.fAnyOperationsAborted or path.exists():
+            raise OSError(f"Windows couldn't move the folder to the Recycle Bin (code {rc}). Close any program "
+                          f"that has files from this server open (like a text editor or File Explorer), then try again.")
+        return
+    shutil.rmtree(path)
+
+
+def delete_server_folder(sid: str):
+    """Delete a server for good: its folder goes to the Recycle Bin and it leaves the list."""
+    s = get_server(sid)
+    d = Path(s["dir"])
+    if d.exists():
+        bad = {Path.home(), documents_dir(), documents_dir() / "Minecraft Servers", app_data_dir()}
+        r = d.resolve()
+        if r.parent == r or any(_same_folder(r, b) for b in bad if b.exists()):
+            raise ValueError("That folder holds more than just this server, so the app won't delete it. "
+                             "Use \"Remove from list\" instead, and delete the files yourself if you want.")
+        if not any((d / n).exists() for n in ("server.properties", "server.jar", "eula.txt", "mods", ".modpack_builder.json",
+                                               "run.bat", "start.bat", "start.sh", "world", "libraries")):
+            raise ValueError("That folder doesn't look like a Minecraft server, so the app won't delete it. "
+                             "Use \"Remove from list\" instead.")
+        send_to_recycle_bin(d)
+    remove_server(sid)
+
+
 def remove_server(sid: str):
     if not any(s["id"] == sid for s in list_servers()):
         return
@@ -4077,7 +4371,7 @@ def modrinth_pack_download(project_id: str, log=print):
     f = next((x for x in v.get("files", []) if x.get("primary")), (v.get("files") or [None])[0])
     if not f or not f.get("filename", "").endswith(".mrpack"):
         raise RuntimeError("That modpack's download isn't in a format the app understands.")
-    dest = app_data_dir() / "downloads" / f["filename"]
+    dest = app_data_dir() / "downloads" / win_safe_filename(f["filename"], "modpack.mrpack")
     hashes = f.get("hashes") or {}
     if not dest.exists():
         log(f"Downloading the modpack {proj.get('title', '')} {v.get('version_number', '')}...")
@@ -4141,6 +4435,7 @@ def create_server(job, b: dict):
     if kind not in ("modrinth", "file", "vanilla"):
         raise ValueError("Choose what you want to play first.")
     # Put it in "Your servers" straight away, so it can be found (and its progress reopened) while it's set up.
+    fresh = not out.exists() or not any(out.iterdir())
     out.mkdir(parents=True, exist_ok=True)
     early = {"setup": "running", "mc": str(src.get("mc") or src.get("version") or ""),
              "loader": "vanilla" if kind == "vanilla" else str(src.get("loader") or "").lower(),
@@ -4162,6 +4457,8 @@ def create_server(job, b: dict):
         try:
             if launch_spec(out) is None:
                 remove_server(rec["id"])
+                if fresh:                       # we made this folder for it: tidy up so "Try again" starts clean
+                    shutil.rmtree(out, ignore_errors=True)
             else:
                 update_server(rec["id"], setup="")
         except Exception:  # noqa: BLE001
@@ -4261,6 +4558,78 @@ def _with_icon_info(s: dict) -> dict:
         s["folder_icon"] = False
     return s
 
+# ---- operators and whitelist -------------------------------------------------------------------
+
+RX_PLAYER_NAME = re.compile(r"[A-Za-z0-9_]{3,16}")
+
+
+def check_player_name(name) -> str:
+    n = str(name or "").strip()
+    if not RX_PLAYER_NAME.fullmatch(n):
+        raise ValueError("That isn't a Minecraft name. Names are 3 to 16 letters, numbers or underscores.")
+    return n
+
+
+def offline_uuid(name: str) -> str:
+    import uuid as _u
+    return str(_u.UUID(bytes=hashlib.md5(f"OfflinePlayer:{name}".encode()).digest(), version=3))
+
+
+def player_profile(server_dir: Path, name: str) -> dict:
+    """{"uuid", "name"} the way the server would store it."""
+    name = check_player_name(name)
+    if str(read_properties(server_dir).get("online-mode", "true")).strip().lower() == "false":
+        return {"uuid": offline_uuid(name), "name": name}
+    try:
+        d = get_json(f"https://api.mojang.com/users/profiles/minecraft/{urllib.parse.quote(name)}")
+    except urllib.error.HTTPError as e:
+        if e.code in (204, 404):
+            raise ValueError(f"There's no Minecraft account called '{name}'. Check the spelling.") from None
+        raise ValueError("Couldn't look that name up with Minecraft right now. Try again in a minute, "
+                         "or start the server and try again.") from None
+    except Exception:  # noqa: BLE001
+        raise ValueError("Couldn't look that name up (no internet?). Start the server and try again, "
+                         "or check your connection.") from None
+    if not isinstance(d, dict) or not d.get("id"):
+        raise ValueError(f"There's no Minecraft account called '{name}'. Check the spelling.")
+    h = str(d["id"]).replace("-", "")
+    return {"uuid": f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}", "name": d.get("name") or name}
+
+
+def _read_list(path: Path) -> list:
+    try:
+        d = json.loads(path.read_text(encoding="utf-8"))
+        return [x for x in d if isinstance(x, dict) and x.get("name")] if isinstance(d, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def player_lists(server_dir: Path) -> dict:
+    props = read_properties(server_dir)
+    return {"ops": [x["name"] for x in _read_list(server_dir / "ops.json")],
+            "whitelist": [x["name"] for x in _read_list(server_dir / "whitelist.json")],
+            "whitelist_on": str(props.get("white-list", "false")).strip().lower() == "true"}
+
+
+def edit_player_list(server_dir: Path, which: str, name: str, add: bool) -> str:
+    """Change ops.json / whitelist.json while the server is stopped. -> the stored name."""
+    path = server_dir / ("ops.json" if which == "ops" else "whitelist.json")
+    items = _read_list(path)
+    name = check_player_name(name)
+    keep = [x for x in items if str(x.get("name", "")).lower() != name.lower()]
+    if add:
+        prof = player_profile(server_dir, name)
+        entry = {"uuid": prof["uuid"], "name": prof["name"]}
+        if which == "ops":
+            level = _int_or(read_properties(server_dir).get("op-permission-level"), 4)
+            entry.update(level=level if 1 <= level <= 4 else 4, bypassesPlayerLimit=False)
+        keep.append(entry)
+        name = prof["name"]
+    elif len(keep) == len(items):
+        return name
+    write_file(path, json.dumps(keep, indent=2))
+    return name
+
 # ---- extra API routes for the app screens -------------------------------------------------------
 
 def _server_state(app, s):
@@ -4293,6 +4662,11 @@ def _whats_new(app, force=False):
         return notes or None
     except Exception:  # noqa: BLE001
         return None
+
+
+def _server_running(app, s) -> bool:
+    st = app.runner.status() if app.runner else {}
+    return bool(st.get("dir") and _same_folder(st["dir"], s["dir"]) and app.runner.state in ("starting", "online", "stopping"))
 
 
 def api_get_extra(h, app, path, q):
@@ -4333,6 +4707,23 @@ def api_get_extra(h, app, path, q):
         if raw is None:
             return h._err("No icon.", 404)
         return h._send(200, raw, "image/png", {"Cache-Control": "max-age=31536000, immutable"})
+    if path == "/api/server/stats":
+        s = get_server(arg("id"))
+        r = app.runner
+        st = r.status() if r else {}
+        if r and st.get("dir") and _same_folder(st["dir"], s["dir"]):
+            return h._json(r.stats())
+        return h._json({"state": "offline"})
+    if path == "/api/server/players":
+        s = get_server(arg("id"))
+        return h._json(player_lists(Path(s["dir"])))
+    if path == "/api/server/mods":
+        s = get_server(arg("id"))
+        d = Path(s["dir"])
+        out = list_server_mods(d, s)
+        out["removed"] = [r for r in summarize_server(d)["removed"] if r["bucket"] == "user"]
+        out["running"] = _server_running(app, s)
+        return h._json(out)
     if path == "/api/server/console":
         s = get_server(arg("id"))
         if app.runner and app.runner.status().get("dir") and Path(app.runner.status()["dir"]) == Path(s["dir"]):
@@ -4374,6 +4765,50 @@ def api_post_extra(h, app, path, body):
                 and app.runner.state in ("starting", "online", "stopping"):
             raise ValueError("Stop the server before removing it from the list.")
         remove_server(sid)
+        return h._json({"ok": True})
+    if path.startswith("/api/server/mods/"):
+        s = get_server(str(body.get("id") or ""))
+        d = Path(s["dir"])
+        act = path.rsplit("/", 1)[1]
+        if act == "folder":
+            (d / "mods").mkdir(exist_ok=True)
+            open_in_file_manager(d / "mods")
+            return h._json({"ok": True})
+        if act == "add":
+            paths = body.get("paths") or []
+            if not isinstance(paths, list) or len(paths) > 500:
+                raise ValueError("Choose up to 500 mod files at a time.")
+            res = add_mods(d, [user_path(p_, "file") for p_ in paths], s)
+            res["running"] = _server_running(app, s)
+            return h._json(res)
+        if _server_running(app, s):
+            raise ValueError("Stop the server first. Mods can't be changed while it's running.")
+        if act == "toggle":
+            set_mod_enabled(d, body.get("file"), bool(body.get("enabled")))
+            return h._json({"ok": True})
+        if act == "remove":
+            remove_user_mod(d, body.get("file"))
+            return h._json({"ok": True})
+        return h._err("Unknown action.", 404)
+    if path == "/api/pickfile":
+        kind = body.get("kind") if body.get("kind") in ("file", "files", "dir") else "file"
+        exts = [re.sub(r"[^\w]", "", str(e))[:10] for e in (body.get("exts") or [])][:10]
+        owner = getattr(app.window, "hwnd", None) if app.window else None
+        try:
+            paths = native_pick(kind, [e for e in exts if e], str(body.get("title") or "")[:120],
+                                str(body.get("start") or ""), owner)
+        except Exception as e:  # noqa: BLE001
+            return h._json({"unsupported": True, "why": str(e)})
+        return h._json({"paths": paths})
+    if path == "/api/servers/delete":
+        sid = str(body.get("id") or "")
+        s = get_server(sid)
+        st = app.runner.status() if app.runner else {}
+        if st.get("dir") and _same_folder(st["dir"], s["dir"]) and app.runner.state in ("starting", "online", "stopping"):
+            raise ValueError("Stop the server before deleting it.")
+        if s.get("setup") and app.busy():
+            raise ValueError("This server is still being set up. Stop the setup first.")
+        delete_server_folder(sid)
         return h._json({"ok": True})
     if path == "/api/server/icon":
         return h._json(set_server_icon(str(body.get("id") or ""), body.get("png"),
@@ -4460,6 +4895,39 @@ def api_post_extra(h, app, path, body):
         h._json({"ok": True})
         app.request_quit()
         return True
+    if path == "/api/server/players":
+        s = get_server(str(body.get("id") or ""))
+        action = str(body.get("action") or "")
+        cmds = {"op": "op", "deop": "deop", "wl_add": "whitelist add", "wl_remove": "whitelist remove"}
+        if action not in cmds and action != "wl_on":
+            raise ValueError("Unknown action.")
+        r = app.runner
+        st = r.status() if r else {}
+        mine = bool(st.get("dir")) and _same_folder(st["dir"], s["dir"])
+        state = r.state if (r and mine) else "offline"
+        if state in ("starting", "stopping"):
+            raise ValueError("Wait until the server has finished starting or stopping, then try again.")
+        if action == "wl_on":
+            apply_settings(Path(s["dir"]), {"white-list": True})
+            if state == "online":
+                r.send("whitelist on")
+            return h._json({"ok": True, **player_lists(Path(s["dir"]))})
+        name = check_player_name(body.get("name"))
+        if state == "online":
+            r.send(f"{cmds[action]} {name}")
+            return h._json({"ok": True, "via": "command"})
+        which = "ops" if action in ("op", "deop") else "whitelist"
+        stored = edit_player_list(Path(s["dir"]), which, name, action in ("op", "wl_add"))
+        return h._json({"ok": True, "via": "file", "name": stored, **player_lists(Path(s["dir"]))})
+    if path == "/api/uistate":
+        app.ui_dirty = bool(body.get("dirty"))
+        return h._json({"ok": True})
+    if path == "/api/server/editprops":
+        s = get_server(str(body.get("id") or ""))
+        props = Path(s["dir"]) / "server.properties"
+        if not props.exists():
+            write_properties(Path(s["dir"]), {})
+        return h._json({"ok": True, "editor": open_in_editor(props)})
     if path == "/api/whatsnew/seen":
         save_settings({"seen_version": APP_VERSION})
         return h._json({"ok": True})
@@ -4496,6 +4964,87 @@ STAGE_ORDER = {"build": ["read", "mods", "detect", "loader", "test"],
                "fix": ["read", "diagnose", "repair", "test"]}
 
 
+# ---- turning errors into plain steps ---------------------------------------------------------
+
+def explain_error(e) -> dict:
+    """-> {"title", "steps": [..], "details"} written for someone who has never run a server."""
+    text = f"{e}"
+    low = text.lower()
+    details = f"{type(e).__name__}: {text}" if isinstance(e, BaseException) else text
+    winerr = getattr(e, "winerror", None)
+    err = getattr(e, "errno", None)
+    m = re.search(r"\[winerror (\d+)\]", low)          # errors re-raised as text keep their code in the message
+    if winerr is None and m:
+        winerr = int(m.group(1))
+    m = re.search(r"\[errno (\d+)\]", low)
+    if err is None and m:
+        err = int(m.group(1))
+    retry = "Press Try again."
+    T = lambda title, *steps: {"title": title, "steps": list(steps), "details": details}
+    if err == 28 or winerr == 112 or "no space left" in low or "not enough space" in low:
+        return T("Your drive is full",
+                 "Free up some space: big modpacks need a few GB (empty the Recycle Bin, remove old downloads).",
+                 "Or press Try again and use \u201cChange\u201d to save the server on another drive.", retry)
+    if winerr == 32 or "being used by another process" in low:
+        return T("A file is being used by another program",
+                 "Close Minecraft, any running server and any File Explorer windows showing the server folder.",
+                 "If you have antivirus software, wait a minute: it may be scanning the new files.", retry)
+    if err == 13 or winerr == 5 or "access is denied" in low or "permission denied" in low:
+        return T("Windows didn\u2019t allow the app to write a file",
+                 "Windows Security\u2019s \u201cControlled folder access\u201d often blocks new apps from saving into "
+                 "Documents. Open Windows Security \u2192 Virus & threat protection \u2192 Manage ransomware protection "
+                 "\u2192 Allow an app through Controlled folder access, and add Minecraft Server Manager.",
+                 "Or press Try again and use \u201cChange\u201d to save the server somewhere else, like C:\\Minecraft Servers.",
+                 "Close any program that has the server folder open.", retry)
+    if winerr in (206, 3) or err == 36 or "path too long" in low or "filename or extension is too long" in low:
+        return T("The folder path is too long for Windows",
+                 "Press Try again and use \u201cChange\u201d to pick a short folder, like C:\\Servers.", retry)
+    if winerr in (87, 123) or "filename, directory name, or volume label syntax" in low:
+        return T("Windows didn\u2019t accept a file name",
+                 "Make sure you have the newest version of the app (Settings \u2192 Updates \u2192 Check now).",
+                 "Give the server a simple name (letters and numbers), then press Try again.")
+    if "isn't installed and couldn't be downloaded" in low and "java" in low:
+        return T("Java couldn\u2019t be set up",
+                 "Java is the free program Minecraft servers run on. Download it from https://adoptium.net "
+                 "(pick the version the message mentions) and install it.", retry, f"Message: {text}")
+    if "curseforge" in low and ("403" in low or "forbidden" in low or "api key" in low or "not allowed" in low):
+        return T("CurseForge didn\u2019t allow some downloads",
+                 "Some modpack authors block downloads by other apps. If the modpack is also on Modrinth, use "
+                 "\u201cFind a modpack\u201d in the app instead.",
+                 "Or get a free CurseForge API key (console.curseforge.com), paste it in Settings \u2192 CurseForge key, "
+                 "and press Try again.")
+    if re.search(r"http error (404|410)|\b404\b.*not found", low):
+        return T("A file this modpack needs isn\u2019t available any more",
+                 "The modpack may have been updated or removed. Try a newer version of it, or a different modpack.",
+                 "If it keeps happening, let the modpack\u2019s author know a download is missing.")
+    if re.search(r"http error (429|5\d\d)", low):
+        return T("The download site is busy right now",
+                 "Wait a few minutes.", retry)
+    if any(k in low for k in ("timed out", "urlopen error", "getaddrinfo", "name or service not known",
+                              "connection reset", "connection refused", "connection aborted", "network is unreachable",
+                              "remote end closed", "ssl", "certificate", "temporary failure in name resolution")):
+        return T("The app couldn\u2019t download what it needs",
+                 "Check that this computer is connected to the internet.",
+                 "School or work networks, VPNs and some antivirus programs can block downloads. Try another network or "
+                 "pause them for a moment.", retry)
+    if "mismatch" in low or "checksum" in low:
+        return T("A download got damaged on the way", "This usually fixes itself.", retry)
+    if "badzipfile" in details.lower() or "not a zip file" in low or "manifest" in low or "isn't a modpack" in low:
+        return T("That file isn\u2019t a modpack the app can read",
+                 "Download the modpack again from CurseForge or Modrinth (the normal download, a .zip or .mrpack file).",
+                 "Then start again and choose that file.")
+    if "installer" in low and ("forge" in low or "neoforge" in low or "fabric" in low or "quilt" in low):
+        return T("The mod loader couldn\u2019t be installed",
+                 "Check your internet connection and that the drive has a few GB free.",
+                 "Antivirus software sometimes stops installers: allow Minecraft Server Manager or pause it briefly.",
+                 retry)
+    return T("Something unexpected went wrong",
+             retry,
+             "If it happens again, close the app and open it again, then retry.",
+             "Still stuck? Press \u201cCopy details\u201d and post them at "
+             "https://github.com/ricoism/minecraft-server-manager/issues so it can be fixed.")
+
+
 class Job:
     def __init__(self, kind):
         self.kind = kind
@@ -4527,9 +5076,11 @@ class Job:
         with self.lock:
             self.result, self.state = result, "done"
 
-    def fail(self, message, cancelled=False):
+    def fail(self, message, cancelled=False, explained=None):
         with self.lock:
             self.result, self.state = {"error": message, "cancelled": cancelled}, "error"
+            if explained:
+                self.result.update(error=explained["title"], steps=explained["steps"], details=explained["details"])
             self.lines.append(("STOPPED: " if cancelled else "ERROR: ") + message)
 
 
@@ -4570,16 +5121,23 @@ def list_dir(path, want_files=False, exts=()):
         p = Path.home()
     while not p.is_dir() and p != p.parent:
         p = p.parent
-    dirs, files, error = [], [], None
+    dirs, files, error, details = [], [], None, {}
     try:
         for e in os.scandir(p):
-            if e.name.startswith("."):
+            if e.name.startswith(".") or (IS_WIN and e.name.lower() in ("desktop.ini", "thumbs.db", "$recycle.bin", "system volume information")):
                 continue
             try:
                 if e.is_dir():
                     dirs.append(e.name)
                 elif want_files and (not exts or e.name.lower().rsplit(".", 1)[-1] in exts):
                     files.append(e.name)
+                else:
+                    continue
+                try:
+                    st = e.stat()
+                    details[e.name] = [int(st.st_mtime), None if e.is_dir() else st.st_size]
+                except OSError:
+                    details[e.name] = [None, None]
             except OSError:
                 pass
     except OSError as ex:
@@ -4592,8 +5150,33 @@ def list_dir(path, want_files=False, exts=()):
         acc = acc / part
         crumbs.append({"name": part, "path": str(acc)})
     parent = str(p.parent) if p.parent != p else ("" if IS_WIN else None)
-    return {"path": str(p), "parent": parent, "crumbs": crumbs, "dirs": dirs[:800], "files": files[:800],
+    return {"path": str(p), "parent": parent, "crumbs": crumbs, "dirs": dirs[:2000], "files": files[:2000],
+            "details": {k: v for k, v in details.items() if k in set(dirs[:2000]) | set(files[:2000])},
             "sep": os.sep, "error": error}
+
+
+def picker_places():
+    """Quick access places for the built-in file picker, like File Explorer's side bar."""
+    out = []
+
+    def add(name, path, ic):
+        if path and Path(path).is_dir() and all(not _same_folder(path, x["path"]) for x in out):
+            out.append({"name": name, "path": str(path), "icon": ic})
+    if IS_WIN:
+        for name, fid, ic in (("Desktop", FOLDER_DESKTOP, "monitor"), ("Downloads", "374DE290-123F-4565-9164-39C4925E467B", "down"),
+                              ("Documents", FOLDER_DOCUMENTS, "file"), ("Pictures", "33E28130-4E1E-4676-835A-98395C3BC3BB", "sparkle")):
+            try:
+                add(name, known_folder(fid), ic)
+            except Exception:  # noqa: BLE001
+                pass
+    home = Path.home()
+    for name, sub, ic in (("Desktop", "Desktop", "monitor"), ("Downloads", "Downloads", "down"), ("Documents", "Documents", "file")):
+        if not any(x["name"] == name for x in out):
+            add(name, home / sub, ic)
+    add("Minecraft Servers", documents_dir() / "Minecraft Servers", "grass")
+    add("Home", home, "home")
+    drives = windows_drives() if IS_WIN else []
+    return {"places": out, "drives": drives}
 
 
 def summarize_server(d: Path):
@@ -4614,6 +5197,275 @@ def summarize_server(d: Path):
             "scripts": [n for n in ("start.bat", "start.sh") if (d / n).exists()]}
 
 
+# ============================================================================
+# Mods tab: list, add, check, turn off, remove
+# ============================================================================
+
+def _vt(s):
+    t = list(ints(s))[:3]
+    if not t:
+        return None
+    while len(t) < 3:
+        t.append(0)
+    return tuple(t)
+
+
+def _fabric_cond(cond, mc):
+    cond = cond.strip()
+    if cond in ("", "*", "x", "X"):
+        return True
+    m = re.match(r"(>=|<=|>|<|=|~|\^)?\s*v?([0-9][0-9A-Za-z.\-+*x]*)$", cond)
+    if not m:
+        return None
+    op, ver = m.group(1) or "", m.group(2).split("-")[0].split("+")[0]
+    parts = ver.split(".")
+    if any(p in ("x", "X", "*") for p in parts):              # 1.20.x
+        fixed = []
+        for p_ in parts:
+            if p_ in ("x", "X", "*"):
+                break
+            fixed.append(p_)
+        want = [int(x) for x in fixed if x.isdigit()]
+        return list(mc[:len(want)]) == want
+    v = _vt(ver)
+    if v is None:
+        return None
+    if op == "~":
+        nxt = (v[0], v[1] + 1, 0) if len([x for x in parts if x]) >= 2 else (v[0] + 1, 0, 0)
+        return v <= mc < nxt
+    if op == "^":
+        return v <= mc < (v[0] + 1, 0, 0)
+    return {"": mc == v, "=": mc == v, ">=": mc >= v, "<=": mc <= v, ">": mc > v, "<": mc < v}[op]
+
+
+def mc_req_matches(req, mc_version):
+    """True/False when a mod says which Minecraft versions it supports; None when that can't be told."""
+    mc = _vt(mc_version)
+    if not req or not mc:
+        return None
+    kind, spec = req
+    try:
+        if kind == "fabric":
+            specs = spec if isinstance(spec, list) else [spec]
+            results = []
+            for sp in specs:
+                for alt in str(sp).split("||"):
+                    conds = [c for c in re.split(r"\s+(?=[<>=~^]|\d)", alt.strip()) if c]
+                    r = [_fabric_cond(c, mc) for c in conds] or [True]
+                    if None in r:
+                        return None
+                    results.append(all(r))
+            return any(results)
+        spec = str(spec).strip()                               # Maven range, e.g. [1.20.1,1.21)
+        if spec in ("", "*"):
+            return True
+        ranges = re.findall(r"([\[(])\s*([^,\])]*?)\s*(?:,\s*([^\])]*?)\s*)?([\])])", spec)
+        if not ranges:
+            return None                                        # a bare version is only a recommendation
+        for lo_b, lo, hi, hi_b in ranges:
+            if "," not in spec and not hi:                     # [1.20.1] exact
+                if _vt(lo) == mc:
+                    return True
+                continue
+            lo_v, hi_v = _vt(lo) if lo else None, _vt(hi) if hi else None
+            ok = True
+            if lo_v:
+                ok = ok and (mc >= lo_v if lo_b == "[" else mc > lo_v)
+            if hi_v:
+                ok = ok and (mc <= hi_v if hi_b == "]" else mc < hi_v)
+            if ok:
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        return None
+
+
+_MOD_CACHE = {}
+
+
+def _mod_info_cached(jar: Path):
+    try:
+        st = jar.stat()
+    except OSError:
+        return None, {}
+    key = (str(jar), st.st_size, st.st_mtime)
+    hit = _MOD_CACHE.get(key)
+    if hit:
+        return hit
+    info = parse_jar(jar)
+    meta = {"files": set(), "client_flag": False, "plugin": False}
+    try:
+        with zipfile.ZipFile(jar) as z:
+            names = set(z.namelist())
+            meta["files"] = {n for n in ("fabric.mod.json", "quilt.mod.json", "META-INF/mods.toml",
+                                         "META-INF/neoforge.mods.toml", "mcmod.info") if n in names}
+            meta["plugin"] = bool({"plugin.yml", "paper-plugin.yml", "bungee.yml"} & names) and not meta["files"]
+            for tn in ("META-INF/mods.toml", "META-INF/neoforge.mods.toml"):
+                if tn in names and re.search(r"(?m)^\s*clientSideOnly\s*=\s*true", z.read(tn).decode("utf-8", "ignore")):
+                    meta["client_flag"] = True
+    except Exception:  # noqa: BLE001
+        pass
+    if len(_MOD_CACHE) > 4000:
+        _MOD_CACHE.clear()
+    _MOD_CACHE[key] = (info, meta)
+    return info, meta
+
+
+def _loader_fits(files, loader, mc):
+    if not files:
+        return None
+    loader = (loader or "").lower()
+    if loader == "fabric":
+        return "fabric.mod.json" in files
+    if loader == "quilt":
+        return bool({"fabric.mod.json", "quilt.mod.json"} & files)
+    if loader == "forge":
+        return bool({"META-INF/mods.toml", "mcmod.info"} & files)
+    if loader == "neoforge":
+        if "META-INF/neoforge.mods.toml" in files:
+            return True
+        v = _vt(mc)
+        return "META-INF/mods.toml" in files and bool(v) and v < (1, 20, 5)
+    return None
+
+
+def _loader_of_files(files):
+    if "META-INF/neoforge.mods.toml" in files:
+        return "NeoForge"
+    if "fabric.mod.json" in files:
+        return "Fabric"
+    if "quilt.mod.json" in files:
+        return "Quilt"
+    return "Forge"
+
+
+def mod_warnings(jar: Path, server_dir: Path, loader: str, mc: str, others=None, side=None):
+    """Plain-language problems with one mod on this server: [{"level": "bad"|"warn", "kind", "text"}]."""
+    info, meta = _mod_info_cached(jar)
+    out = []
+    if info is None or info.broken:
+        return [{"level": "bad", "kind": "broken", "text": "This file can't be opened. It may be damaged or not a mod at all. Download it again."}]
+    if meta.get("plugin"):
+        return [{"level": "bad", "kind": "plugin", "text": "This is a plugin for Bukkit, Spigot or Paper servers, not a mod. It won't do anything here."}]
+    if not meta.get("files"):
+        out.append({"level": "warn", "kind": "unknown", "text": "This doesn't look like a mod (it has no mod information inside)."})
+    name = info.title or jar.name
+    if info.env == "client" or meta.get("client_flag") or (side and side.server == "unsupported"):
+        out.append({"level": "bad", "kind": "client", "text": f"{name} only works inside the game itself (it's client-side). On a server it does nothing and can stop the server from starting. Players add it to their own game instead."})
+    elif info.own_ids & (CLIENT_ONLY_MODIDS | load_learned()) or (side is None and CLIENT_RE.search(jar.name.lower())):
+        out.append({"level": "warn", "kind": "client", "text": f"{name} is usually a client-side mod (for the game itself, not servers). If the server won't start, remove it."})
+    fits = _loader_fits(meta.get("files") or set(), loader, mc)
+    if fits is False:
+        out.append({"level": "bad", "kind": "loader", "text": f"This mod is made for {_loader_of_files(meta['files'])}, but this server runs {LOADER_NAMES.get(loader, loader or 'something else')}. It won't load."})
+    ok_mc = mc_req_matches(info.mc_req, mc)
+    if ok_mc is False:
+        want = info.mc_req[1] if isinstance(info.mc_req[1], str) else " or ".join(map(str, info.mc_req[1]))
+        out.append({"level": "bad", "kind": "version", "text": f"This mod is for a different Minecraft version ({want}). This server runs {mc}. Look for the {mc} version of the mod."})
+    if others is not None:
+        provided, ids = set(), {}
+        for o in others:
+            if o.jar and o.jar != jar:
+                provided |= o.provided
+                for i in o.dup_ids - PLACEHOLDER_IDS:
+                    ids.setdefault(i, o.jar.name)
+        dup = sorted({ids[i] for i in info.dup_ids if i in ids})
+        if dup:
+            out.append({"level": "warn", "kind": "duplicate", "text": f"You already have this mod ({dup[0]}). Two copies stop the server from starting, so remove one."})
+        if fits is not False:
+            missing = sorted(d for d in info.deps - BUILTIN_IDS - provided - info.provided
+                             if not d.startswith(("fabric-", "quilted_")) or d in ("fabric-api", "fabric-language-kotlin"))
+            if missing:
+                out.append({"level": "warn", "kind": "deps", "text": "It also needs " + ", ".join(missing[:4]) + (" and more" if len(missing) > 4 else "") + ", which isn't in the mods folder. Add that too."})
+    return out
+
+
+def _server_mc_loader(d: Path, rec=None):
+    env = detect_server_env(d)
+    mc, loader = env.get("mc") or "", env.get("loader") or ""
+    if rec:
+        mc, loader = mc or rec.get("mc") or "", loader or rec.get("loader") or ""
+    return mc, loader
+
+
+def list_server_mods(d: Path, rec=None):
+    mods = d / "mods"
+    mc, loader = _server_mc_loader(d, rec)
+    files = sorted([p for p in mods.iterdir() if p.is_file() and (p.name.lower().endswith(".jar") or p.name.lower().endswith(".jar.disabled"))],
+                   key=lambda p: p.name.lower()) if mods.is_dir() else []
+    infos = [_mod_info_cached(p)[0] for p in files if p.name.lower().endswith(".jar")]
+    infos = [i for i in infos if i]
+    out = []
+    for p in files:
+        on = p.name.lower().endswith(".jar")
+        info = _mod_info_cached(p)[0]
+        warns = mod_warnings(p, d, loader, mc, infos if on else None) if on else []
+        out.append({"file": p.name, "name": (info.title if info and info.title else re.sub(r"\.jar(\.disabled)?$", "", p.name, flags=re.I)),
+                    "version": (info.version if info and info.version and "$" not in info.version else ""),
+                    "enabled": on, "size": p.stat().st_size, "warnings": warns})
+    return {"mods": out, "folder": str(mods), "mc": mc, "loader": loader}
+
+
+def _mod_file(d: Path, name: str) -> Path:
+    name = str(name or "")
+    if Path(name).name != name or not re.search(r"\.jar(\.disabled)?$", name, re.I):
+        raise ValueError("That isn't a mod file.")
+    p = d / "mods" / name
+    if not p.is_file():
+        raise ValueError("That mod isn't in the mods folder any more.")
+    return p
+
+
+def add_mods(d: Path, paths, rec=None, online=True):
+    """Copy mod files into mods/ and check each one. Modrinth is asked whether they work on servers."""
+    mods = d / "mods"
+    mods.mkdir(exist_ok=True)
+    added, skipped = [], []
+    for raw in paths or []:
+        src = Path(str(raw))
+        if not src.is_file():
+            skipped.append({"file": src.name, "why": "The file couldn't be found."})
+            continue
+        if src.suffix.lower() != ".jar":
+            skipped.append({"file": src.name, "why": "Mods are .jar files. " + ("Unzip it first, then add the .jar files inside." if src.suffix.lower() in (".zip", ".rar", ".7z") else "This one isn't.")})
+            continue
+        dest = mods / win_safe_filename(src.name, "mod.jar")
+        if dest.exists() and _same_folder(dest, src):
+            added.append(dest)
+            continue
+        if dest.exists() and sha1_file(dest) == sha1_file(src):
+            skipped.append({"file": src.name, "why": "It's already in the mods folder."})
+            continue
+        if dest.exists():
+            dest = mods / (dest.stem + "-new.jar")
+        shutil.copy2(src, dest)
+        added.append(dest)
+    sides = {}
+    if added and online:
+        sides = modrinth_sides(added, lambda s: None)
+    mc, loader = _server_mc_loader(d, rec)
+    infos = [i for i in (_mod_info_cached(p)[0] for p in mods.glob("*.jar")) if i]
+    out = []
+    for p in added:
+        info = _mod_info_cached(p)[0]
+        out.append({"file": p.name, "name": (info.title if info and info.title else p.stem),
+                    "warnings": mod_warnings(p, d, loader, mc, infos, sides.get(p.name))})
+    return {"added": out, "skipped": skipped}
+
+
+def set_mod_enabled(d: Path, name: str, on: bool):
+    p = _mod_file(d, name)
+    if on and p.name.lower().endswith(".jar.disabled"):
+        p.rename(p.with_name(p.name[:-len(".disabled")]))
+    elif not on and p.name.lower().endswith(".jar"):
+        p.rename(p.with_name(p.name + ".disabled"))
+
+
+def remove_user_mod(d: Path, name: str):
+    p = _mod_file(d, name)
+    if not move_mod(p, d, "user", "removed by you in the Mods tab"):
+        raise ValueError("The mod couldn't be moved. Stop the server first, then try again.")
+
+
 def restore_mod(d: Path, bucket, name):
     if bucket not in BUCKETS or Path(name).name != name or not (d / "mods").is_dir():
         raise ValueError("Can't restore that file.")
@@ -4626,6 +5478,113 @@ def restore_mod(d: Path, bucket, name):
         keep = [l for l in rf.read_text(encoding="utf-8", errors="ignore").splitlines()
                 if l.partition("\t")[0] != name]
         write_file(rf, "\n".join(keep) + ("\n" if keep else ""))
+
+
+def native_pick(kind="file", exts=(), title="", start="", owner=None):
+    """The normal Windows "Open" window (the same one File Explorer users know).
+    kind: "file", "files" (several) or "dir". -> list of paths ([] when cancelled). Raises OSError if it can't be shown."""
+    if not IS_WIN:
+        raise OSError("not Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("a", wintypes.DWORD), ("b", wintypes.WORD), ("c", wintypes.WORD), ("d", ctypes.c_ubyte * 8)]
+
+    def guid(s_):
+        g = GUID()
+        ctypes.oledll.ole32.CLSIDFromString(ctypes.c_wchar_p(s_), ctypes.byref(g))
+        return g
+
+    class FILTERSPEC(ctypes.Structure):
+        _fields_ = [("name", wintypes.LPCWSTR), ("spec", wintypes.LPCWSTR)]
+
+    def call(obj, idx, *args, argtypes=()):
+        vtbl = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        fn = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)(vtbl[idx])
+        return fn(obj, *args)
+
+    def release(obj):
+        if obj:
+            call(obj, 2)
+
+    ole32 = ctypes.windll.ole32
+    inited = ole32.CoInitializeEx(None, 0x2 | 0x4) in (0, 1)        # apartment threaded, no DDE
+    dlg = ctypes.c_void_p()
+    items = []
+    try:
+        hr = ole32.CoCreateInstance(ctypes.byref(guid("{DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7}")), None, 1,
+                                    ctypes.byref(guid("{d57c7288-d4ad-4768-be02-9d969532d960}")), ctypes.byref(dlg))
+        if hr != 0 or not dlg:
+            raise OSError(f"The Windows file window isn't available (0x{hr & 0xffffffff:08X}).")
+        opts = wintypes.DWORD()
+        call(dlg, 10, ctypes.byref(opts), argtypes=(ctypes.POINTER(wintypes.DWORD),))
+        o = opts.value | 0x40 | 0x800 | 0x8                                 # file system only, path must exist, keep cwd
+        o |= 0x20 if kind == "dir" else 0x1000                              # pick folders / file must exist
+        if kind == "files":
+            o |= 0x200
+        call(dlg, 9, o, argtypes=(wintypes.DWORD,))
+        if title:
+            call(dlg, 17, title, argtypes=(wintypes.LPCWSTR,))
+        keep = []
+        if kind != "dir" and exts:
+            pat = ";".join("*." + e.strip(".") for e in exts)
+            label = ", ".join("." + e.strip(".") for e in exts) + " files"
+            specs = (FILTERSPEC * 2)(FILTERSPEC(label, pat), FILTERSPEC("All files", "*.*"))
+            keep.append(specs)
+            call(dlg, 4, 2, specs, argtypes=(wintypes.UINT, ctypes.POINTER(FILTERSPEC)))
+        if start and Path(start).is_dir():
+            folder = ctypes.c_void_p()
+            if ctypes.windll.shell32.SHCreateItemFromParsingName(str(start), None,
+                    ctypes.byref(guid("{43826D1E-E718-42EE-BC55-A1E261C37BFE}")), ctypes.byref(folder)) == 0:
+                call(dlg, 12, folder, argtypes=(ctypes.c_void_p,))
+                release(folder)
+        hr = call(dlg, 3, owner or None, argtypes=(wintypes.HWND,))
+        if hr & 0xffffffff == 0x800704C7:                                  # the user pressed Cancel
+            return []
+        if hr != 0:
+            raise OSError(f"The Windows file window couldn't open (0x{hr & 0xffffffff:08X}).")
+
+        def path_of(item):
+            buf = ctypes.c_wchar_p()
+            if call(item, 5, 0x80058000, ctypes.byref(buf), argtypes=(wintypes.DWORD, ctypes.POINTER(ctypes.c_wchar_p))) != 0:
+                return None
+            try:
+                return buf.value
+            finally:
+                ole32.CoTaskMemFree(buf)
+
+        arr = ctypes.c_void_p()
+        if call(dlg, 27, ctypes.byref(arr), argtypes=(ctypes.POINTER(ctypes.c_void_p),)) == 0 and arr:
+            n = wintypes.DWORD()
+            call(arr, 7, ctypes.byref(n), argtypes=(ctypes.POINTER(wintypes.DWORD),))
+            for i in range(n.value):
+                it = ctypes.c_void_p()
+                if call(arr, 8, i, ctypes.byref(it), argtypes=(wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p))) == 0:
+                    p_ = path_of(it)
+                    release(it)
+                    if p_:
+                        items.append(p_)
+            release(arr)
+        return items
+    finally:
+        release(dlg)
+        if inited:
+            ole32.CoUninitialize()
+
+
+def open_in_editor(path: Path) -> str:
+    """Open a text file for editing. -> the editor's name for the message."""
+    if IS_WIN:
+        windir = os.environ.get("WINDIR", r"C:\Windows")
+        notepad = Path(windir) / "System32" / "notepad.exe"
+        subprocess.Popen([str(notepad) if notepad.exists() else "notepad.exe", str(path)], close_fds=True)
+        return "Notepad"
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", "-t", str(path)])
+        return "TextEdit"
+    subprocess.Popen(["xdg-open", str(path)])
+    return ""
 
 
 def open_in_file_manager(path: Path):
@@ -4653,6 +5612,7 @@ class WebApp:
         self.stop_evt = threading.Event()
         self.lock = threading.Lock()
         self.runner = ServerRunner() if mode == "app" else None
+        self.ui_dirty = False            # the page has unsaved server settings
         self.updater = None
 
     def busy(self):
@@ -4677,7 +5637,7 @@ class WebApp:
             except Cancelled as e:
                 job.fail(str(e), cancelled=True)
             except Exception as e:  # noqa: BLE001
-                job.fail(str(e))
+                job.fail(str(e), explained=explain_error(e))
             finally:
                 CANCEL.clear()          # a Stop must not linger and cancel the next Start or repair
                 SKIP_TEST.clear()
@@ -4714,12 +5674,13 @@ def make_handler(app: WebApp):
                 self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
+            return True                 # "handled": api_*_extra routes return this so nothing else answers too
 
         def _json(self, obj, code=200):
-            self._send(code, json.dumps(obj))
+            return self._send(code, json.dumps(obj))
 
         def _err(self, msg, code=400):
-            self._json({"error": msg}, code)
+            return self._json({"error": msg}, code)
 
         def _host_ok(self):
             host = (self.headers.get("Host") or "").lower()
@@ -4780,7 +5741,10 @@ def make_handler(app: WebApp):
                     return self._json({"ok": True})
                 if u.path == "/api/fs":
                     exts = tuple(x for x in (q.get("exts") or [""])[0].split(",") if x)
-                    return self._json(list_dir((q.get("path") or [""])[0], (q.get("files") or ["0"])[0] == "1", exts))
+                    out = list_dir((q.get("path") or [""])[0], (q.get("files") or ["0"])[0] == "1", exts)
+                    if (q.get("places") or ["0"])[0] == "1":
+                        out.update(picker_places())
+                    return self._json(out)
                 if u.path == "/api/latestlog":
                     raw = (q.get("dir") or [""])[0].strip()
                     try:
@@ -4899,12 +5863,15 @@ def make_handler(app: WebApp):
                     return self._json({"ok": True})
                 if u.path == "/api/settings":
                     # only what the page may change; the server list etc. are managed by their own routes
-                    allowed = {"theme": str, "titlebar": str, "aggressive": bool, "cfkey": str, "eula": bool}
+                    allowed = {"theme": str, "titlebar": str, "aggressive": bool, "cfkey": str, "eula": bool,
+                               "showprivate": bool, "picker": str}
                     upd = {k: v for k, v in body.items() if k in allowed and isinstance(v, allowed[k])}
                     if upd.get("theme") not in (None, "auto", "light", "dark"):
                         upd.pop("theme")
                     if upd.get("titlebar") not in (None, "custom", "standard"):
                         upd.pop("titlebar")
+                    if upd.get("picker") not in (None, "windows", "builtin"):
+                        upd.pop("picker")
                     cur = save_settings(upd)
                     if "theme" in body and app.window:
                         app.window.set_theme(theme_is_dark(body.get("theme")))
@@ -5087,6 +6054,8 @@ class NativeWindow:
             return "Your server is still running.\n\nStop it safely (saving the world) and close the app?"
         if self.app.busy():
             return f"A task is still running.\n\nStop it and close {APP_NAME}?"
+        if getattr(self.app, "ui_dirty", False):
+            return "You have server settings that aren't saved yet.\n\nClose without saving them?"
         return None
 
     def _wndproc(self, hwnd, msg, wp, lp):
@@ -5888,7 +6857,7 @@ PAGE_HTML = r"""<!doctype html>
 }
 :root[data-theme=dark]{color-scheme:dark;
   --ink:#f3f6fd;--ink-2:rgba(236,241,252,.76);--ink-3:rgba(226,233,248,.56);
-  --glass-hi:rgba(255,255,255,.14);--glass-lo:rgba(255,255,255,.05);--glass-solid:rgba(20,26,46,.62);
+  --glass-hi:rgba(255,255,255,.14);--glass-lo:rgba(255,255,255,.05);--glass-solid:rgba(20,26,46,.62);--menu:rgba(22,28,50,.96);
   --field:rgba(255,255,255,.08);--field-hi:rgba(255,255,255,.14);--well:rgba(4,8,20,.42);
   --line:rgba(255,255,255,.12);--edge:rgba(255,255,255,.42);
   --t-ok:#5ff0ab;--t-warn:#ffd977;--t-bad:#ff8c8f;--t-acc:#9cb4ff;
@@ -5897,7 +6866,7 @@ PAGE_HTML = r"""<!doctype html>
 }
 :root[data-theme=light]{color-scheme:light;
   --ink:#121a2f;--ink-2:rgba(18,26,47,.78);--ink-3:rgba(18,26,47,.62);
-  --glass-hi:rgba(255,255,255,.74);--glass-lo:rgba(255,255,255,.42);--glass-solid:rgba(250,252,255,.8);
+  --glass-hi:rgba(255,255,255,.74);--glass-lo:rgba(255,255,255,.42);--glass-solid:rgba(250,252,255,.8);--menu:rgba(252,253,255,.97);
   --field:rgba(255,255,255,.62);--field-hi:rgba(255,255,255,.92);--well:rgba(255,255,255,.6);
   --line:rgba(18,26,47,.12);--edge:rgba(255,255,255,.95);
   --t-ok:#0f7a4c;--t-warn:#8a5a00;--t-bad:#bf2232;--t-acc:#2f55d6;
@@ -6111,6 +7080,18 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:24px;heigh
 .agree{display:flex;gap:14px;align-items:flex-start;padding:18px;border-radius:16px;background:var(--well);box-shadow:inset 0 0 0 1px var(--line)}
 .agree p{margin:0;color:var(--ink-2)}
 .wnav{display:flex;justify-content:space-between;gap:10px;margin-top:4px}
+.btn.danger-text{color:var(--redstone)}
+.ctxmenu{position:fixed;z-index:60;min-width:220px;padding:6px;border-radius:14px;background:var(--menu);-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px);box-shadow:inset 0 0 0 1px var(--line),var(--shadow);animation:ctxin .12s ease-out}
+@keyframes ctxin{from{opacity:0;transform:scale(.97)}}
+.ctxmenu button{display:flex;width:100%;align-items:center;gap:10px;padding:8px 10px;border:0;border-radius:9px;background:none;color:var(--ink);font:inherit;font-size:14px;text-align:left;cursor:pointer}
+.ctxmenu button svg{width:16px;height:16px;flex:none;opacity:.8}
+.ctxmenu button:hover,.ctxmenu button:focus-visible{background:var(--field-hi);outline:none}
+.ctxmenu button.danger{color:var(--redstone)}
+.ctxmenu button:disabled{opacity:.45;cursor:default;background:none}
+.ctxmenu hr{border:0;height:1px;background:var(--line);margin:5px 4px}
+.w1bar{position:sticky;bottom:14px;z-index:5;margin-top:18px;align-items:center;padding:10px 12px 10px 18px;border-radius:16px;background:var(--glass-solid);-webkit-backdrop-filter:blur(18px);backdrop-filter:blur(18px);box-shadow:inset 0 0 0 1px var(--line),var(--shadow)}
+.w1sel{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink-2);font-size:14px}
+.w1sel b{color:var(--ink)}
 .hint{color:var(--t-warn);font-size:13.5px;margin:6px 2px 0}
 .memwarn{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;padding:14px 16px;border-radius:15px;margin-top:10px;background:color-mix(in srgb,var(--gold) 13%,transparent);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--gold) 40%,transparent)}
 .memwarn>svg{width:20px;height:20px;color:var(--t-warn);grid-column:1;grid-row:1/span 4;margin-top:1px}.memwarn>:not(svg){grid-column:2}
@@ -6190,6 +7171,8 @@ details.log summary::-webkit-details-marker{display:none}
 .stats div{padding:12px 14px;border-radius:14px;background:var(--well);box-shadow:inset 0 0 0 1px var(--line)}
 .stats b{display:block;font:15px var(--pix);margin-top:2px;letter-spacing:.02em}
 .stats span{color:var(--ink-3);font-size:12px}
+.joinhead{display:flex;gap:12px;align-items:flex-start;justify-content:space-between}
+.joinhead .btn{flex:none}
 .join{padding:24px;border-radius:var(--r-xl);display:flex;flex-direction:column;gap:12px}
 .addr{display:flex;align-items:center;gap:12px;padding:12px 12px 12px 14px;border-radius:15px;background:var(--well);box-shadow:inset 0 0 0 1px var(--line)}
 .addr .t{flex:1;min-width:0}
@@ -6222,13 +7205,62 @@ details.log summary::-webkit-details-marker{display:none}
 .player{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:14px;background:var(--well);box-shadow:inset 0 0 0 1px var(--line)}
 .player img{width:36px;height:36px;border-radius:7px;image-rendering:pixelated;background:var(--field)}
 .player b{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
-.setlist{display:grid;gap:12px}
+.pgrid{display:grid;gap:26px}.psec>h4{margin:0 0 6px;font:650 16px/1.2 var(--display)}.psec .sec-sub{margin:0 0 12px}
+.addrow{display:flex;gap:10px;max-width:520px}.addrow input{flex:1}
+.plist{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.plist .empty-c{color:var(--ink-3);font-size:13.5px}
+.pchip{display:flex;align-items:center;gap:8px;padding:5px 6px 5px 6px;border-radius:12px;background:var(--well);box-shadow:inset 0 0 0 1px var(--line);font-weight:600;font-size:13.5px}
+.pchip img{width:24px;height:24px;border-radius:6px;image-rendering:pixelated}.pchip button{all:unset;cursor:pointer;width:22px;height:22px;display:grid;place-items:center;border-radius:7px;color:var(--ink-3)}
+.pchip button:hover{background:var(--field-hi);color:var(--t-bad)}.pchip button svg{width:12px;height:12px}.tag-op{font:10px/1 var(--pix);padding:4px 6px;border-radius:6px;color:var(--t-ok);background:color-mix(in srgb,var(--emerald) 16%,transparent)}
+.setlist{display:grid;gap:22px}.setgroup{display:grid;gap:10px}.setgroup>h4{margin:4px 2px 0;font:650 16px/1.2 var(--display);color:var(--ink)}
+.sethead{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:16px}
+#t-settings{overflow:clip}   /* hidden would make the panel its own scroller and stop the save bar sticking */
+.savebar{position:sticky;bottom:14px;z-index:5;margin-top:18px;display:flex;align-items:center;gap:10px;padding:10px 12px 10px 18px;border-radius:16px;background:var(--glass-solid);-webkit-backdrop-filter:blur(18px);backdrop-filter:blur(18px);box-shadow:inset 0 0 0 1px var(--line),var(--shadow)}
+.savebar span{flex:1;color:var(--ink-3);font-weight:600;font-size:13.5px}.savebar.dirty span{color:var(--t-warn)}.savebar.dirty{box-shadow:inset 0 0 0 1.5px color-mix(in srgb,var(--gold) 60%,transparent),var(--shadow)}
 .set{display:grid;grid-template-columns:minmax(0,1fr) minmax(170px,260px);gap:16px;align-items:center;padding:14px 16px;border-radius:15px;background:var(--well);box-shadow:inset 0 0 0 1px var(--line)}
 .set b{display:block;font-weight:650}.set span{color:var(--ink-3);font-size:13px}
 .set .ctl{display:flex;justify-content:flex-end}
 .item{display:flex;align-items:center;gap:12px;padding:11px 0;border-top:1px solid var(--line)}
 .item:first-child{border-top:0}
 .item .t{flex:1;min-width:0}.item b{display:block;font-weight:600;overflow-wrap:anywhere}.item small{display:block;color:var(--ink-3)}
+.steps{margin:14px 0 4px;padding:0;list-style:none;counter-reset:st;display:grid;gap:8px}
+.steps li{counter-increment:st;display:grid;grid-template-columns:auto 1fr;gap:12px;align-items:start;padding:12px 14px;border-radius:14px;background:var(--well);box-shadow:inset 0 0 0 1px var(--line);font-size:14px;line-height:1.45;overflow-wrap:anywhere}
+.steps li::before{content:counter(st);display:grid;place-items:center;width:24px;height:24px;border-radius:8px;font:700 13px/1 var(--display);color:#fff;background:linear-gradient(135deg,var(--lapis),var(--amethyst))}
+#r-details pre{white-space:pre-wrap;word-break:break-word;max-height:180px;overflow:auto;font:12px/1.5 var(--mono);margin:8px 0}
+.modhead{display:flex;gap:14px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap}
+.modacts{display:flex;gap:8px;flex-wrap:wrap}
+.modnote{display:flex;gap:10px;align-items:flex-start;margin-top:14px;padding:11px 14px;border-radius:14px;background:color-mix(in srgb,var(--gold) 14%,transparent);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--gold) 40%,transparent);font-size:14px}
+.modnote svg{width:18px;height:18px;flex:none;color:var(--gold);margin-top:1px}
+.moddrop{display:flex;gap:10px;align-items:center;justify-content:center;margin-top:14px;padding:14px;border-radius:14px;border:1.5px dashed color-mix(in srgb,var(--ink) 22%,transparent);color:var(--ink-2);font-size:14px;transition:background .2s,border-color .2s}
+.moddrop svg{width:18px;height:18px}.moddrop.over{background:color-mix(in srgb,var(--emerald) 14%,transparent);border-color:var(--emerald)}
+.modtools{display:flex;gap:14px;align-items:center;margin-top:14px;flex-wrap:wrap}
+.modtools .search{flex:1;min-width:200px}
+.modfilter{display:flex;gap:8px;align-items:center;font-size:14px;color:var(--ink-2);cursor:pointer}
+.modlist{margin-top:8px}
+.mod{display:flex;align-items:center;gap:12px;padding:10px 4px;border-top:1px solid var(--line)}
+.mod:first-child{border-top:0}
+.mod .t{flex:1;min-width:0}.mod b{font-weight:600;overflow-wrap:anywhere}.mod small{display:block;color:var(--ink-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mod.off b,.mod.off small{opacity:.55}
+.mod .mw{margin-top:6px;display:grid;gap:4px}
+.mw div{display:flex;gap:7px;align-items:flex-start;font-size:13px;line-height:1.4;color:var(--ink-2)}
+.mw svg{width:15px;height:15px;flex:none;margin-top:1px}
+.mw .bad svg{color:var(--redstone)}.mw .warn svg{color:var(--gold)}.mw .ok svg{color:var(--emerald)}
+.mod .tag{font-size:11.5px;font-weight:650;padding:2px 7px;border-radius:99px;margin-left:6px;vertical-align:1px}
+.tag.bad{background:color-mix(in srgb,var(--redstone) 22%,transparent);color:var(--redstone)}.tag.warn{background:color-mix(in srgb,var(--gold) 22%,transparent);color:var(--gold)}
+.mod .acts{display:flex;gap:6px;align-items:center;flex:none}
+.modsub{margin:20px 0 4px;font-size:14px;color:var(--ink-2)}
+.addres{display:grid;gap:10px;max-height:52vh;overflow:auto}
+.addres .ar{padding:12px 14px;border-radius:14px;background:var(--well);box-shadow:inset 0 0 0 1px var(--line)}
+.addres .ar b{display:block;margin-bottom:4px;overflow-wrap:anywhere}
+.addres .ar .btn{margin-top:8px}
+.hstats{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px}
+.hcard{padding:14px 16px 10px;border-radius:16px;background:var(--well);box-shadow:inset 0 0 0 1px var(--line)}
+.hlab{font-size:12px;font-weight:650;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-3)}
+.hval{font:700 26px/1.15 var(--display);margin-top:4px;font-variant-numeric:tabular-nums}
+.hval.good{color:var(--emerald)}.hval.warn{color:var(--gold)}.hval.bad{color:var(--redstone)}
+.hsub{font-size:13px;color:var(--ink-3);min-height:18px}
+.hcard canvas{display:block;width:100%;height:60px;margin-top:6px}
+.hnote{grid-column:1/-1;margin:0;font-size:13px;color:var(--ink-3)}
+@media (max-width:640px){.hstats{grid-template-columns:1fr}}
 .finding{display:flex;gap:12px;align-items:flex-start;padding:12px 14px;border-radius:14px;background:var(--well);box-shadow:inset 0 0 0 1px var(--line);margin-top:8px}
 .finding svg{width:18px;height:18px;flex:none;margin-top:2px;color:var(--tone)}
 
@@ -6247,6 +7279,41 @@ details.log summary::-webkit-details-marker{display:none}
 .sheet .body p{color:var(--ink-2);margin:0 0 10px}
 .sheet footer{display:flex;justify-content:flex-end;gap:10px;margin-top:18px;align-items:center}
 .sheet footer small{margin-right:auto;color:var(--ink-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sheet.wide{width:min(920px,100%);max-height:min(640px,92vh);height:min(640px,92vh)}
+.sheet.wide .body{display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden}
+.xp{display:flex;flex-direction:column;flex:1;min-height:0;gap:8px;font-size:13.5px}
+.xp-bar{display:flex;gap:4px;align-items:center}
+.xp-tb{all:unset;box-sizing:border-box;display:grid;place-items:center;width:32px;height:32px;border-radius:8px;cursor:pointer;color:var(--ink-2)}
+.xp-tb svg{width:16px;height:16px}.xp-tb.rot svg{transform:rotate(180deg)}
+.xp-tb:hover:not(:disabled){background:var(--field-hi)}.xp-tb:disabled{opacity:.35;cursor:default}.xp-tb:focus-visible{outline:2px solid var(--t-acc)}
+.xp-addr,.xp-search,.xp-name,.xp-ftype{font:inherit;color:var(--ink);background:var(--field);border:0;box-shadow:inset 0 0 0 1px var(--line);border-radius:8px;height:32px;padding:0 10px;min-width:0}
+.xp .xp-addr{flex:1 1 auto;width:auto;padding:0 10px}.xp .xp-search{flex:0 0 190px;width:190px;padding:0 10px}.xp .xp-name{padding:0 10px;border-radius:8px}.xp .xp-ftype{width:auto;padding:0 10px;border-radius:8px}
+.xp-addr:focus,.xp-search:focus,.xp-name:focus,.xp-ftype:focus{outline:2px solid var(--t-acc);outline-offset:-1px}
+.xp-wrap{display:grid;grid-template-columns:190px 1fr;gap:8px;flex:1;min-height:0}
+.xp-side{overflow:auto;padding:4px;border-radius:10px;background:var(--well);box-shadow:inset 0 0 0 1px var(--line)}
+.xp-sh{font-size:11.5px;font-weight:650;color:var(--ink-3);padding:8px 8px 4px;text-transform:uppercase;letter-spacing:.04em}
+.xp-place{all:unset;box-sizing:border-box;display:flex;align-items:center;gap:8px;width:100%;padding:6px 8px;border-radius:7px;cursor:pointer;white-space:nowrap;overflow:hidden}
+.xp-place span{overflow:hidden;text-overflow:ellipsis}.xp-place svg{width:16px;height:16px;flex:none;color:var(--gold)}
+.xp-place:hover{background:var(--field-hi)}.xp-place.on{background:color-mix(in srgb,var(--lapis) 26%,transparent)}.xp-place:focus-visible{outline:2px solid var(--t-acc)}
+.xp-main{display:flex;flex-direction:column;min-height:0;border-radius:10px;background:var(--well);box-shadow:inset 0 0 0 1px var(--line);overflow:hidden}
+.xp-row{display:grid;grid-template-columns:minmax(0,1fr) 150px 150px 84px;align-items:center;gap:8px;padding:0 10px;height:30px;border-radius:6px;cursor:default;user-select:none}
+.xp-head{height:30px;border-radius:0;border-bottom:1px solid var(--line);padding:0 10px}
+.xp-head .xp-c{all:unset;cursor:pointer;color:var(--ink-3);font-size:12.5px;padding:4px 0;white-space:nowrap}
+.xp-head .xp-c.on::after{content:' \25B4';font-size:10px}.xp-head .xp-c.on.down::after{content:' \25BE'}
+.xp-rows{flex:1;overflow:auto;padding:4px;outline:none}
+.xp-row .xp-c{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink-3);font-size:12.5px}
+.xp-row .xp-name-c{display:flex;align-items:center;gap:8px;color:var(--ink);font-size:13.5px}
+.xp-name-c span{overflow:hidden;text-overflow:ellipsis}
+.xp-name-c svg{width:17px;height:17px;flex:none}.xp-name-c svg.fold{color:var(--gold);fill:color-mix(in srgb,var(--gold) 35%,transparent)}.xp-name-c svg.doc{color:var(--ink-3)}
+.xp-col-size{text-align:right}
+.xp-rows .xp-row:hover{background:var(--field)}
+.xp-rows .xp-row[aria-selected=true]{background:color-mix(in srgb,var(--lapis) 30%,transparent);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--lapis) 60%,transparent)}
+.xp-empty{padding:24px;text-align:center;color:var(--ink-3)}
+.xp-bottom{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.xp-nl{display:flex;align-items:center;gap:8px;flex:1;min-width:240px;color:var(--ink-2)}.xp-name{flex:1}
+.xp-ftype{max-width:260px}
+.xp-status{width:100%;font-size:12px;color:var(--ink-3);white-space:pre}
+@media (max-width:700px){.xp-wrap{grid-template-columns:1fr}.xp-side{display:none}.xp-row{grid-template-columns:minmax(0,1fr) 84px}.xp-col-date,.xp-col-type{display:none}.xp .xp-search{flex-basis:110px;width:110px}}
 .crumbs{display:flex;flex-wrap:wrap;gap:2px;margin:10px 0 8px;font-size:13px}
 .crumbs button{all:unset;cursor:pointer;padding:3px 8px;border-radius:8px;color:var(--ink-2)}.crumbs button:hover{background:var(--field)}
 .crumbs span{color:var(--ink-3);align-self:center}
@@ -6302,6 +7369,8 @@ details.log summary::-webkit-details-marker{display:none}
 <symbol id="i-users" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0113 0M16 4.6a3.5 3.5 0 010 6.8M21.5 20a6.5 6.5 0 00-4-6"/></symbol>
 <symbol id="i-terminal" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12 15h5"/></symbol>
 <symbol id="i-sliders" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-eyeoff" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.6 5.1A10.8 10.8 0 0112 5c6.4 0 10 7 10 7a17.6 17.6 0 01-3.2 4.2M6.6 6.6C3.7 8.5 2 12 2 12s3.6 7 10 7a10 10 0 005.4-1.6"/><path d="M9.9 9.9a3 3 0 004.2 4.2"/><path d="M3 3l18 18"/></symbol>
 <symbol id="i-heart" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 20s-7-4.4-7-10a4 4 0 017-2.6A4 4 0 0119 10c0 5.6-7 10-7 10z"/></symbol>
 </defs></svg>
 
@@ -6370,7 +7439,7 @@ details.log summary::-webkit-details-marker{display:none}
         <label class="field">Minecraft version<small>The newest version is the right choice unless your friends play an older one.</small>
           <select id="v-ver"></select></label>
       </div>
-      <div class="wnav" style="margin-top:18px"><span></span><button class="btn primary" id="w1-next" disabled>Next<svg><use href="#i-chev"/></svg></button></div>
+      <div class="wnav w1bar" id="w1-bar"><span class="w1sel" id="w1-sel">Pick what you want to play</span><button class="btn primary" id="w1-next" disabled>Next<svg><use href="#i-chev"/></svg></button></div>
     </div>
     <!-- step 2 -->
     <div id="w2" hidden>
@@ -6409,8 +7478,10 @@ details.log summary::-webkit-details-marker{display:none}
   </div>
   <div class="glass progress" id="b-result" hidden data-shine>
     <h2 id="r-title" tabindex="-1"></h2><p class="now" id="r-sub"></p>
+    <ol class="steps" id="r-steps" hidden></ol>
     <div id="r-todos"></div>
-    <div class="pfoot"><span></span><div style="display:flex;gap:10px"><button class="btn" id="r-home">All servers</button><button class="btn primary" id="r-open" hidden>Open server</button></div></div>
+    <details class="log" id="r-details" hidden><summary><svg width="14" height="14"><use href="#i-down"/></svg>Technical details</summary><pre class="feed" id="r-details-text"></pre><button class="btn sm quiet" id="r-copy">Copy details</button></details>
+    <div class="pfoot"><span></span><div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end"><button class="btn" id="r-home">All servers</button><button class="btn" id="r-retry" hidden>Try again</button><button class="btn primary" id="r-open" hidden>Open server</button></div></div>
   </div>
 </section>
 
@@ -6427,7 +7498,8 @@ details.log summary::-webkit-details-marker{display:none}
       <div class="stats"><div><span>Players</span><b id="stat-players">0</b></div><div><span>Memory</span><b id="stat-ram">-</b></div><div><span>Version</span><b id="stat-ver">-</b></div></div>
     </div>
     <div class="glass join" data-shine>
-      <div><h3 class="sec-title">How to join</h3><p class="sec-sub" style="margin:0">In Minecraft: Multiplayer, then Add Server, then paste the address.</p></div>
+      <div class="joinhead"><div><h3 class="sec-title">How to join</h3><p class="sec-sub" style="margin:0">In Minecraft: Multiplayer, then Add Server, then paste the address.</p></div>
+        <button class="btn sm quiet" id="priv-btn" type="button" title="Your addresses are hidden so they don't show up in screenshots or streams. Copy still copies the real address."><svg><use href="#i-eye"/></svg><span>Show</span></button></div>
       <div class="addr"><span class="ai"><svg><use href="#i-monitor"/></svg></span><div class="t"><small>On this computer</small><code id="a-local">localhost</code></div><button class="btn sm" data-copy="a-local"><svg><use href="#i-copy"/></svg>Copy</button></div>
       <div class="addr"><span class="ai"><svg><use href="#i-wifi"/></svg></span><div class="t"><small>Friends on the same Wi-Fi</small><code id="a-lan">-</code></div><button class="btn sm" data-copy="a-lan"><svg><use href="#i-copy"/></svg>Copy</button></div>
       <div class="addr"><span class="ai"><svg><use href="#i-globe"/></svg></span><div class="t"><small>Friends anywhere else</small><code id="a-pub">Finding your address…</code></div><button class="btn sm" data-copy="a-pub"><svg><use href="#i-copy"/></svg>Copy</button></div>
@@ -6442,6 +7514,7 @@ details.log summary::-webkit-details-marker{display:none}
   <div class="tabs" role="tablist" id="tabs">
     <button role="tab" data-tab="console" aria-selected="true"><svg width="15" height="15"><use href="#i-terminal"/></svg>Console</button>
     <button role="tab" data-tab="players" aria-selected="false"><svg width="15" height="15"><use href="#i-users"/></svg>Players</button>
+    <button role="tab" data-tab="mods" aria-selected="false" id="tab-mods"><svg width="15" height="15"><use href="#i-block"/></svg>Mods</button>
     <button role="tab" data-tab="settings" aria-selected="false"><svg width="15" height="15"><use href="#i-sliders"/></svg>Settings</button>
     <button role="tab" data-tab="problems" aria-selected="false"><svg width="15" height="15"><use href="#i-heart"/></svg>Health<span class="badge" id="prob-badge" hidden>!</span></button>
   </div>
@@ -6450,13 +7523,40 @@ details.log summary::-webkit-details-marker{display:none}
     <form class="cmd" id="cmd-form"><input type="text" id="cmd" placeholder="Type a command, like: say Hello everyone" autocomplete="off" spellcheck="false" aria-label="Server command"><button class="btn" type="submit">Send</button></form>
     <div class="quick"><button class="btn sm" data-q="admin">Make someone an admin</button><button class="btn sm" data-q="time set day">Make it day</button><button class="btn sm" data-q="weather clear">Clear the weather</button><button class="btn sm" data-q="save-all">Save the world now</button><button class="btn sm" data-q="say">Send a message</button></div>
   </div>
-  <div class="glass tabpanel" id="t-players" hidden data-shine><div class="players" id="players"></div></div>
-  <div class="glass tabpanel" id="t-settings" hidden data-shine>
-    <p class="sec-sub" style="margin-top:0">Changes take effect the next time the server starts.</p>
+  <div class="glass tabpanel" id="t-players" hidden>
+    <div class="pgrid">
+      <section class="psec"><h4>Online now</h4><div class="players" id="players"></div></section>
+      <section class="psec"><h4>Operators</h4><p class="sec-sub">Operators (admins) can use commands like /gamemode, /tp and /kick from inside the game. Only give this to people you trust.</p>
+        <form class="addrow" id="op-form"><input type="text" id="op-name" maxlength="16" placeholder="Their Minecraft name" autocomplete="off" spellcheck="false" aria-label="Minecraft name to make operator"><button class="btn sm primary" type="submit">Make operator</button></form>
+        <div class="plist" id="op-list"></div></section>
+      <section class="psec" id="wl-sec"><h4>Whitelist</h4><p class="sec-sub" id="wl-text"></p>
+        <form class="addrow" id="wl-form"><input type="text" id="wl-name" maxlength="16" placeholder="Their Minecraft name" autocomplete="off" spellcheck="false" aria-label="Minecraft name to add to the whitelist"><button class="btn sm primary" type="submit">Add to whitelist</button></form>
+        <button class="btn sm" id="wl-on" hidden>Turn on the whitelist</button>
+        <div class="plist" id="wl-list"></div></section>
+    </div>
+  </div>
+  <div class="glass tabpanel" id="t-settings" hidden>
+    <div class="sethead"><p class="sec-sub" style="margin:0">Changes take effect the next time the server starts.</p><button class="btn sm" id="props-open"><svg><use href="#i-file"/></svg>Edit the server.properties file</button></div>
     <div class="setlist" id="setlist"></div>
-    <div class="pfoot"><button class="btn quiet sm" id="srv-remove">Remove from my list</button><div style="display:flex;gap:10px"><button class="btn sm" id="srv-icon-btn">Change icon</button><button class="btn sm" id="srv-rename">Rename</button><button class="btn primary" id="set-save">Save changes</button></div></div>
+    <div class="pfoot"><span style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn quiet sm" id="srv-remove">Remove from my list</button><button class="btn quiet sm danger-text" id="srv-delete">Delete server</button></span><div style="display:flex;gap:10px"><button class="btn sm" id="srv-icon-btn">Change icon</button><button class="btn sm" id="srv-rename">Rename</button></div></div>
+    <div class="savebar" id="savebar"><span id="savebar-text">All changes saved</span><button class="btn quiet sm" id="set-discard" hidden>Discard</button><button class="btn primary" id="set-save" disabled>Save changes</button></div>
+  </div>
+  <div class="glass tabpanel" id="t-mods" hidden data-shine>
+    <div class="modhead"><div><h3 class="sec-title">Mods</h3><p class="sec-sub" id="mods-sub" style="margin:0">The mods this server loads.</p></div>
+      <div class="modacts"><button class="btn primary" id="mods-add"><svg><use href="#i-plus"/></svg>Add mods</button><button class="btn" id="mods-folder"><svg><use href="#i-folder"/></svg>Open mods folder</button></div></div>
+    <div class="modnote" id="mods-running" hidden><svg><use href="#i-alert"/></svg><span>The server is running. Stop it to turn mods on or off or remove them. New mods load the next time it starts.</span></div>
+    <div class="moddrop" id="mods-drop"><svg><use href="#i-plus"/></svg><span>Drop <b>.jar</b> mod files here to add them. The app checks each one for you.</span></div>
+    <div class="modtools"><div class="search"><div class="sicon"><svg><use href="#i-search"/></svg><input type="search" id="mods-q" placeholder="Find a mod" autocomplete="off" spellcheck="false" aria-label="Find a mod"></div></div>
+      <label class="modfilter" id="mods-onlywarn-l" hidden><span class="sw"><input type="checkbox" id="mods-onlywarn"><span></span></span><span id="mods-onlywarn-t">Only mods that need a look</span></label></div>
+    <div id="mods-list" class="modlist"></div>
+    <div id="mods-removed-box" hidden><h4 class="modsub">Mods you removed</h4><div id="mods-removed"></div></div>
   </div>
   <div class="glass tabpanel" id="t-problems" hidden data-shine>
+    <div id="hstats" class="hstats">
+      <div class="hcard"><div class="hlab">Memory used</div><div class="hval" id="hs-mem">\u2013</div><div class="hsub" id="hs-mem-sub"></div><canvas id="hs-mem-c" width="300" height="60"></canvas></div>
+      <div class="hcard"><div class="hlab">Average tick</div><div class="hval" id="hs-tick">\u2013</div><div class="hsub" id="hs-tick-sub"></div><canvas id="hs-tick-c" width="300" height="60"></canvas></div>
+      <p class="hnote" id="hs-note" hidden></p>
+    </div>
     <div id="health"></div>
     <h3 class="sec-title" style="margin-top:22px">Check a log file</h3>
     <p class="sec-sub">If someone sent you a crash log, or the server misbehaves, give the app the log and it looks for the cause.</p>
@@ -6476,6 +7576,8 @@ details.log summary::-webkit-details-marker{display:none}
       <div class="set"><div><b>Look</b><span>Automatic follows the time of day where you are.</span></div><div class="ctl"><div class="seg" id="theme-seg"><button data-v="auto">Automatic</button><button data-v="light">Light</button><button data-v="dark">Dark</button></div></div></div>
       <div class="set"><div><b>Moving sky</b><span>Drifting clouds, twinkling stars and the odd shooting star. Turn it off on slower computers.</span></div><div class="ctl"><span class="sw"><input type="checkbox" id="motion-sw" aria-label="Moving sky"><span></span></span></div></div>
       <div class="set" id="tb-row"><div><b>Window frame</b><span>Use the app’s own glass title bar, or the standard Windows one. Takes effect next time the app opens.</span></div><div class="ctl"><div class="seg" id="tb-seg"><button data-v="custom">App</button><button data-v="standard">Windows</button></div></div></div>
+      <div class="set" id="pk-row"><div><b>Choosing files and folders</b><span>Use the normal Windows “Open” window you know from other programs, or the one built into this app.</span></div><div class="ctl"><div class="seg" id="pk-seg"><button data-v="windows">Windows</button><button data-v="builtin">Built-in</button></div></div></div>
+      <div class="set"><div><b>Show addresses</b><span>Your IP addresses are hidden so they don’t end up in screenshots or streams. Copy buttons still copy the real address.</span></div><div class="ctl"><span class="sw"><input type="checkbox" id="priv-sw" aria-label="Show addresses"><span></span></span></div></div>
       <div class="set"><div><b>Updates</b><span id="upd-text">Checking…</span></div><div class="ctl"><button class="btn sm" id="upd-check">Check now</button></div></div>
       <div class="set"><div><b>Stronger repairs</b><span>When a crash has no clear cause, also take out mods that are only suspected. Usually not needed.</span></div><div class="ctl"><span class="sw"><input type="checkbox" id="aggr" aria-label="Stronger repairs"><span></span></span></div></div>
       <div class="set"><div><b>CurseForge key</b><span>Optional. Helps when some CurseForge modpack files won’t download.</span></div><div class="ctl"><input type="password" id="cfkey" placeholder="Paste key" autocomplete="off"></div></div>
@@ -6594,7 +7696,7 @@ function paintMax(){win('state').then(function(st){var m=st&&st.max;$('#max-ic')
 /* ---------- modal ---------- */
 var modalPrev=null,modalClose=null;
 function modal(title,body,buttons,onClose){
-  modalPrev=document.activeElement;modalClose=onClose||null;$('#m-title').textContent=title;var b=$('#m-body');b.textContent='';
+  modalPrev=document.activeElement;modalClose=onClose||null;$('#veil .sheet').classList.remove('wide');$('#m-title').textContent=title;var b=$('#m-body');b.textContent='';
   if(typeof body==='string'){b.appendChild(el('p',null,body))}else if(body)b.appendChild(body);
   var f=$('#m-foot');f.textContent='';(buttons||[{t:'OK',primary:true}]).forEach(function(x){var bt=el('button','btn'+(x.primary?' primary':x.danger?' stop':' quiet'),x.t);bt.onclick=function(){if(x.fn&&x.fn()===false)return;closeModal()};f.appendChild(bt)});
   $('#veil').hidden=false;var first=f.querySelector('.primary,.stop')||$('#m-x');setTimeout(function(){first.focus()},30);
@@ -6610,26 +7712,91 @@ function prompt2(title,text,ph,okText){return new Promise(function(res){var box=
 
 /* ---------- file/folder picker ---------- */
 var pk=null,pkSeq=0;
-function pick(opt){return new Promise(function(resolve){
-  var box=el('div');box.innerHTML='';var go=el('form','search');var gi=el('input');gi.type='text';gi.placeholder='Type a folder path and press Enter';gi.setAttribute('aria-label','Go to path');go.appendChild(gi);box.appendChild(go);
-  var cr=el('nav','crumbs');var list=el('div','list');box.appendChild(cr);box.appendChild(list);
-  var done=false,cur='';var foot=[{t:'Cancel'}];if(opt.kind==='dir')foot.push({t:'Use this folder',primary:true,fn:function(){if(!cur)return false;done=true;resolve(cur)}});
-  modal(opt.title,box,foot,function(){if(!done)resolve(null)});pk={};
-  go.onsubmit=function(e){e.preventDefault();if(gi.value.trim())load(gi.value.trim())};
-  function load(path){var seq=++pkSeq;list.setAttribute('aria-busy','true');
-    api('/api/fs?path='+encodeURIComponent(path)+(opt.kind==='file'?'&files=1&exts='+opt.exts.join(','):'')).then(function(d){
-      if(seq!==pkSeq||!pk)return;list.removeAttribute('aria-busy');cur=d.path;cr.textContent='';
-      var hb=el('button',null,'Home');hb.type='button';hb.onclick=function(){load(S.home)};cr.appendChild(hb);
-      if(S.info.win){var pc=el('button',null,'This PC');pc.type='button';pc.onclick=function(){load('')};cr.appendChild(el('span',null,'\u203a'));cr.appendChild(pc)}
-      var cs=d.crumbs.length>4?[d.crumbs[0],null].concat(d.crumbs.slice(-2)):d.crumbs;
-      cs.forEach(function(c){cr.appendChild(el('span',null,'\u203a'));if(!c){cr.appendChild(el('span',null,'\u2026'));return}var b=el('button',null,c.name);b.type='button';b.onclick=function(){load(c.path)};cr.appendChild(b)});
-      list.textContent='';
-      if(d.parent!==null&&d.parent!==undefined){var up=el('button');up.type='button';up.appendChild(icon('back'));up.appendChild(el('span',null,'Up one level'));up.onclick=function(){load(d.parent)};list.appendChild(up)}
-      d.dirs.forEach(function(n){var b=el('button');b.type='button';b.title=n;b.appendChild(icon('folder'));b.appendChild(el('span',null,n));b.onclick=function(){load(joinPath(d.path,n))};list.appendChild(b)});
-      (d.files||[]).forEach(function(n){var b=el('button');b.type='button';b.title=n;b.appendChild(icon('file'));b.appendChild(el('span',null,n));b.onclick=function(){done=true;closeModal();resolve(joinPath(d.path,n))};list.appendChild(b)});
-      if(!d.dirs.length&&!(d.files||[]).length)list.appendChild(el('p','muted',d.error?'This folder can\u2019t be opened.':(opt.kind==='file'?'No matching files here.':'No folders here.')));
-      var f=list.querySelector('button');if(f)f.focus();
-    }).catch(function(e){if(seq!==pkSeq)return;list.removeAttribute('aria-busy');toast(e.message,true)})}
+function useNativePicker(){var st=S.info.settings||{};return !!S.info.native_capable&&st.picker!=='builtin'&&!S.noNativePick}
+// opt.kind: 'file' | 'files' (several) | 'dir'. Resolves to a path (or an array of paths for 'files'), or null.
+function pick(opt){if(!useNativePicker())return pickBuiltin(opt);
+  return api('/api/pickfile',{kind:opt.kind,exts:opt.exts||[],title:opt.title||'',start:opt.start||''}).then(function(d){
+    if(d.unsupported){S.noNativePick=true;return pick(opt)}var ps=d.paths||[];if(!ps.length)return null;return opt.kind==='files'?ps:ps[0]}).catch(function(){S.noNativePick=true;return pick(opt)})}
+function pickBuiltin(opt){return new Promise(function(resolve){
+  // Laid out like File Explorer: Back/Forward/Up, address bar, search, Quick access on the left, details on the right.
+  var multi=opt.kind==='files',wantFiles=opt.kind!=='dir',exts=opt.exts||[],allTypes=false;
+  var root=el('div','xp'),bar=el('div','xp-bar');
+  function tbtn(ic,label,cls){var b=el('button','xp-tb'+(cls?' '+cls:''));b.type='button';b.title=label;b.setAttribute('aria-label',label);b.appendChild(icon(ic));bar.appendChild(b);return b}
+  var bBack=tbtn('back','Back (Alt+Left)'),bFwd=tbtn('chev','Forward (Alt+Right)'),bUp=tbtn('down','Up to the parent folder (Backspace)','rot'),bRef=tbtn('restart','Refresh (F5)');
+  var addr=el('input','xp-addr');addr.type='text';addr.spellcheck=false;addr.setAttribute('aria-label','Address');bar.appendChild(addr);
+  var srch=el('input','xp-search');srch.type='search';srch.placeholder='Search';srch.setAttribute('aria-label','Search this folder');bar.appendChild(srch);root.appendChild(bar);
+  var wrap=el('div','xp-wrap'),side=el('nav','xp-side'),main=el('div','xp-main');side.setAttribute('aria-label','Quick access');
+  var head=el('div','xp-row xp-head');[['name','Name'],['date','Date modified'],['type','Type'],['size','Size']].forEach(function(c){var b=el('button','xp-c xp-col-'+c[0],c[1]);b.type='button';b.dataset.k=c[0];head.appendChild(b)});
+  var rows=el('div','xp-rows');rows.tabIndex=0;rows.setAttribute('role','listbox');if(multi)rows.setAttribute('aria-multiselectable','true');
+  main.appendChild(head);main.appendChild(rows);wrap.appendChild(side);wrap.appendChild(main);root.appendChild(wrap);
+  var bot=el('div','xp-bottom'),nl=el('label','xp-nl',wantFiles?'File name:':'Folder:'),nameBox=el('input','xp-name');nameBox.type='text';nameBox.spellcheck=false;nl.appendChild(nameBox);bot.appendChild(nl);
+  var typeSel=null;if(wantFiles&&exts.length){typeSel=el('select','xp-ftype');var o1=el('option',null,exts.map(function(e){return e.toUpperCase()}).join(', ')+' files ('+exts.map(function(e){return '*.'+e}).join(';')+')');o1.value='f';var o2=el('option',null,'All files (*.*)');o2.value='a';typeSel.appendChild(o1);typeSel.appendChild(o2);typeSel.setAttribute('aria-label','File type');bot.appendChild(typeSel);
+    typeSel.onchange=function(){allTypes=typeSel.value==='a';load(cur,true)}}
+  var status=el('div','xp-status');bot.appendChild(status);root.appendChild(bot);
+  var done=false,cur=null,data=null,items=[],sel=new Set(),anchor=-1,back=[],fwd=[],sortK='name',sortUp=true;
+  function finish(v){done=true;closeModal();resolve(v)}
+  function choose(){var t=nameBox.value.trim();
+    if(t&&(/^([A-Za-z]:|\\\\|\/)/.test(t)||t.indexOf('…')<0&&!items.some(function(x){return x.name===t})&&/[\\/]/.test(t))){   // a typed path
+      api('/api/fs?path='+encodeURIComponent(t)+'&files=1').then(function(d){var norm=function(x){return x.replace(/[\\/]+$/,'').toLowerCase()};
+        if(norm(d.path)===norm(t)){if(wantFiles)go2(d.path);else finish(d.path)}else{var nm=t.split(/[\\/]/).pop();if(wantFiles&&(d.files||[]).indexOf(nm)>=0)finish(multi?[joinPath(d.path,nm)]:joinPath(d.path,nm));else toast('Windows can’t find “'+t+'”. Check the spelling and try again.',true)}}).catch(function(e){toast(e.message,true)});return false}
+    var picked=items.filter(function(x,i){return sel.has(i)});
+    if(!picked.length&&t){var hit=items.filter(function(x){return x.name.toLowerCase()===t.toLowerCase()})[0];if(hit)picked=[hit]}
+    if(picked.length===1&&picked[0].dir&&wantFiles){go2(picked[0].path);return false}
+    if(!wantFiles){if(cur===''&&!picked.length)return false;finish(picked.length&&picked[0].dir?picked[0].path:cur);return false}
+    var fs=picked.filter(function(x){return !x.dir});if(!fs.length)return false;
+    finish(multi?fs.map(function(x){return x.path}):fs[0].path);return false}
+  modal(opt.title||(wantFiles?'Open':'Select a folder'),root,[{t:'Cancel'},{t:wantFiles?'Open':'Select Folder',primary:true,fn:choose}],function(){if(!done)resolve(null)});pk={};
+  $('#veil .sheet').classList.add('wide');
+  function fmtDate(t){if(!t)return '';var d=new Date(t*1000);return d.toLocaleDateString()+' '+d.toLocaleTimeString([],{hour:'numeric',minute:'2-digit'})}
+  function ftype(n,dir){if(dir)return 'File folder';var e=(n.match(/\.([^.]+)$/)||[])[1];if(!e)return 'File';e=e.toLowerCase();
+    return {jar:'Executable Jar File',zip:'Compressed (zipped) Folder',txt:'Text Document',log:'Text Document',png:'PNG File',jpg:'JPG File',mrpack:'MRPACK File',json:'JSON File',properties:'PROPERTIES File',bat:'Windows Batch File'}[e]||e.toUpperCase()+' File'}
+  function fsize(b){return b==null?'':Math.max(1,Math.ceil(b/1024)).toLocaleString()+' KB'}
+  function paintSel(){[].forEach.call(rows.children,function(r,i){r.setAttribute('aria-selected',sel.has(+r.dataset.i))});
+    var ps=items.filter(function(x,i){return sel.has(i)});
+    if(ps.length)nameBox.value=ps.length>1?ps.filter(function(x){return !x.dir}).map(function(x){return '"'+x.name+'"'}).join(' '):ps[0].dir&&wantFiles?'':ps[0].name;
+    status.textContent=items.length+' item'+(items.length===1?'':'s')+(ps.length?'   '+ps.length+' item'+(ps.length===1?'':'s')+' selected':'')}
+  function render(){var q=srch.value.trim().toLowerCase();rows.textContent='';
+    var vis=items.map(function(x,i){return [x,i]}).filter(function(p){return !q||p[0].name.toLowerCase().indexOf(q)>=0});
+    vis.sort(function(a,b){var x=a[0],y=b[0];if(x.dir!==y.dir)return x.dir?-1:1;var r=sortK==='date'?(x.mtime||0)-(y.mtime||0):sortK==='size'?(x.size||0)-(y.size||0):sortK==='type'?ftype(x.name,x.dir).localeCompare(ftype(y.name,y.dir)):x.name.localeCompare(y.name,undefined,{numeric:true,sensitivity:'base'});return sortUp?r:-r});
+    vis.forEach(function(p){var x=p[0],r=el('div','xp-row');r.dataset.i=p[1];r.setAttribute('role','option');r.title=x.name;
+      var n=el('span','xp-c xp-name-c');n.appendChild(icon(x.drive?'monitor':x.dir?'folder':'file'));n.lastChild.classList.add(x.dir?'fold':'doc');n.appendChild(el('span',null,x.label||x.name));r.appendChild(n);
+      r.appendChild(el('span','xp-c xp-col-date',fmtDate(x.mtime)));r.appendChild(el('span','xp-c xp-col-type',x.drive?'Local Disk':ftype(x.name,x.dir)));r.appendChild(el('span','xp-c xp-col-size',fsize(x.size)));
+      r.onclick=function(e){var i=+r.dataset.i;if(multi&&e.shiftKey&&anchor>=0){var order=[].map.call(rows.children,function(c){return +c.dataset.i}),a=order.indexOf(anchor),b=order.indexOf(i);sel=new Set(order.slice(Math.min(a,b),Math.max(a,b)+1))}
+        else if(multi&&(e.ctrlKey||e.metaKey)){sel.has(i)?sel.delete(i):sel.add(i);anchor=i}else{sel=new Set([i]);anchor=i}paintSel()};
+      r.ondblclick=function(){var i=+r.dataset.i;sel=new Set([i]);if(items[i].dir)go2(items[i].path);else{paintSel();choose()}};rows.appendChild(r)});
+    if(!vis.length)rows.appendChild(el('div','xp-empty',data&&data.error?'This folder can’t be opened.':q?'No items match your search.':'This folder is empty.'));
+    [].forEach.call(head.children,function(b){b.classList.toggle('on',b.dataset.k===sortK);b.classList.toggle('down',b.dataset.k===sortK&&!sortUp)});paintSel()}
+  [].forEach.call(head.children,function(b){b.onclick=function(){if(sortK===b.dataset.k)sortUp=!sortUp;else{sortK=b.dataset.k;sortUp=true}render()}});
+  srch.oninput=render;
+  function go2(path){if(cur!==null&&path!==cur){back.push(cur);fwd=[]}load(path)}
+  function load(path,keep){var seq=++pkSeq;rows.setAttribute('aria-busy','true');
+    api('/api/fs?path='+encodeURIComponent(path)+'&places=1'+(wantFiles?'&files=1'+(allTypes?'':'&exts='+exts.join(',')):'')).then(function(d){
+      if(seq!==pkSeq||!pk)return;rows.removeAttribute('aria-busy');data=d;cur=d.path;S.sep=d.sep||S.sep;
+      addr.value=cur===''?'This PC':cur;srch.value='';sel=new Set();anchor=-1;if(!keep&&!wantFiles)nameBox.value='';
+      var det=d.details||{};
+      items=cur===''?d.dirs.map(function(n){return {name:n,label:'Local Disk ('+n.replace(/\\$/,'')+')',path:n,dir:true,drive:true}}):
+        d.dirs.map(function(n){return {name:n,path:joinPath(d.path,n),dir:true,mtime:(det[n]||[])[0]}}).concat((d.files||[]).map(function(n){return {name:n,path:joinPath(d.path,n),dir:false,mtime:(det[n]||[])[0],size:(det[n]||[])[1]}}));
+      bBack.disabled=!back.length;bFwd.disabled=!fwd.length;bUp.disabled=d.parent===null||d.parent===undefined;
+      side.textContent='';var qa=el('div','xp-sh','Quick access');side.appendChild(qa);
+      (d.places||[]).forEach(function(p){addPlace(p.name,p.path,p.icon)});
+      if(S.info.win||(d.drives||[]).length){side.appendChild(el('div','xp-sh','This PC'));addPlace('This PC','','monitor');(d.drives||[]).forEach(function(v){addPlace('Local Disk ('+v.replace(/\\$/,'')+')',v,'folder')})}
+      render();rows.focus()}).catch(function(e){if(seq!==pkSeq)return;rows.removeAttribute('aria-busy');toast(e.message,true)})}
+  function addPlace(name,path,ic){var b=el('button','xp-place');b.type='button';b.appendChild(icon(ic||'folder'));b.appendChild(el('span',null,name));
+    var same=(path||'').replace(/[\\/]+$/,'').toLowerCase()===(cur||'').replace(/[\\/]+$/,'').toLowerCase();if(same)b.classList.add('on');b.onclick=function(){go2(path)};side.appendChild(b)}
+  bBack.onclick=function(){if(!back.length)return;fwd.push(cur);load(back.pop())};
+  bFwd.onclick=function(){if(!fwd.length)return;back.push(cur);load(fwd.pop())};
+  bUp.onclick=function(){if(data&&data.parent!=null)go2(data.parent)};bRef.onclick=function(){load(cur,true)};
+  addr.onkeydown=function(e){if(e.key==='Enter'){e.preventDefault();var v=addr.value.trim();if(/^this pc$/i.test(v))v='';go2(v)}};
+  addr.onfocus=function(){addr.select()};
+  nameBox.onkeydown=function(e){if(e.key==='Enter'){e.preventDefault();choose()}};
+  root.addEventListener('keydown',function(e){if(e.target===addr||e.target===nameBox||e.target===srch){return}
+    if(e.altKey&&e.key==='ArrowLeft'){e.preventDefault();bBack.click()}else if(e.altKey&&e.key==='ArrowRight'){e.preventDefault();bFwd.click()}
+    else if(e.key==='Backspace'||(e.altKey&&e.key==='ArrowUp')){e.preventDefault();bUp.click()}else if(e.key==='F5'){e.preventDefault();bRef.click()}});
+  rows.addEventListener('keydown',function(e){var order=[].map.call(rows.querySelectorAll('.xp-row'),function(c){return +c.dataset.i});if(!order.length)return;
+    var pos=anchor>=0?order.indexOf(anchor):-1;
+    if(e.key==='ArrowDown'||e.key==='ArrowUp'){e.preventDefault();pos=Math.max(0,Math.min(order.length-1,pos+(e.key==='ArrowDown'?1:-1)));anchor=order[pos];sel=new Set([anchor]);paintSel();var r=rows.querySelector('[data-i="'+anchor+'"]');if(r)r.scrollIntoView({block:'nearest'})}
+    else if(e.key==='Enter'&&anchor>=0){e.preventDefault();if(items[anchor].dir)go2(items[anchor].path);else choose()}
+    else if(e.key==='a'&&(e.ctrlKey||e.metaKey)&&multi){e.preventDefault();sel=new Set(order.filter(function(i){return !items[i].dir}));paintSel()}});
   load(opt.start||S.home);
 })}
 
@@ -6641,6 +7808,7 @@ document.addEventListener('dragover',function(e){e.preventDefault()});document.a
 /* ---------- navigation ---------- */
 var VIEWS=['home','create','build','server','settings','install'];
 function go(v,arg){
+  if(S.view==='server'&&tab==='settings'&&setDirty&&!(v==='server'&&arg===S.sid)){guardLeave(function(){go(v,arg)});return}
   if(S.view==='server'&&v!=='server')stopServerPolling();
   S.view=v;VIEWS.forEach(function(x){$('#v-'+x).hidden=x!==v});$('#main').scrollTop=0;
   var cr=$('#crumb');cr.textContent='';
@@ -6669,6 +7837,7 @@ function renderHome(){
     var top=el('div','top'),ic=el('div','picon');packIcon(ic,iconUrl(s));top.appendChild(ic);var nm=el('div');nm.style.minWidth='0';nm.appendChild(el('h3',null,s.name));top.appendChild(nm);c.appendChild(top);
     var chips=el('div','chips');if(s.mc)chips.appendChild(el('span','chip pix',s.mc));if(s.loader)chips.appendChild(el('span','chip',loaderName(s.loader)));if(s.pack&&s.pack!==s.name)chips.appendChild(el('span','chip',s.pack));c.appendChild(chips);
     var f=el('div','foot'),st=el('span','state'),d=el('i','dot '+(s.missing?'':s.state));st.appendChild(d);st.appendChild(document.createTextNode(s.missing?'Folder not found':stateText(s)));f.appendChild(st);f.appendChild(icon('chev'));f.lastChild.setAttribute('width','16');f.lastChild.setAttribute('height','16');c.appendChild(f);
+    c.oncontextmenu=function(e){e.preventDefault();serverMenu(s,e.clientX||c.getBoundingClientRect().left+20,e.clientY||c.getBoundingClientRect().top+20)};
     c.onclick=function(){if(s.missing){ask('Folder not found','The folder for \u201c'+s.name+'\u201d can\u2019t be found. It may have been moved or deleted. Remove it from your list?','Remove',true).then(function(ok){if(ok)api('/api/servers/remove',{id:s.id}).then(loadHome)});return}if(s.state==='setting_up'){go('build');return}go('server',s.id)};
     box.appendChild(c)});
   if(has){var n=el('button','scard new');var p=el('span','plus');p.appendChild(icon('plus'));n.appendChild(p);n.appendChild(el('b',null,'Create a new server'));var im=el('span','muted','or add one you already have');n.appendChild(im);
@@ -6704,7 +7873,8 @@ function search(q,offset){S.q=q;S.page=offset;var box=$('#packs');if(!offset){bo
     $('#q-note').textContent=q?(d.total?fmtNum(d.total)+' modpack'+(d.total===1?'':'s')+' found':'No modpacks match \u201c'+q+'\u201d. Try a shorter name.'):'Popular modpacks';
     d.hits.forEach(function(h){var b=el('button','pack');b.setAttribute('aria-pressed','false');var ic=el('div','picon');packIcon(ic,h.icon);b.appendChild(ic);
       var t=el('div');t.style.minWidth='0';t.appendChild(el('b',null,h.title));t.appendChild(el('p',null,h.description));var m=el('div','meta');if(h.mc)m.appendChild(el('span','chip pix',h.mc));h.loaders.slice(0,2).forEach(function(l){m.appendChild(el('span','chip',l))});m.appendChild(el('span','chip',fmtNum(h.downloads)+' downloads'));t.appendChild(m);b.appendChild(t);
-      b.onclick=function(){$$('.pack').forEach(function(p){p.setAttribute('aria-pressed',p===b)});S.src={type:'modrinth',id:h.id,title:h.title,icon:h.icon,mc:h.mc,loader:h.loaders[0]||''};validateW()};box.appendChild(b)});
+      b.onclick=function(){$$('.pack').forEach(function(p){p.setAttribute('aria-pressed',p===b)});S.src={type:'modrinth',id:h.id,title:h.title,icon:h.icon,mc:h.mc,loader:h.loaders[0]||''};validateW()};
+      b.ondblclick=function(){b.onclick();$('#w1-next').click()};b.title='Double-click to choose it and go to the next step';box.appendChild(b)});
     $('#q-more').hidden=offset+d.hits.length>=d.total||!d.hits.length;
   }).catch(function(e){box.removeAttribute('aria-busy');$('#q-note').textContent='Couldn\u2019t reach the modpack library. Check your internet connection, then try again.'})}
 $('#q-more').onclick=function(){search(S.q,S.page+18)};
@@ -6716,7 +7886,8 @@ function setFile(path){api('/api/inspect',{path:path}).then(function(d){S.fileSr
 var drop=$('#drop');['dragenter','dragover'].forEach(function(t){drop.addEventListener(t,function(e){e.preventDefault();drop.classList.add('over')})});['dragleave','drop'].forEach(function(t){drop.addEventListener(t,function(e){e.preventDefault();drop.classList.remove('over')})});
 drop.addEventListener('drop',function(e){var f=e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0];if(!f)return;if(!/\.(zip|mrpack)$/i.test(f.name)){toast('Use a .zip or .mrpack modpack file.',true);return}upload(f,'pack').then(function(d){setFile(d.path)}).catch(function(e){toast(e.message,true)})});
 $('#pick-file').onclick=$('#fp-change').onclick=function(){pick({kind:'file',exts:['zip','mrpack'],title:'Choose your modpack file'}).then(function(p){if(p)setFile(p)})};
-function validateW(){$('#w1-next').disabled=!S.src;var ok=$('#w-eula').checked;$('#w-create').disabled=!ok;$('#w3-hint').hidden=ok}
+function validateW(){$('#w1-next').disabled=!S.src;var ws=$('#w1-sel');ws.textContent='';
+  if(!S.src)ws.textContent='Pick what you want to play';else{ws.appendChild(document.createTextNode('Selected: '));ws.appendChild(el('b',null,S.src.type==='vanilla'?'Minecraft '+S.src.version:S.src.title||'your modpack'))}var ok=$('#w-eula').checked;$('#w-create').disabled=!ok;$('#w3-hint').hidden=ok}
 $('#w-eula').onchange=validateW;
 $('#w1-next').onclick=function(){if(!S.src)return;var name=S.src.type==='vanilla'?'Minecraft '+S.src.version:S.src.title||'My server';$('#w-name').value=name;
   api('/api/defaults?name='+encodeURIComponent(name)+'&mods='+(S.src.type==='vanilla'?0:(S.src.mods||120))).then(function(d){S.sysgb=Math.round(d.system_mb/1024);S.recRam=Math.round(d.ram_mb/1024);if(!S.ramTouched||S.ramFor!==S.src){S.ram=S.recRam;S.ramTouched=false}S.ramFor=S.src;if(!S.dirTouched)S.dir=d.dir;paintRam();paintDir()}).catch(function(){});setStep(2);$('#w-name').focus()};
@@ -6732,7 +7903,7 @@ $('#w2-back').onclick=function(){setStep(1)};$('#w3-back').onclick=function(){se
 $('#w2-next').onclick=function(){if(!$('#w-name').value.trim()){$('#w-name').focus();return}var sm=$('#w-summary');sm.textContent='';var t=el('div','t');t.appendChild(el('b',null,$('#w-name').value.trim()));
   t.appendChild(el('span',null,(S.src.type==='vanilla'?'Minecraft '+S.src.version:S.src.title+(S.src.mc?', Minecraft '+S.src.mc:''))+', '+S.ram+' GB memory'));sm.appendChild(t);setStep(3);validateW()};
 $('#w-create').onclick=function(){var b=this;if(!$('#w-eula').checked)return;b.disabled=true;
-  api('/api/create',{source:S.src,name:$('#w-name').value.trim(),dir:S.dir,ram_mb:S.ram*1024,eula:true,test:$('#w-test').checked,aggressive:!!(S.info.settings&&S.info.settings.aggressive),cfkey:(S.info.settings&&S.info.settings.cfkey)||''})
+  api('/api/create',S.lastCreate={source:S.src,name:$('#w-name').value.trim(),dir:S.dir,ram_mb:S.ram*1024,eula:true,test:$('#w-test').checked,aggressive:!!(S.info.settings&&S.info.settings.aggressive),cfkey:(S.info.settings&&S.info.settings.cfkey)||''})
     .then(function(){S.jobName=$('#w-name').value.trim();S.jobSid=null;api('/api/settings',{eula:true}).catch(function(){});S.info.settings=S.info.settings||{};S.info.settings.eula=true;startProgress('build',S.src.type)}).catch(function(e){b.disabled=false;toast(e.message,true)})};
 
 /* ---------- progress (create / fix jobs) ---------- */
@@ -6787,24 +7958,30 @@ function showResult(d){var r=d.result||{};doneJob=null;paintJobPill();
   var title,sub;if(r.cancelled){title='Stopped';sub='Nothing else will change. The server folder keeps what was done so far.'}else if(d.state==='error'){title='That didn\u2019t work';sub=r.error||'Something went wrong.'}
   else if(r.ok===false){title=d.kind==='fix'?'Some problems still need you':'Your server is made, but it needs a fix first';sub=todos.length?'Here\u2019s what\u2019s left to do:':'Its first start didn\u2019t work. Open it and press Start to see what happens; \u201cFix it for me\u201d can usually sort it out.'}
   else{title='Done';sub=''}
+  if(d.state==='error'&&!r.cancelled&&r.steps&&r.steps.length){title=r.error||'That didn\u2019t work';sub='Here\u2019s what to do:'}
+  var ol=$('#r-steps');ol.textContent='';(r.steps||[]).forEach(function(t){ol.appendChild(el('li',null,t))});ol.hidden=!(d.state==='error'&&!r.cancelled&&r.steps&&r.steps.length);
+  $('#r-details').hidden=!(d.state==='error'&&r.details);$('#r-details').open=false;$('#r-details-text').textContent=r.details||'';
+  $('#r-retry').hidden=!(d.state==='error'&&d.kind==='build'&&S.lastCreate&&!r.server_id);
   $('#r-title').textContent=title;$('#r-sub').textContent=sub;var td=$('#r-todos');td.textContent='';todos.forEach(function(t){var f=el('div','finding t-warn');f.appendChild(icon('alert'));f.appendChild(el('div',null,t));td.appendChild(f)});
   var sid=r.server_id||(r.cancelled||d.state==='error'?S.jobSid:null);$('#r-open').hidden=true;
   loadHome().then(function(){var known=sid&&S.servers.some(function(x){return x.id===sid});$('#r-open').hidden=!known;$('#r-open').onclick=function(){go('server',sid)}});$('#r-title').focus()}
 $('#r-home').onclick=function(){go('home')};
+$('#r-copy').onclick=function(){var t=$('#r-details-text').textContent;(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(function(){toast('Details copied')}).catch(function(){toast('Couldn\u2019t copy. Select the text and copy it.',true)})};
+$('#r-retry').onclick=function(){var b=this;if(!S.lastCreate)return;b.disabled=true;api('/api/create',S.lastCreate).then(function(){b.disabled=false;S.jobSid=null;startProgress('build',S.lastCreate.source&&S.lastCreate.source.type)}).catch(function(e){b.disabled=false;toast(e.message,true)})};
 
 /* ---------- server control room ---------- */
 var srv=null,conSince=0,sPollT=null,conT=null,conBusy=false,conGen=0,tab='console',lastState='';
 function ensureConsole(){if(!conT&&!conBusy)pollConsole()}
 function stopServerPolling(){clearTimeout(sPollT);clearTimeout(conT);sPollT=conT=null;conGen++;conBusy=false}
-function openServer(id){stopServerPolling();srv=null;conSince=0;lastState='';$('#console').textContent='';var ce=el('div','empty-c','The server\u2019s messages appear here while it runs.');ce.id='console-empty';$('#console').appendChild(ce);
-  $('#srv-crash').hidden=true;$('#srv-ready').hidden=!S.justMade;S.justMade=false;$('#a-pub').textContent='Finding your address\u2026';$('#reach').textContent='';selTab('console');
-  refreshServer(true);api('/api/server/public?id='+id).then(function(d){$('#a-pub').textContent=d.address||'Not available right now'}).catch(function(){$('#a-pub').textContent='Not available right now'})}
-function refreshServer(first){var id=S.sid;api('/api/server/status?id='+id).then(function(d){if(S.view!=='server'||S.sid!==id)return;srv=d;paintServer(d,first);
+function openServer(id){stopServerPolling();srv=null;modsData=null;$('#mods-list').textContent='';$('#mods-q').value='';plists={ops:[],whitelist:[],whitelist_on:false};S.onlinePlayers=null;setTimeout(loadPlayerLists,0);conSince=0;lastState='';$('#console').textContent='';var ce=el('div','empty-c','The server\u2019s messages appear here while it runs.');ce.id='console-empty';$('#console').appendChild(ce);
+  $('#srv-crash').hidden=true;$('#srv-ready').hidden=!S.justMade;S.justMade=false;setAddr('a-pub','Finding your address\u2026');$('#reach').textContent='';delete $('#reach').dataset.real;paintPrivacy();selTab('console');
+  refreshServer(true);api('/api/server/public?id='+id).then(function(d){setAddr('a-pub',d.address||'Not available right now')}).catch(function(){setAddr('a-pub','Not available right now')})}
+function refreshServer(first){var id=S.sid;api('/api/server/status?id='+id).then(function(d){if(S.view!=='server'||S.sid!==id)return;srv=d;paintServer(d,first);if(first&&S.afterOpen){var af=S.afterOpen;S.afterOpen=null;setTimeout(af,0)}
   sPollT=setTimeout(function(){refreshServer(false)},d.status.state==='starting'||d.status.state==='stopping'?1000:2500)}).catch(function(e){if(S.view!=='server')return;toast(e.message,true);go('home')})}
 function paintServer(d,first){var s=d.server,st=d.status||{},state=st.state||'offline';
   if(first){$('#srv-name').textContent=s.name;packIcon($('#srv-icon'),iconUrl(s));var ch=$('#srv-chips');ch.textContent='';if(s.mc)ch.appendChild(el('span','chip pix',s.mc));if(s.loader)ch.appendChild(el('span','chip',loaderName(s.loader)));if(s.pack&&s.pack!==s.name)ch.appendChild(el('span','chip',s.pack));
-    $('#stat-ver').textContent=s.mc||'-';$('#h-mods').hidden=s.loader==='vanilla'||!s.loader;var cr=$('#crumb span');if(cr)cr.textContent=s.name}
-  var j=d.join||{};$('#a-local').textContent=j.local||'localhost';$('#a-lan').textContent=j.lan||'Not connected to a network';$('#h-port').textContent=j.port||25565;$('#h-lan').textContent=j.lan?j.lan.split(':')[0]:'this PC';
+    $('#stat-ver').textContent=s.mc||'-';$('#tab-mods').hidden=s.loader==='vanilla';if(s.loader==='vanilla'&&tab==='mods')selTab('console');$('#h-mods').hidden=s.loader==='vanilla'||!s.loader;var cr=$('#crumb span');if(cr)cr.textContent=s.name}
+  var j=d.join||{};setAddr('a-local',j.local||'localhost');setAddr('a-lan',j.lan||'Not connected to a network');$('#h-port').textContent=j.port||25565;setAddr('h-lan',j.lan?j.lan.split(':')[0]:'this PC');
   var orb=$('#orb');orb.className='orb '+state;var n=(st.players||[]).length;
   var T={offline:['Offline','Press Start when you want to play.'],starting:['Starting\u2026','Getting the world ready. Big modpacks can take a few minutes.'],online:['Online',n?(n===1?'1 person is playing.':n+' people are playing.'):'Ready for players. Share an address on the right.'],stopping:['Stopping\u2026','Saving the world before it shuts down.'],crashed:['Stopped','Something went wrong. See below.']}[state]||['Offline',''];
   $('#st-title').textContent=T[0];$('#st-sub').textContent=T[1];
@@ -6819,7 +7996,7 @@ function paintServer(d,first){var s=d.server,st=d.status||{},state=st.state||'of
 function pollConsole(){var id=S.sid,g=conGen;conBusy=true;api('/api/server/console?id='+id+'&since='+conSince).then(function(d){if(g!==conGen)return;conBusy=false;if(S.view!=='server'||S.sid!==id){conT=null;return}conSince=d.next;addConsole(d.lines);
   var st=srv&&srv.status&&srv.status.state;conT=(st==='offline'||st==='crashed')&&!d.lines.length?null:setTimeout(pollConsole,document.hidden?2500:700)}).catch(function(){if(g!==conGen)return;conBusy=false;if(S.view==='server'&&S.sid===id)conT=setTimeout(pollConsole,2000)})}
 function addConsole(lines){if(!lines.length)return;var c=$('#console'),e=$('#console-empty');if(e)e.remove();var near=c.scrollHeight-c.scrollTop-c.clientHeight<80,frag=document.createDocumentFragment();
-  lines.forEach(function(l){frag.appendChild(el('div','c '+(l.kind||'info'),l.t))});c.appendChild(frag);var extra=c.childElementCount-1500;if(extra>0){var r=document.createRange();r.setStartBefore(c.firstChild);r.setEndAfter(c.children[extra-1]);r.deleteContents()}if(near)c.scrollTop=c.scrollHeight}
+  lines.forEach(function(l){var d=el('div','c '+(l.kind||'info'),maskIP(l.t));d._t=l.t;frag.appendChild(d)});c.appendChild(frag);var extra=c.childElementCount-1500;if(extra>0){var r=document.createRange();r.setStartBefore(c.firstChild);r.setEndAfter(c.children[extra-1]);r.deleteContents()}if(near)c.scrollTop=c.scrollHeight}
 $('#srv-start').onclick=function(){startServer(false)};
 function startServer(eula){var b=$('#srv-start');b.disabled=true;api('/api/server/start',{id:S.sid,eula:eula}).then(function(){$('#srv-ready').hidden=true;clearTimeout(sPollT);refreshServer(false);ensureConsole()})
   .catch(function(e){b.disabled=false;if(e.data&&e.data.eula){ask('Agree to the Minecraft rules','To run a server you need to agree to the Minecraft EULA (Mojang\u2019s rules for servers). In short: don\u2019t sell things that change the game.','I agree',false).then(function(ok){if(ok)startServer(true)})}else toast(e.message,true)})}
@@ -6829,12 +8006,12 @@ $('#srv-restart').onclick=function(){api('/api/server/restart',{id:S.sid}).then(
 $('#srv-folder').onclick=function(){if(!srv)return;api('/api/open',{dir:srv.server.dir}).catch(function(e){toast(e.message,true)})};
 $('#srv-fix').onclick=function(){var b=this;b.disabled=true;b.lastChild.textContent='Fixing\u2026';api('/api/server/fix',{id:S.sid}).then(function(r){b.disabled=false;b.lastChild.textContent='Fix it for me';
   if(r.changed){toast('Fixed. Starting your server again\u2026');$('#srv-crash').hidden=true}else{selTab('problems');toast('This one needs you. See Health.',true)}clearTimeout(sPollT);refreshServer(false)}).catch(function(e){b.disabled=false;b.lastChild.textContent='Fix it for me';toast(e.message,true)})};
-$$('[data-copy]').forEach(function(b){b.onclick=function(){var t=$('#'+b.dataset.copy).textContent;if(!/[0-9a-z]/i.test(t)||/Not |Finding/.test(t))return;(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(function(){toast('Copied: '+t)}).catch(function(){toast('Couldn\u2019t copy. Select the address and copy it.',true)})}});
+$$('[data-copy]').forEach(function(b){b.onclick=function(){var x=$('#'+b.dataset.copy),t=x.dataset.real!=null?x.dataset.real:x.textContent;if(!/[0-9a-z]/i.test(t)||/Not |Finding/.test(t))return;(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(function(){toast(maskIP(t)===t?'Copied: '+t:'Address copied (still hidden here)')}).catch(function(){toast('Couldn\u2019t copy. Select the address and copy it.',true)})}});
 $('#help-net').addEventListener('toggle',function(){if(!this.open||!srv||srv.status.state!=='online')return;var r=$('#reach');r.textContent='Checking whether friends far away can reach you\u2026';
-  api('/api/server/reach?id='+S.sid).then(function(d){r.textContent='';var dt=el('i','dot '+(d.reachable===true?'online':d.reachable===false?'crashed':''));r.appendChild(dt);r.appendChild(document.createTextNode(d.detail||''))}).catch(function(){r.textContent=''})});
+  api('/api/server/reach?id='+S.sid).then(function(d){r.textContent='';var dt=el('i','dot '+(d.reachable===true?'online':d.reachable===false?'crashed':''));r.appendChild(dt);r.dataset.real=d.detail||'';r.appendChild(document.createTextNode(maskIP(d.detail||'')))}).catch(function(){r.textContent=''})});
 /* tabs */
-function selTab(t){tab=t;$$('#tabs button').forEach(function(b){b.setAttribute('aria-selected',b.dataset.tab===t)});['console','players','settings','problems'].forEach(function(x){$('#t-'+x).hidden=x!==t});
-  if(t==='settings')loadSrvSettings();if(t==='problems')renderHealth()}
+function selTab(t){if(tab==='settings'&&t!=='settings'&&setDirty){guardLeave(function(){selTab(t)});return}tab=t;$$('#tabs button').forEach(function(b){b.setAttribute('aria-selected',b.dataset.tab===t)});['console','players','mods','settings','problems'].forEach(function(x){$('#t-'+x).hidden=x!==t});
+  if(t==='settings')loadSrvSettings();if(t==='problems'){renderHealth();loadStats()}if(t==='players')loadPlayerLists();if(t==='mods')loadMods()}
 $$('#tabs button').forEach(function(b){b.onclick=function(){selTab(b.dataset.tab)}});
 $('#cmd-form').onsubmit=function(e){e.preventDefault();var c=$('#cmd').value.trim();if(!c)return;sendCmd(c);$('#cmd').value=''};
 function sendCmd(c){if(!srv||srv.status.state!=='online'){toast('Start the server first, then send commands.',true);return}api('/api/server/command',{id:S.sid,command:c}).then(function(){ensureConsole()}).catch(function(e){toast(e.message,true)})}
@@ -6842,23 +8019,62 @@ $$('[data-q]').forEach(function(b){b.onclick=function(){var q=b.dataset.q;
   if(q==='admin')prompt2('Make someone an admin','Admins can use commands in the game, like changing the time or giving items. Type their exact Minecraft name.','Minecraft name','Make admin').then(function(n){if(n)sendCmd('op '+n)});
   else if(q==='say')prompt2('Send a message','Everyone on the server sees this in their chat.','Your message','Send').then(function(m){if(m)sendCmd('say '+m)});
   else sendCmd(q)}});
-function renderPlayers(list,state){var box=$('#players');box.textContent='';if(!list.length){box.appendChild(el('p','muted',state==='online'?'No one is playing yet. Share an address from \u201cHow to join\u201d with your friends.':'Players show up here while the server is online.'));return}
-  list.forEach(function(n){var p=el('div','player'),im=new Image();im.alt='';im.referrerPolicy='no-referrer';im.src='https://mc-heads.net/avatar/'+encodeURIComponent(n)+'/36';im.onerror=function(){im.style.visibility='hidden'};p.appendChild(im);p.appendChild(el('b',null,n));
-    var a=el('button','btn sm quiet','Make admin');a.onclick=function(){sendCmd('op '+n)};p.appendChild(a);box.appendChild(p)})}
+function head(n){var im=new Image();im.alt='';im.referrerPolicy='no-referrer';im.src='https://mc-heads.net/avatar/'+encodeURIComponent(n)+'/36';im.onerror=function(){im.style.visibility='hidden'};return im}
+var plists={ops:[],whitelist:[],whitelist_on:false};
+function isOp(n){return plists.ops.some(function(x){return x.toLowerCase()===String(n).toLowerCase()})}
+function renderPlayers(list,state){var box=$('#players');box.textContent='';S.onlinePlayers=list;if(!list.length){box.appendChild(el('p','muted',state==='online'?'No one is playing yet. Share an address from “How to join” with your friends.':'Players show up here while the server is online.'));return}
+  list.forEach(function(n){var p=el('div','player');p.appendChild(head(n));p.appendChild(el('b',null,n));
+    if(isOp(n))p.appendChild(el('span','tag-op','OP'));else{var a=el('button','btn sm quiet','Make operator');a.onclick=function(){playerAction('op',n)};p.appendChild(a)}box.appendChild(p)})}
+function paintPlists(){function chips(box,names,action,label){box.textContent='';if(!names.length){box.appendChild(el('span','empty-c',label));return}
+    names.forEach(function(n){var c=el('div','pchip');c.appendChild(head(n));c.appendChild(el('span',null,n));var x=el('button');x.type='button';x.title='Remove';x.setAttribute('aria-label','Remove '+n);x.appendChild(icon('x'));
+      x.onclick=function(){playerAction(action,n)};c.appendChild(x);box.appendChild(c)})}
+  chips($('#op-list'),plists.ops,'deop','No operators yet.');
+  var on=plists.whitelist_on;$('#wl-form').hidden=!on;$('#wl-list').hidden=!on;$('#wl-on').hidden=on;
+  $('#wl-text').textContent=on?'Only players on this list can join.':'The whitelist is off, so anyone who has your address can join. Turn it on to choose exactly who can play.';
+  if(on)chips($('#wl-list'),plists.whitelist,'wl_remove','Nobody is on the whitelist yet. Add yourself first!');
+  if(S.onlinePlayers)renderPlayers(S.onlinePlayers,srv&&srv.status&&srv.status.state)}
+function loadPlayerLists(){var id=S.sid;api('/api/server/players?id='+id).then(function(d){if(S.sid!==id)return;plists=d;paintPlists()}).catch(function(){})}
+function playerAction(action,name,done){api('/api/server/players',{id:S.sid,action:action,name:name}).then(function(r){
+    var msg={op:name+' is now an operator.',deop:name+' is no longer an operator.',wl_add:name+' can now join.',wl_remove:name+' was removed from the whitelist.',wl_on:'The whitelist is on.'}[action];
+    if(r.via==='file'||action==='wl_on'){plists={ops:r.ops,whitelist:r.whitelist,whitelist_on:r.whitelist_on};paintPlists()}else setTimeout(loadPlayerLists,1200);
+    toast(msg);if(done)done()}).catch(function(e){toast(e.message,true)})}
+$('#op-form').onsubmit=function(e){e.preventDefault();var n=$('#op-name').value.trim();if(!n)return;playerAction('op',n,function(){$('#op-name').value=''})};
+$('#wl-form').onsubmit=function(e){e.preventDefault();var n=$('#wl-name').value.trim();if(!n)return;playerAction('wl_add',n,function(){$('#wl-name').value=''})};
+$('#wl-on').onclick=function(){ask('Turn on the whitelist?','Only players you add will be able to join. Add yourself and your friends to the list right after.','Turn it on',false).then(function(ok){if(ok)playerAction('wl_on','')})};
 /* settings */
-var setVals={};
-function loadSrvSettings(){api('/api/server/settings?id='+S.sid).then(function(d){var box=$('#setlist');box.textContent='';setVals={};
-  var ram=el('div','set'),rl=el('div');rl.appendChild(el('b',null,'Memory'));rl.appendChild(el('span',null,'How much of your computer\u2019s memory the server can use. More helps big modpacks.'));ram.appendChild(rl);
-  var rc=el('div','ctl'),rs=el('select');var sys=Math.max(4,Math.floor(d.system_mb/1024*.8));for(var g=2;g<=sys;g++){var o=el('option',null,g+' GB');o.value=g*1024;rs.appendChild(o)}var curMb=Math.max(2048,Math.round(d.ram_mb/1024)*1024);if(!rs.querySelector('option[value="'+curMb+'"]')){var oc=el('option',null,Math.round(curMb/1024)+' GB');oc.value=curMb;rs.appendChild(oc)}rs.value=curMb;rs.setAttribute('aria-label','Memory');rc.appendChild(rs);ram.appendChild(rc);box.appendChild(ram);setVals.__ram=rs;
-  var rec=Math.max(2,Math.round((d.rec_mb||4096)/1024)),sysg=Math.round(d.system_mb/1024),warnBox=el('div');box.appendChild(warnBox);
-  var paintMem=function(){warnBox.textContent='';var w=memWarn(+rs.value/1024,rec,sysg,function(){rs.value=rec*1024;paintMem()});if(w)warnBox.appendChild(w)};rs.onchange=paintMem;paintMem();
+var setVals={},setInit={},setDirty=false;
+function valOf(i){return i.type==='checkbox'?i.checked:i.value}
+function markSet(){setDirty=Object.keys(setVals).some(function(k){return String(valOf(setVals[k]))!==String(setInit[k])});
+  var bar=$('#savebar');bar.classList.toggle('dirty',setDirty);$('#savebar-text').textContent=setDirty?'You have unsaved changes':'All changes saved';
+  $('#set-save').disabled=!setDirty;$('#set-discard').hidden=!setDirty;api('/api/uistate',{dirty:setDirty}).catch(function(){})}
+function loadSrvSettings(){api('/api/server/settings?id='+S.sid).then(function(d){var box=$('#setlist');box.textContent='';setVals={};setInit={};
+  var groups={},order=[];function grp(name){if(!groups[name]){var g=el('section','setgroup');g.appendChild(el('h4',null,name));box.appendChild(g);groups[name]=g;order.push(name)}return groups[name]}
+  var ram=el('div','set'),rl=el('div');rl.appendChild(el('b',null,'Memory'));rl.appendChild(el('span',null,'How much of your computer’s memory the server can use. More helps big modpacks.'));ram.appendChild(rl);
+  var rc=el('div','ctl'),rs=el('select');var sys=Math.max(4,Math.floor(d.system_mb/1024*.8));for(var g=2;g<=sys;g++){var o=el('option',null,g+' GB');o.value=g*1024;rs.appendChild(o)}var curMb=Math.max(2048,Math.round(d.ram_mb/1024)*1024);if(!rs.querySelector('option[value="'+curMb+'"]')){var oc=el('option',null,Math.round(curMb/1024)+' GB');oc.value=curMb;rs.appendChild(oc)}rs.value=curMb;rs.setAttribute('aria-label','Memory');rc.appendChild(rs);ram.appendChild(rc);
+  var basics=grp('Basics');basics.appendChild(ram);setVals.__ram=rs;
+  var rec=Math.max(2,Math.round((d.rec_mb||4096)/1024)),sysg=Math.round(d.system_mb/1024),warnBox=el('div');basics.appendChild(warnBox);
+  var paintMem=function(){warnBox.textContent='';var w=memWarn(+rs.value/1024,rec,sysg,function(){rs.value=rec*1024;paintMem();markSet()});if(w)warnBox.appendChild(w)};rs.onchange=function(){paintMem();markSet()};paintMem();
   d.fields.forEach(function(f){var row=el('div','set'),l=el('div');l.appendChild(el('b',null,f.label));if(f.help)l.appendChild(el('span',null,f.help));row.appendChild(l);var c=el('div','ctl'),inp;
     if(f.type==='bool'){var w=el('span','sw');inp=el('input');inp.type='checkbox';inp.checked=String(f.value)==='true'||f.value===true;w.appendChild(inp);w.appendChild(el('span'));c.appendChild(w)}
     else if(f.type==='choice'){inp=el('select');(f.choices||[]).forEach(function(ch){var o=el('option',null,ch[1]);o.value=ch[0];inp.appendChild(o)});inp.value=f.value;c.appendChild(inp)}
-    else{inp=el('input');inp.type='text';inp.value=f.value==null?'':f.value;if(f.type==='int')inp.inputMode='numeric';c.appendChild(inp)}
-    inp.setAttribute('aria-label',f.label);setVals[f.key]=inp;row.appendChild(c);box.appendChild(row)})}).catch(function(e){toast(e.message,true)})}
-$('#set-save').onclick=function(){var vals={},ram=null;Object.keys(setVals).forEach(function(k){var i=setVals[k];if(k==='__ram'){ram=+i.value;return}vals[k]=i.type==='checkbox'?i.checked:i.value});
-  if(!(ram>0))ram=null;api('/api/server/settings',{id:S.sid,values:vals,ram_mb:ram}).then(function(){toast(srv&&srv.status.state==='online'?'Saved. Restart the server to use the new settings.':'Saved.');if(ram)$('#stat-ram').textContent=Math.round(ram/1024)+' GB'}).catch(function(e){toast(e.message,true)})};
+    else{inp=el('input');inp.type='text';inp.value=f.value==null?'':f.value;if(f.type==='int')inp.inputMode='numeric';if(f.key==='server-ip'&&!showPrivate()&&inp.value){inp.type='password';inp.title='Hidden for privacy. Click to show.';inp.addEventListener('focus',function(){this.type='text'})}c.appendChild(inp)}
+    inp.setAttribute('aria-label',f.label);inp.addEventListener('input',markSet);inp.addEventListener('change',markSet);setVals[f.key]=inp;row.appendChild(c);grp(f.group||'Other settings').appendChild(row)});
+  Object.keys(setVals).forEach(function(k){setInit[k]=valOf(setVals[k])});markSet()}).catch(function(e){toast(e.message,true)})}
+function saveSettings(){var vals={},ram=null;Object.keys(setVals).forEach(function(k){var i=setVals[k],v=valOf(i);if(String(v)===String(setInit[k]))return;if(k==='__ram'){ram=+v;return}vals[k]=v});
+  if(!(ram>0))ram=null;var b=$('#set-save');b.disabled=true;
+  return api('/api/server/settings',{id:S.sid,values:vals,ram_mb:ram}).then(function(){Object.keys(setVals).forEach(function(k){setInit[k]=valOf(setVals[k])});markSet();
+    toast(srv&&srv.status.state==='online'?'Saved. Restart the server to use the new settings.':'Saved.');if(ram)$('#stat-ram').textContent=Math.round(ram/1024)+' GB'}).catch(function(e){markSet();toast(e.message,true);throw e})}
+$('#set-save').onclick=function(){saveSettings().catch(function(){})};
+$('#set-discard').onclick=function(){loadSrvSettings()};
+/* leaving with unsaved changes */
+function guardLeave(proceed){if(!setDirty){proceed();return}
+  modal('Save your changes?','You changed some server settings but haven’t saved them yet.',[{t:'Keep editing'},{t:'Don’t save',danger:true,fn:function(){setDirty=false;api('/api/uistate',{dirty:false}).catch(function(){});setTimeout(proceed,0)}},
+    {t:'Save',primary:true,fn:function(){saveSettings().then(function(){setTimeout(proceed,0)}).catch(function(){})}}])}
+$('#props-open').onclick=function(){api('/api/server/editprops',{id:S.sid}).then(function(r){var b=el('div','notes');
+  b.appendChild(el('p',null,'server.properties is now open'+(r.editor?' in '+r.editor:'')+'. Edit it there, then:'));var ol=el('ol','steps');
+  ['Save the file: press Ctrl+S (or File → Save) before you close it. Unsaved edits are lost.','Close it and come back here. This page shows your changes straight away.','Restart the server if it’s running, so it uses the new settings.'].forEach(function(t){ol.appendChild(el('li',null,t))});b.appendChild(ol);
+  modal('Editing server.properties',b,[{t:'Got it',primary:true}])}).catch(function(e){toast(e.message,true)})};
+window.addEventListener('focus',function(){if(S.view==='server'&&tab==='settings'&&!setDirty&&$('#veil').hidden)loadSrvSettings()});
 function squarePng(img,size){var c=document.createElement('canvas');c.width=c.height=size;var g=c.getContext('2d'),w=img.naturalWidth,h=img.naturalHeight,k=Math.max(size/w,size/h);
   g.imageSmoothingEnabled=!(Math.max(w,h)<=64&&size>=Math.max(w,h));g.imageSmoothingQuality='high';g.drawImage(img,(size-w*k)/2,(size-h*k)/2,w*k,h*k);return c.toDataURL('image/png')}
 function openIconPicker(){if(!srv)return;var s=srv.server,picked=null;
@@ -6881,6 +8097,7 @@ function openIconPicker(){if(!srv)return;var s=srv.server,picked=null;
     api('/api/server/icon',{id:s.id,png:picked.big,game_png:picked.small,to_game:cb.checked}).then(function(r){srv.server.icon=r.icon;packIcon($('#srv-icon'),iconUrl(srv.server));loadHome();
       toast(cb.checked?(srv.status&&srv.status.state==='online'?'Icon saved. Players see it after the server restarts.':'Icon saved. Players will see it in their server list too.'):'Icon saved.')}).catch(function(e){toast(e.message,true)})}}]);
   var sv=$('#m-foot .primary');if(sv)sv.disabled=true}
+$('#srv-delete').onclick=function(){if(!srv)return;var st=srv.status&&srv.status.state;if(st==='online'||st==='starting'||st==='stopping'){toast('Stop the server before deleting it.',true);return}deleteServer(srv.server)};
 $('#srv-icon').onclick=openIconPicker;$('#srv-icon-btn').onclick=openIconPicker;
 $('#srv-rename').onclick=function(){prompt2('Rename server','Give it a name you\u2019ll recognise.',srv.server.name,'Rename').then(function(n){if(!n)return;api('/api/servers/rename',{id:S.sid,name:n}).then(function(s){srv.server.name=s.name;$('#srv-name').textContent=s.name;var c=$('#crumb span');if(c)c.textContent=s.name;toast('Renamed')}).catch(function(e){toast(e.message,true)})})};
 $('#srv-remove').onclick=function(){ask('Remove from your list?','The server disappears from the app, but its folder and world stay on your computer. You can add it back any time.','Remove',true).then(function(ok){if(ok)api('/api/servers/remove',{id:S.sid}).then(function(){toast('Removed from your list');S.sid=null;go('home')}).catch(function(e){toast(e.message,true)})})};
@@ -6895,11 +8112,130 @@ function renderHealth(){var h=$('#health');h.textContent='';var st=srv&&srv.stat
 $('#srv-checklog').onclick=function(){pick({kind:'file',exts:['log','txt'],title:'Choose the log file',start:srv?joinPath(srv.server.dir,'logs'):S.home}).then(function(p){if(!p)return;
   api('/api/server/fixlog',{id:S.sid,log:p,aggressive:!!(S.info.settings&&S.info.settings.aggressive)}).then(function(){startProgress('fix')}).catch(function(e){toast(e.message,true)})})};
 
+/* ---------- right-click menu on server cards ---------- */
+function closeMenu(){var m=$('#ctxmenu');if(m)m.remove();document.removeEventListener('mousedown',menuOutside,true)}
+function menuOutside(e){var m=$('#ctxmenu');if(m&&!m.contains(e.target))closeMenu()}
+window.addEventListener('blur',closeMenu);window.addEventListener('resize',closeMenu);document.addEventListener('scroll',closeMenu,true);
+document.addEventListener('keydown',function(e){if(e.key==='Escape'&&$('#ctxmenu')){closeMenu();e.stopPropagation()}},true);
+function openWith(id,fn){S.afterOpen=fn||null;go('server',id)}
+function serverMenu(s,x,y){closeMenu();var m=el('div','ctxmenu');m.id='ctxmenu';m.setAttribute('role','menu');
+  var running=s.state==='online'||s.state==='starting',busy=s.state==='stopping'||s.state==='setting_up';
+  function item(ic,label,fn,cls,dis){var b=el('button',cls||null);b.setAttribute('role','menuitem');b.appendChild(icon(ic));b.appendChild(document.createTextNode(label));b.disabled=!!dis;b.onclick=function(){closeMenu();fn()};m.appendChild(b);return b}
+  if(s.missing){item('x','Remove from list',function(){api('/api/servers/remove',{id:s.id}).then(function(){toast('Removed from your list');loadHome()}).catch(function(e){toast(e.message,true)})},'danger')}
+  else if(s.state==='setting_up'){item('chev','Show setup progress',function(){go('build')})}
+  else{
+    item('chev','Open',function(){go('server',s.id)});
+    if(running)item('stop','Stop server',function(){api('/api/server/stop',{id:s.id}).then(function(){toast('Stopping '+s.name+'…');setTimeout(loadHome,800)}).catch(function(e){toast(e.message,true)})},null,s.state==='stopping');
+    else item('play','Start server',function(){openWith(s.id,function(){startServer(false)})},null,busy);
+    m.appendChild(el('hr'));
+    item('sliders','Edit server settings',function(){openWith(s.id,function(){selTab('settings')})});
+    if(s.loader!=='vanilla')item('block','Mods',function(){openWith(s.id,function(){selTab('mods')})});
+    item('users','Players',function(){openWith(s.id,function(){selTab('players')})});
+    item('folder','Open folder',function(){api('/api/open',{dir:s.dir}).catch(function(e){toast(e.message,true)})});
+    m.appendChild(el('hr'));
+    item('sparkle','Change icon',function(){openWith(s.id,function(){openIconPicker()})});
+    item('file','Rename',function(){prompt2('Rename server','Give it a name you’ll recognise.',s.name,'Rename').then(function(n){if(!n)return;api('/api/servers/rename',{id:s.id,name:n}).then(function(){toast('Renamed');loadHome()}).catch(function(e){toast(e.message,true)})})});
+    item('undo','Remove from list',function(){ask('Remove from your list?','“'+s.name+'” disappears from the app, but its folder and world stay on your computer. You can add it back any time.','Remove',true).then(function(ok){if(ok)api('/api/servers/remove',{id:s.id}).then(function(){toast('Removed from your list');loadHome()}).catch(function(e){toast(e.message,true)})})},null,running||busy);
+    item('x','Delete server…',function(){deleteServer(s)},'danger',running||busy)}
+  document.body.appendChild(m);var r=m.getBoundingClientRect();m.style.left=Math.max(8,Math.min(x,innerWidth-r.width-8))+'px';m.style.top=Math.max(8,Math.min(y,innerHeight-r.height-8))+'px';
+  setTimeout(function(){document.addEventListener('mousedown',menuOutside,true)},0);var f=m.querySelector('button:not(:disabled)');if(f)f.focus();
+  m.addEventListener('keydown',function(e){var bs=[].slice.call(m.querySelectorAll('button:not(:disabled)')),i=bs.indexOf(document.activeElement);
+    if(e.key==='ArrowDown'||e.key==='ArrowUp'){e.preventDefault();bs[(i+(e.key==='ArrowDown'?1:-1)+bs.length)%bs.length].focus()}})}
+function deleteServer(s){ask('Delete “'+s.name+'”?','This deletes the server and its world'+(IS_WINDOWS()?'. The folder goes to the Recycle Bin, so you can still get it back from there if you change your mind.':' from your computer.'),'Delete server',true).then(function(ok){if(!ok)return;
+  api('/api/servers/delete',{id:s.id}).then(function(){toast('Deleted “'+s.name+'”');if(S.view==='server'&&S.sid===s.id){S.sid=null;go('home')}else loadHome()}).catch(function(e){toast(e.message,true)})})}
+function IS_WINDOWS(){return /Windows/i.test(navigator.userAgent)}
+
+/* ---------- privacy: addresses are hidden unless the user shows them ---------- */
+var RX_IP=/\b(?:\d{1,3}\.){3}\d{1,3}\b|\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\b|\b(?:[0-9a-f]{1,4}:){1,6}:(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?(?![\w:])/gi;
+function showPrivate(){return !!(S.info&&S.info.settings&&S.info.settings.showprivate)}
+function maskIP(t){if(t==null||showPrivate())return t;return String(t).replace(RX_IP,function(ip){return ip==='127.0.0.1'||ip==='0.0.0.0'?ip:ip.indexOf(':')>=0?'••••:••••:••••':'•••.•••.•••.•••'})}
+function setAddr(id,real){var x=$('#'+id);if(!x)return;x.dataset.real=real;x.textContent=maskIP(real)}
+function paintPrivacy(){var on=showPrivate(),b=$('#priv-btn');b.querySelector('use').setAttribute('href',on?'#i-eyeoff':'#i-eye');b.lastElementChild.textContent=on?'Hide':'Show';
+  b.setAttribute('aria-pressed',on);b.title=on?'Hide your addresses (useful before sharing your screen or streaming).':'Your addresses are hidden so they don’t show up in screenshots or streams. Copy still copies the real address.';
+  ['a-local','a-lan','a-pub','h-lan'].forEach(function(id){var x=$('#'+id);if(x&&x.dataset.real!=null)x.textContent=maskIP(x.dataset.real)});
+  $$('#console .c').forEach(function(d){if(d._t!=null)d.textContent=maskIP(d._t)});var r=$('#reach');if(r&&r.dataset.real!=null)r.lastChild.textContent=maskIP(r.dataset.real)}
+$('#priv-btn').onclick=function(){S.info.settings=S.info.settings||{};S.info.settings.showprivate=!showPrivate();paintPrivacy();api('/api/settings',{showprivate:S.info.settings.showprivate}).catch(function(){})};
+
+/* ---------- Mods tab ---------- */
+var modsData=null,modsSeq=0;
+function warnIcon(lv){return icon(lv==='ok'?'check':'alert')}
+function warnLines(ws){var box=el('div','mw');ws.forEach(function(w){var d=el('div',w.level);d.appendChild(warnIcon(w.level));d.appendChild(el('span',null,w.text));box.appendChild(d)});return box}
+function loadMods(){if(!S.sid)return;var id=S.sid,seq=++modsSeq;if(!modsData)$('#mods-list').setAttribute('aria-busy','true');
+  api('/api/server/mods?id='+id).then(function(d){if(seq!==modsSeq||id!==S.sid)return;$('#mods-list').removeAttribute('aria-busy');modsData=d;paintMods()}).catch(function(e){$('#mods-list').removeAttribute('aria-busy');toast(e.message,true)})}
+function paintMods(){var d=modsData;if(!d)return;var on=d.mods.filter(function(m){return m.enabled}).length,off=d.mods.length-on;
+  var flagged=d.mods.filter(function(m){return m.warnings.length});
+  $('#mods-sub').textContent=d.mods.length?on+' mod'+(on===1?'':'s')+' turned on'+(off?', '+off+' turned off':'')+(d.loader?' · '+loaderName(d.loader)+(d.mc?' '+d.mc:''):''):'No mods yet. Add some with the button, or drop .jar files below.';
+  $('#mods-running').hidden=!d.running;
+  $('#mods-onlywarn-l').hidden=!flagged.length;$('#mods-onlywarn-t').textContent='Only mods that need a look ('+flagged.length+')';if(!flagged.length)$('#mods-onlywarn').checked=false;
+  var q=$('#mods-q').value.trim().toLowerCase(),only=$('#mods-onlywarn').checked,box=$('#mods-list');box.textContent='';
+  var list=d.mods.filter(function(m){return(!only||m.warnings.length)&&(!q||(m.name+' '+m.file).toLowerCase().indexOf(q)>=0)});
+  list.sort(function(a,b){var wa=a.warnings.some(function(w){return w.level==='bad'})?0:a.warnings.length?1:2,wb=b.warnings.some(function(w){return w.level==='bad'})?0:b.warnings.length?1:2;return wa-wb||a.name.localeCompare(b.name,undefined,{sensitivity:'base'})});
+  list.forEach(function(m){var r=el('div','mod'+(m.enabled?'':' off')),t=el('div','t'),nm=el('b',null,m.name);t.appendChild(nm);
+    var worst=m.warnings.some(function(w){return w.level==='bad'})?'bad':m.warnings.length?'warn':'';if(worst)nm.appendChild(el('span','tag '+worst,worst==='bad'?'Problem':'Check'));if(!m.enabled)nm.appendChild(el('span','tag',' Off'));
+    t.appendChild(el('small',null,m.file+(m.version?' · version '+m.version:'')));if(m.warnings.length&&m.enabled)t.appendChild(warnLines(m.warnings));r.appendChild(t);
+    var a=el('div','acts'),sw=el('label','sw'),cb=el('input');cb.type='checkbox';cb.checked=m.enabled;cb.disabled=d.running;cb.setAttribute('aria-label',(m.enabled?'Turn off ':'Turn on ')+m.name);sw.title=d.running?'Stop the server first':m.enabled?'Turned on. Click to turn it off without removing it.':'Turned off. Click to turn it back on.';sw.appendChild(cb);sw.appendChild(el('span'));
+    cb.onchange=function(){cb.disabled=true;api('/api/server/mods/toggle',{id:S.sid,file:m.file,enabled:cb.checked}).then(function(){toast((cb.checked?'Turned on ':'Turned off ')+m.name);loadMods()}).catch(function(e){cb.checked=!cb.checked;cb.disabled=false;toast(e.message,true)})};
+    a.appendChild(sw);var rm=el('button','btn sm quiet');rm.appendChild(icon('x'));rm.setAttribute('aria-label','Remove '+m.name);rm.title=d.running?'Stop the server first':'Remove this mod (you can put it back later)';rm.disabled=d.running;
+    rm.onclick=function(){removeMod(m)};a.appendChild(rm);r.appendChild(a);box.appendChild(r)});
+  if(!list.length&&d.mods.length)box.appendChild(el('p','muted',only?'Nothing needs a look.':'No mods match “'+q+'”.'));
+  var rb=$('#mods-removed');rb.textContent='';$('#mods-removed-box').hidden=!d.removed.length;
+  d.removed.forEach(function(x){var it=el('div','mod'),t=el('div','t');t.appendChild(el('b',null,x.jar.replace(/\.jar(\.disabled)?$/i,'')));t.appendChild(el('small',null,x.jar));it.appendChild(t);
+    var b=el('button','btn sm quiet');b.appendChild(icon('undo'));b.appendChild(document.createTextNode('Put back'));b.disabled=d.running;
+    b.onclick=function(){b.disabled=true;api('/api/restore',{dir:srv.server.dir,bucket:x.bucket,jar:x.jar}).then(function(){toast('Put back '+x.jar);loadMods()}).catch(function(e){b.disabled=false;toast(e.message,true)})};it.appendChild(b);rb.appendChild(it)})}
+function removeMod(m,after){return api('/api/server/mods/remove',{id:S.sid,file:m.file}).then(function(){toast('Removed '+m.name+'. You can put it back below.');loadMods();if(after)after()}).catch(function(e){toast(e.message,true)})}
+$('#mods-q').oninput=paintMods;$('#mods-onlywarn').onchange=paintMods;
+$('#mods-folder').onclick=function(){api('/api/server/mods/folder',{id:S.sid}).catch(function(e){toast(e.message,true)})};
+$('#mods-add').onclick=function(){pick({kind:'files',exts:['jar'],title:'Choose mods to add',start:S.home}).then(function(ps){if(ps&&ps.length)addMods(ps)})};
+function addMods(paths){var b=$('#mods-add');b.disabled=true;toast('Checking '+paths.length+' mod'+(paths.length===1?'':'s')+'…');
+  api('/api/server/mods/add',{id:S.sid,paths:paths}).then(function(r){b.disabled=false;showAddResults(r);loadMods()}).catch(function(e){b.disabled=false;toast(e.message,true)})}
+function showAddResults(r){var box=el('div','addres');
+  var bad=r.added.filter(function(m){return m.warnings.some(function(w){return w.level==='bad'})}),warn=r.added.filter(function(m){return m.warnings.length&&bad.indexOf(m)<0}),good=r.added.filter(function(m){return !m.warnings.length});
+  if(good.length){var g=el('div','ar');g.appendChild(el('b',null,good.length===1?good[0].name+' was added and looks good.':good.length+' mods were added and look good.'));if(good.length>1&&good.length<=8)g.appendChild(el('small','muted',good.map(function(m){return m.name}).join(', ')));box.appendChild(g)}
+  bad.concat(warn).forEach(function(m){var a=el('div','ar');a.appendChild(el('b',null,m.name));a.appendChild(warnLines(m.warnings));
+    if(m.warnings.some(function(w){return w.level==='bad'})){var x=el('button','btn sm');x.appendChild(icon('x'));x.appendChild(document.createTextNode('Remove it'));x.onclick=function(){x.disabled=true;api('/api/server/mods/remove',{id:S.sid,file:m.file}).then(function(){x.replaceWith(el('small','muted','Removed.'));loadMods()}).catch(function(e){x.disabled=false;toast(e.message,true)})};a.appendChild(x)}
+    box.appendChild(a)});
+  r.skipped.forEach(function(s){var a=el('div','ar');a.appendChild(el('b',null,s.file+' wasn’t added'));a.appendChild(warnLines([{level:'warn',text:s.why}]));box.appendChild(a)});
+  if(r.running&&r.added.length){box.appendChild(el('p','muted','Restart the server to load the new mods.'))}
+  var title=bad.length?'Some mods may cause problems':warn.length?'Mods added. A few need a look':r.added.length?'Mods added':'No mods were added';
+  modal(title,box,[{t:'Done',primary:true}])}
+(function(){var dz=$('#mods-drop'),tp=$('#t-mods');
+  ['dragenter','dragover'].forEach(function(t){tp.addEventListener(t,function(e){e.preventDefault();dz.classList.add('over')})});
+  ['dragleave','drop'].forEach(function(t){tp.addEventListener(t,function(e){e.preventDefault();if(t==='dragleave'&&tp.contains(e.relatedTarget))return;dz.classList.remove('over')})});
+  tp.addEventListener('drop',function(e){var fs=[].slice.call((e.dataTransfer&&e.dataTransfer.files)||[]);if(!fs.length)return;
+    var jars=fs.filter(function(f){return /\.jar$/i.test(f.name)});if(!jars.length){toast('Mods are .jar files. Drop .jar files here.',true);return}
+    if(fs.length>jars.length)toast('Only .jar files were added. Other files were left out.');
+    Promise.all(jars.map(function(f,i){return upload(f,'mod'+i)})).then(function(rs){addMods(rs.map(function(x){return x.path}))}).catch(function(e){toast(e.message,true)})})})();
+
+/* ---------- live stats (Health tab) ---------- */
+var statsT=null;
+function fmtMB(mb){return mb>=1024?(mb/1024).toFixed(mb>=10240?0:1)+' GB':Math.round(mb)+' MB'}
+function spark(c,vals,max,col){var x=c.getContext('2d'),w=c.width,h=c.height;x.clearRect(0,0,w,h);if(!vals||vals.length<2)return;
+  var m=max||Math.max.apply(null,vals)||1,n=vals.length;x.beginPath();vals.forEach(function(v,i){var px=i/(n-1)*w,py=h-2-Math.min(1,v/m)*(h-4);i?x.lineTo(px,py):x.moveTo(px,py)});
+  x.strokeStyle=col;x.lineWidth=2;x.lineJoin='round';x.stroke();x.lineTo(w,h);x.lineTo(0,h);x.closePath();x.globalAlpha=.15;x.fillStyle=col;x.fill();x.globalAlpha=1}
+function cssv(n,f){var v=getComputedStyle(document.documentElement).getPropertyValue(n).trim();return v||f}
+function paintStats(d){var on=d&&d.state==='online',run=d&&(on||d.state==='starting');
+  var mem=$('#hs-mem'),tk=$('#hs-tick'),note=$('#hs-note');
+  if(!run){mem.textContent='–';tk.textContent='–';tk.className='hval';$('#hs-mem-sub').textContent='';$('#hs-tick-sub').textContent='';
+    note.hidden=false;note.textContent='Start the server to see how much memory it uses and how fast it runs.';spark($('#hs-mem-c'),[]);spark($('#hs-tick-c'),[]);return}
+  note.hidden=true;
+  if(d.mem_mb!=null){mem.textContent=fmtMB(d.mem_mb);$('#hs-mem-sub').textContent=d.limit_mb?'of '+fmtMB(d.limit_mb)+' you gave it':''}else{mem.textContent='…';$('#hs-mem-sub').textContent='Measuring…'}
+  spark($('#hs-mem-c'),d.mem_hist,d.limit_mb?d.limit_mb*1.1:0,cssv('--lapis','#5b80ff'));
+  if(!d.tick_supported){tk.textContent='–';tk.className='hval';$('#hs-tick-sub').textContent='This Minecraft version can’t report its tick speed.';spark($('#hs-tick-c'),[]);return}
+  if(d.tick_ms==null){tk.textContent='…';tk.className='hval';$('#hs-tick-sub').textContent=on?'Measuring…':'Waiting for the server to finish starting…';spark($('#hs-tick-c'),[]);return}
+  var cls=d.tick_ms<40?'good':d.tick_ms<50?'warn':'bad';tk.className='hval '+cls;tk.textContent=d.tick_ms.toFixed(1)+' ms';
+  $('#hs-tick-sub').textContent=(d.tps!=null?d.tps.toFixed(1)+' TPS · ':'')+(cls==='good'?'Running smoothly':cls==='warn'?'A little busy':'Lagging (it should stay under 50 ms)');
+  spark($('#hs-tick-c'),d.tick_hist,Math.max(60,Math.max.apply(null,d.tick_hist||[0])),cssv(cls==='good'?'--emerald':cls==='warn'?'--gold':'--redstone','#35d48d'))}
+function loadStats(){clearTimeout(statsT);if(S.view!=='server'||tab!=='problems'||!S.sid)return;var id=S.sid;
+  api('/api/server/stats?id='+id).then(function(d){if(id===S.sid&&tab==='problems')paintStats(d)}).catch(function(){}).then(function(){statsT=setTimeout(loadStats,2000)})}
+
 /* ---------- app settings ---------- */
-function loadSettings(){applyTheme(themeMode(),false);$('#motion-sw').checked=motionOn();var st=S.info.settings||{};$$('#tb-seg button').forEach(function(b){b.setAttribute('aria-pressed',b.dataset.v===(st.titlebar||'custom'))});$('#tb-row').hidden=!S.info.native_capable;
+function loadSettings(){applyTheme(themeMode(),false);$('#motion-sw').checked=motionOn();var st=S.info.settings||{};$$('#tb-seg button').forEach(function(b){b.setAttribute('aria-pressed',b.dataset.v===(st.titlebar||'custom'))});$('#tb-row').hidden=!S.info.native_capable;$('#pk-row').hidden=!S.info.native_capable;
+  $$('#pk-seg button').forEach(function(b){b.setAttribute('aria-pressed',b.dataset.v===(st.picker||'windows'))});$('#priv-sw').checked=!!st.showprivate;
   $('#aggr').checked=!!st.aggressive;$('#cfkey').value=st.cfkey||'';$('#about-text').textContent='Version '+S.info.version+'. Made to turn modpacks into servers without the headaches.';paintUpdate()}
 $$('#theme-seg button').forEach(function(b){b.onclick=function(){applyTheme(b.dataset.v,true)}});
 $$('#tb-seg button').forEach(function(b){b.onclick=function(){$$('#tb-seg button').forEach(function(x){x.setAttribute('aria-pressed',x===b)});S.info.settings.titlebar=b.dataset.v;api('/api/settings',{titlebar:b.dataset.v}).then(function(){toast('Saved. It changes the next time you open the app.')}).catch(function(){})}});
+$$('#pk-seg button').forEach(function(b){b.onclick=function(){$$('#pk-seg button').forEach(function(x){x.setAttribute('aria-pressed',x===b)});S.info.settings.picker=b.dataset.v;S.noNativePick=false;api('/api/settings',{picker:b.dataset.v}).catch(function(){})}});
+$('#priv-sw').onchange=function(){S.info.settings.showprivate=this.checked;api('/api/settings',{showprivate:this.checked}).catch(function(){})};
 $('#aggr').onchange=function(){S.info.settings.aggressive=this.checked;api('/api/settings',{aggressive:this.checked}).catch(function(){})};
 $('#motion-sw').onchange=function(){setMotion(this.checked)};
 $('#cfkey').onchange=function(){S.info.settings.cfkey=this.value.trim();api('/api/settings',{cfkey:this.value.trim()}).catch(function(){})};
@@ -6940,7 +8276,7 @@ $('#go-install').onclick=function(){var b=this;if(installed){b.disabled=true;api
     $('#inst-sub').textContent='You\u2019ll find it in your Start menu'+($('#i-desktop').checked?' and on your desktop.':'.')}).catch(function(e){b.disabled=false;b.textContent='Install';toast(e.message,true)})};
 
 /* ---------- close protection (browser/Edge window only; the native window asks itself) ---------- */
-window.addEventListener('beforeunload',function(e){if(S.info.native)return;var running=S.servers.some(function(s){return s.state==='online'||s.state==='starting'});if(polling||running){e.preventDefault();e.returnValue=''}});
+window.addEventListener('beforeunload',function(e){if(S.info.native)return;var running=S.servers.some(function(s){return s.state==='online'||s.state==='starting'});if(polling||running||setDirty){e.preventDefault();e.returnValue=''}});
 
 /* ---------- boot ---------- */
 api('/api/info').then(function(d){S.info=d;S.home=d.home;S.sep=d.win?'\\':'/';var st=d.settings||{};
