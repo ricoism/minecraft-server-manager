@@ -2510,7 +2510,7 @@ class ServerRunner:
                 want = self._state == "online" and self._probe_cmd and now < self._stats_wanted and now >= next_probe
                 if want:
                     self._probe_until = now + 4
-                    next_probe = now + 5
+                    next_probe = now + 8     # each probe adds a few lines to the server's log, so not too often
                     try:
                         proc.stdin.write(self._probe_cmd + "\n")
                         proc.stdin.flush()
@@ -4638,8 +4638,8 @@ def _server_state(app, s):
         if job is not None and job.state == "running" and getattr(job, "server_id", None) == s["id"]:
             return {"state": "setting_up", "players": [], "error": None}
         s["setup"] = ""                      # the app was closed mid-setup; treat it like any other server
-    r = app.runner
-    if r is not None and r.status().get("dir") and Path(r.status()["dir"]) == Path(s["dir"]):
+    r = app.runner_for(s)
+    if r is not None and r.status().get("dir"):
         st = r.status()
         return {"state": st.get("state", "offline"), "players": st.get("players", []), "error": st.get("error")}
     return {"state": "offline", "players": [], "error": None}
@@ -4665,8 +4665,40 @@ def _whats_new(app, force=False):
 
 
 def _server_running(app, s) -> bool:
-    st = app.runner.status() if app.runner else {}
-    return bool(st.get("dir") and _same_folder(st["dir"], s["dir"]) and app.runner.state in ("starting", "online", "stopping"))
+    r = app.runner_for(s)
+    return bool(r and r.state in ("starting", "online", "stopping"))
+
+
+def multi_server_load(app, s, others):
+    """Is this PC strong enough to run this server next to the ones already running?
+    -> {"level": "ok"|"warn"|"bad", "reasons": [...], "running": [names], ...}"""
+    sys_mb = system_ram_mb() or 8192
+    cores = os.cpu_count() or 4
+    names, planned = [], read_ram_mb(Path(s["dir"])) or 4096
+    recs = {os.path.normcase(str(Path(x["dir"]).resolve())): x for x in list_servers() if not x.get("missing")}
+    for r in others:
+        d = r.status().get("dir") or ""
+        rec = recs.get(os.path.normcase(str(Path(d).resolve()))) if d else None
+        names.append(rec["name"] if rec else Path(d).name)
+        planned += (r._ram_limit or (read_ram_mb(Path(d)) if d else 0) or 4096)
+    n = len(others) + 1
+    need = int(planned * 1.15) + 3072          # Java uses a bit more than its limit; Windows and other apps need room too
+    reasons, level = [], "ok"
+    if need > sys_mb:
+        level = "bad"
+        reasons.append(f"Together the servers would use about {need / 1024:.0f} GB of memory, but this computer has "
+                       f"{sys_mb / 1024:.0f} GB. Windows will start swapping to disk, which makes every server lag badly "
+                       f"and can make them crash.")
+    elif need > sys_mb * 0.85:
+        level = "warn"
+        reasons.append(f"Together the servers would use about {need / 1024:.0f} GB of this computer's "
+                       f"{sys_mb / 1024:.0f} GB of memory. That leaves little room for Windows and other programs "
+                       f"(like Minecraft itself), so things may slow down.")
+    if cores < 2 * n + 2:
+        level = "bad" if cores < 2 * n else ("warn" if level == "ok" else level)
+        reasons.append(f"This computer's processor has {cores} threads. Each Minecraft server wants at least two, "
+                       f"so {n} servers at once may lag (blocks and mobs freezing, players rubber-banding).")
+    return {"level": level, "reasons": reasons, "running": names, "need_mb": need, "system_mb": sys_mb, "cores": cores}
 
 
 def api_get_extra(h, app, path, q):
@@ -4687,12 +4719,10 @@ def api_get_extra(h, app, path, q):
                         "ram_mb": recommended_ram_mb(int(arg("mods", "0") or 0), sysmb)})
     if path == "/api/server/status":
         s = get_server(arg("id"))
-        st = app.runner.status() if app.runner and Path(app.runner.status().get("dir") or "/nonexistent") == Path(s["dir"]) \
-            else {"state": "offline", "players": []}
+        r = app.runner_for(s)
+        st = r.status() if r and r.status().get("dir") else {"state": "offline", "players": []}
         return h._json({"server": _with_icon_info(s), "status": st, "join": join_info(Path(s["dir"]), fetch_public=False),
-                        "other_running": bool(app.runner and app.runner.status().get("dir") and
-                                              Path(app.runner.status()["dir"]) != Path(s["dir"]) and
-                                              app.runner.state in ("starting", "online", "stopping"))})
+                        "others_running": len([x for x in app.active_runners() if x is not r])})
     if path == "/api/server/public":
         s = get_server(arg("id"))
         ip = public_ip()
@@ -4709,9 +4739,8 @@ def api_get_extra(h, app, path, q):
         return h._send(200, raw, "image/png", {"Cache-Control": "max-age=31536000, immutable"})
     if path == "/api/server/stats":
         s = get_server(arg("id"))
-        r = app.runner
-        st = r.status() if r else {}
-        if r and st.get("dir") and _same_folder(st["dir"], s["dir"]):
+        r = app.runner_for(s)
+        if r and r.status().get("dir"):
             return h._json(r.stats())
         return h._json({"state": "offline"})
     if path == "/api/server/players":
@@ -4726,8 +4755,9 @@ def api_get_extra(h, app, path, q):
         return h._json(out)
     if path == "/api/server/console":
         s = get_server(arg("id"))
-        if app.runner and app.runner.status().get("dir") and Path(app.runner.status()["dir"]) == Path(s["dir"]):
-            lines, nxt = app.runner.lines(int(arg("since", "0") or 0))
+        r = app.runner_for(s)
+        if r and r.status().get("dir"):
+            lines, nxt = r.lines(int(arg("since", "0") or 0))
             return h._json({"lines": lines, "next": nxt})
         return h._json({"lines": [], "next": int(arg("since", "0") or 0)})
     if path == "/api/server/settings":
@@ -4736,9 +4766,10 @@ def api_get_extra(h, app, path, q):
                         "rec_mb": recommended_ram_mb(Path(s["dir"]), system_ram_mb() or 8192),
                         "system_mb": system_ram_mb() or 8192})
     if path == "/api/server/diagnose":
-        if not app.runner:
+        r = app.runner_for(get_server(arg("id"))) if arg("id") else None
+        if not r:
             return h._json({"summary": "", "findings": [], "fixable": False})
-        return h._json(app.runner.diagnose())
+        return h._json(r.diagnose())
     if path == "/api/server/removed":
         return h._json(summarize_server(Path(get_server(arg("id"))["dir"])))
     if path == "/api/update":
@@ -4761,8 +4792,7 @@ def api_post_extra(h, app, path, body):
     if path == "/api/servers/remove":
         sid = str(body.get("id") or "")
         s = next((x for x in list_servers() if x["id"] == sid), None)
-        if s and app.runner and app.runner.status().get("dir") and Path(app.runner.status()["dir"]) == Path(s["dir"]) \
-                and app.runner.state in ("starting", "online", "stopping"):
+        if s and not s.get("missing") and _server_running(app, s):
             raise ValueError("Stop the server before removing it from the list.")
         remove_server(sid)
         return h._json({"ok": True})
@@ -4803,8 +4833,7 @@ def api_post_extra(h, app, path, body):
     if path == "/api/servers/delete":
         sid = str(body.get("id") or "")
         s = get_server(sid)
-        st = app.runner.status() if app.runner else {}
-        if st.get("dir") and _same_folder(st["dir"], s["dir"]) and app.runner.state in ("starting", "online", "stopping"):
+        if _server_running(app, s):
             raise ValueError("Stop the server before deleting it.")
         if s.get("setup") and app.busy():
             raise ValueError("This server is still being set up. Stop the setup first.")
@@ -4824,7 +4853,9 @@ def api_post_extra(h, app, path, body):
         s = get_server(str(body.get("id") or ""))
         if app.busy():
             raise ValueError("Wait for the current task to finish first.")
-        r = app.runner
+        r = app.runner_for(s, create=True)
+        if r is None:
+            raise ValueError("Servers can only be started from the app.")
         if path.endswith("restart") and r.state in ("starting", "online"):
             r.stop()
             for _ in range(240):
@@ -4832,9 +4863,21 @@ def api_post_extra(h, app, path, body):
                     break
                 time.sleep(0.25)
         elif r.state in ("starting", "online", "stopping"):
-            if r.status().get("dir") and Path(r.status()["dir"]) != Path(s["dir"]):
-                raise ValueError("Another server is running. Stop it first, then start this one.")
             return h._json({"ok": True})
+        else:
+            others = [x for x in app.active_runners() if x is not r]
+            port = server_port(Path(s["dir"]))
+            for o in others:
+                od = o.status().get("dir")
+                if od and server_port(Path(od)) == port:
+                    other = next((x["name"] for x in list_servers() if _same_folder(x["dir"], od)), Path(od).name)
+                    raise ValueError(f"\u201c{other}\u201d is already using port {port}, and two servers can't share a port. "
+                                     f"Open this server's Settings, change \u201cServer port\u201d to another number "
+                                     f"(for example {port + 1}), save, then press Start again.")
+            if others and not body.get("multi_ok"):
+                load = multi_server_load(app, s, others)
+                if load["level"] != "ok":
+                    return h._json({"error": "This computer may struggle to run another server.", "multi": load}, 409)
         try:
             r.start(Path(s["dir"]), accept_eula=bool(body.get("eula") or load_settings().get("eula")))
         except EulaRequired as e:
@@ -4843,12 +4886,15 @@ def api_post_extra(h, app, path, body):
             save_settings({"eula": True})
         return h._json({"ok": True})
     if path == "/api/server/stop":
-        get_server(str(body.get("id") or ""))
-        app.runner.stop()
+        r = app.runner_for(get_server(str(body.get("id") or "")))
+        if r:
+            r.stop()
         return h._json({"ok": True})
     if path == "/api/server/command":
-        get_server(str(body.get("id") or ""))
-        app.runner.send(str(body.get("command") or ""))
+        r = app.runner_for(get_server(str(body.get("id") or "")))
+        if not r or r.state != "online":
+            raise ValueError("Start the server first, then send commands.")
+        r.send(str(body.get("command") or ""))
         return h._json({"ok": True})
     if path == "/api/server/settings":
         s = get_server(str(body.get("id") or ""))
@@ -4859,14 +4905,13 @@ def api_post_extra(h, app, path, body):
             set_ram(Path(s["dir"]), c, mb // 256 * 256)
         return h._json({"ok": True})
     if path == "/api/server/fix":
-        get_server(str(body.get("id") or ""))
-        res = app.runner.fix_and_restart(accept_eula=bool(body.get("eula", load_settings().get("eula"))),
+        r = app.runner_for(get_server(str(body.get("id") or "")), create=True)
+        res = r.fix_and_restart(accept_eula=bool(body.get("eula", load_settings().get("eula"))),
                                          aggressive=bool(body.get("aggressive")))
         return h._json(res)
     if path == "/api/server/fixlog":
         s = get_server(str(body.get("id") or ""))
-        st = app.runner.status() if app.runner else {}
-        if st.get("dir") and _same_folder(st["dir"], s["dir"]) and app.runner.state in ("starting", "online", "stopping"):
+        if _server_running(app, s):
             raise ValueError("Stop the server first, then check the log file.")
         log_path = user_path(body.get("log"), "file")
         eula = bool(load_settings().get("eula"))
@@ -4884,10 +4929,10 @@ def api_post_extra(h, app, path, body):
             app.updater.check_now()
         return h._json(app.updater.status() if app.updater else {"state": "disabled"})
     if path == "/api/update/install":
-        if app.runner and app.runner.state in ("starting", "online", "stopping"):
+        if app.active_runners():
             if not body.get("stop_server"):
-                raise ValueError("Stop your server first, then install the update.")
-            app.runner.shutdown()                # saves the world and stops the server, then we update
+                raise ValueError("Stop your servers first, then install the update.")
+            app.shutdown_servers()               # saves the worlds and stops the servers, then we update
         if app.busy():
             raise ValueError("Wait for the current task to finish, then install the update.")
         if not (app.updater and app.updater.install_now()):
@@ -4901,10 +4946,8 @@ def api_post_extra(h, app, path, body):
         cmds = {"op": "op", "deop": "deop", "wl_add": "whitelist add", "wl_remove": "whitelist remove"}
         if action not in cmds and action != "wl_on":
             raise ValueError("Unknown action.")
-        r = app.runner
-        st = r.status() if r else {}
-        mine = bool(st.get("dir")) and _same_folder(st["dir"], s["dir"])
-        state = r.state if (r and mine) else "offline"
+        r = app.runner_for(s)
+        state = r.state if r else "offline"
         if state in ("starting", "stopping"):
             raise ValueError("Wait until the server has finished starting or stopping, then try again.")
         if action == "wl_on":
@@ -5611,12 +5654,37 @@ class WebApp:
         self.uploads = {}
         self.stop_evt = threading.Event()
         self.lock = threading.Lock()
-        self.runner = ServerRunner() if mode == "app" else None
+        self.can_run = mode == "app"
+        self.runners = {}                # one ServerRunner per server folder, so several can run at once
         self.ui_dirty = False            # the page has unsaved server settings
         self.updater = None
 
     def busy(self):
         return self.job is not None and self.job.state == "running"
+
+    def runner_for(self, s, create=False):
+        """The runner for this server (a record with "dir"), or None if it has never been started."""
+        if not self.can_run:
+            return None
+        key = os.path.normcase(str(Path(s["dir"]).resolve()))
+        with self.lock:
+            r = self.runners.get(key)
+            if r is None and create:
+                r = self.runners[key] = ServerRunner()
+            return r
+
+    def active_runners(self):
+        with self.lock:
+            rs = list(self.runners.values())
+        return [r for r in rs if r.state in ("starting", "online", "stopping")]
+
+    def shutdown_servers(self):
+        """Stop every running server cleanly (each saves its world), all at the same time."""
+        ts = [threading.Thread(target=r.shutdown, daemon=True) for r in self.active_runners()]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(150)
 
     def request_quit(self):
         self.stop_evt.set()
@@ -6049,9 +6117,10 @@ class NativeWindow:
     HT = {"l": 10, "r": 11, "t": 12, "tl": 13, "tr": 14, "b": 15, "bl": 16, "br": 17}
 
     def _close_question(self):
-        runner = getattr(self.app, "runner", None)
-        if runner is not None and getattr(runner, "state", "offline") in ("starting", "online", "stopping"):
-            return "Your server is still running.\n\nStop it safely (saving the world) and close the app?"
+        n = len(self.app.active_runners()) if hasattr(self.app, "active_runners") else 0
+        if n:
+            return ("Your server is still running.\n\nStop it safely (saving the world) and close the app?" if n == 1 else
+                    f"{n} servers are still running.\n\nStop them safely (saving their worlds) and close the app?")
         if self.app.busy():
             return f"A task is still running.\n\nStop it and close {APP_NAME}?"
         if getattr(self.app, "ui_dirty", False):
@@ -6066,9 +6135,8 @@ class NativeWindow:
                 if r != 6:
                     return 0
                 CANCEL.set()
-                runner = getattr(self.app, "runner", None)
-                if runner is not None:
-                    threading.Thread(target=self._stop_then_close, args=(runner,), daemon=True).start()
+                if hasattr(self.app, "shutdown_servers"):
+                    threading.Thread(target=self._stop_then_close, daemon=True).start()
                     return 0
         if self.frameless:
             if msg == self.WM_NCCALCSIZE and wp:
@@ -6090,9 +6158,9 @@ class NativeWindow:
                 return _user32.CallWindowProcW(self._old, hwnd, msg, wp, -1)   # don't repaint a caption
         return _user32.CallWindowProcW(self._old, hwnd, msg, wp, lp)
 
-    def _stop_then_close(self, runner):
+    def _stop_then_close(self):
         try:
-            runner.shutdown()
+            self.app.shutdown_servers()
         except Exception:  # noqa: BLE001
             pass
         for _ in range(120):
@@ -6804,11 +6872,10 @@ def run_web(port=0, open_browser=True, app_window=True, browser=None, browser_ar
     except KeyboardInterrupt:
         CANCEL.set()
     finally:
-        if app.runner is not None:
-            try:
-                app.runner.shutdown()           # stop a running Minecraft server cleanly (saves the world)
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            app.shutdown_servers()              # stop running Minecraft servers cleanly (saves the worlds)
+        except Exception:  # noqa: BLE001
+            pass
         httpd.shutdown()
         httpd.server_close()
         for d in app.uploads.values():
@@ -6988,7 +7055,7 @@ label.field{display:grid;gap:7px;font-weight:600;font-size:13.5px}
 label.field small{font-weight:400;color:var(--ink-3)}
 .sw{position:relative;flex:none;width:50px;height:30px}
 .sw input{position:absolute;inset:0;margin:0;opacity:0;cursor:pointer;z-index:1}
-.sw span{position:absolute;inset:0;border-radius:99px;background:var(--field);box-shadow:inset 0 0 0 1px var(--line);transition:background .25s}
+.sw span{position:absolute;inset:0;border-radius:11px;background:var(--field);box-shadow:inset 0 0 0 1px var(--line);transition:background .25s}
 .sw span::after{content:"";position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:8px;background:#fff;box-shadow:0 2px 6px rgba(0,0,0,.35);transition:transform .3s cubic-bezier(.3,1.4,.5,1)}
 .sw input:checked+span{background:linear-gradient(120deg,var(--emerald),#2fbf9a)}
 .sw input:checked+span::after{transform:translateX(20px)}
@@ -7157,17 +7224,63 @@ details.log summary::-webkit-details-marker{display:none}
 .room{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,1fr);gap:18px;margin-top:22px}
 .beacon{padding:26px;border-radius:var(--r-xl);display:flex;flex-direction:column;gap:22px}
 .bstate{display:flex;gap:20px;align-items:center}
-.orb{position:relative;width:86px;height:86px;flex:none;border-radius:24px;--c:var(--ink-3);
-  background:radial-gradient(110% 110% at 30% 20%,rgba(255,255,255,.65),transparent 50%),linear-gradient(145deg,color-mix(in srgb,var(--c) 85%,white),color-mix(in srgb,var(--c) 75%,black));
-  box-shadow:inset 0 1px 1px rgba(255,255,255,.8),0 18px 40px -14px var(--c)}
-.orb::before{content:"";position:absolute;inset:22px;border-radius:9px;background:rgba(255,255,255,.28);box-shadow:inset 0 0 0 2px rgba(255,255,255,.35)}
-.orb::after{content:"";position:absolute;inset:-8px;border-radius:30px;border:2px solid var(--c);opacity:0}
-.orb.online{--c:var(--emerald)}.orb.starting,.orb.stopping{--c:var(--gold)}.orb.crashed{--c:var(--redstone)}.orb.offline{--c:#8a93b0}
-.orb.starting::after,.orb.stopping::after{animation:pulse 1.6s ease-out infinite}
+.mwarn{margin:0 0 12px;padding-left:20px;display:grid;gap:8px;color:var(--ink-2);line-height:1.45}
+.orb{position:relative;width:86px;height:86px;flex:none;--c:#8792b4;--glow:0}
+.orb.online{--c:var(--emerald);--glow:1}.orb.starting{--c:var(--gold);--glow:.7}.orb.stopping{--c:#f0a24a;--glow:.45}.orb.crashed{--c:var(--redstone);--glow:.8}
+.ocube{position:absolute;inset:0;width:100%;height:100%;overflow:visible;z-index:2;animation:ofloat 4.5s ease-in-out infinite}
+.ohalo{fill:var(--c);opacity:calc(.15 + var(--glow)*.35);filter:blur(6px);transition:fill .5s,opacity .5s}
+.oglass polygon{stroke:none;transition:fill .5s}
+.oglass .gt{fill:color-mix(in srgb,var(--c) 26%,rgba(255,255,255,.34))}
+.oglass .gl{fill:color-mix(in srgb,var(--c) 20%,rgba(255,255,255,.16))}
+.oglass .gr{fill:color-mix(in srgb,var(--c) 22%,rgba(10,16,40,.22))}
+.oframe polygon{fill:none;stroke:rgba(255,255,255,.22);stroke-width:1.2;stroke-linejoin:round}
+.oedge{fill:none;stroke:color-mix(in srgb,var(--c) 45%,#fff);stroke-width:2.2;stroke-linejoin:round;stroke-linecap:round;opacity:.9;transition:stroke .5s}
+.ocore{filter:drop-shadow(0 0 calc(2px + var(--glow)*8px) var(--c));transition:filter .5s}
+.ocore .ct{fill:color-mix(in srgb,var(--c) 55%,#fff)}.ocore .cl{fill:var(--c)}.ocore .cr{fill:color-mix(in srgb,var(--c) 68%,#000)}
+.ocore polygon{transition:fill .5s}
+.orb.offline .ocore{opacity:.55;filter:saturate(.4)}
+.ocrack{fill:none;stroke:#fff;stroke-width:1.6;stroke-linejoin:round;opacity:0}
+.orb.crashed .ocrack{opacity:.85}
+.orb.crashed .ocube{animation:oshake .5s cubic-bezier(.36,.07,.19,.97) 1,ofloat 4.5s ease-in-out .5s infinite}
+.orb.crashed .ocore{animation:oflick 2.4s steps(1) infinite}
+.obeam{position:absolute;left:50%;bottom:72px;width:16px;height:150px;margin-left:-8px;z-index:1;pointer-events:none;transform-origin:bottom;transform:scaleY(0);opacity:0;
+  background:linear-gradient(to top,color-mix(in srgb,var(--c) 90%,#fff),color-mix(in srgb,var(--c) 50%,transparent) 45%,transparent);filter:blur(1.5px);
+  -webkit-mask:linear-gradient(90deg,transparent,#000 30%,#000 70%,transparent);mask:linear-gradient(90deg,transparent,#000 30%,#000 70%,transparent);transition:transform .7s cubic-bezier(.2,.8,.2,1),opacity .5s}
+.orb.online .obeam{transform:scaleY(1);opacity:.85;animation:obeam 2.6s ease-in-out infinite}
+.orb.starting .obeam{transform:scaleY(.35);opacity:.6;animation:ocharge 1.1s steps(2) infinite}
+.orb.stopping .obeam{animation:ofade 1.6s ease-in infinite}
+.oring{position:absolute;inset:4px;z-index:0;border-radius:6px;border:2px dashed var(--c);opacity:0;transform:rotate(45deg) scale(.95)}
+.orb.starting .oring,.orb.stopping .oring{opacity:.55;animation:oring 3s linear infinite}
+.orb.stopping .oring{animation-direction:reverse}
+.orb.starting .ocore{animation:ocore 1.1s ease-in-out infinite}
+.opx{position:absolute;left:50%;top:40%;width:5px;height:5px;z-index:3;background:color-mix(in srgb,var(--c) 60%,#fff);opacity:0;pointer-events:none;box-shadow:0 0 6px var(--c)}
+.orb.online .opx{animation:opx 2.8s ease-out infinite}
+.orb.online .opx:nth-of-type(2){animation-delay:.55s;margin-left:-14px}.orb.online .opx:nth-of-type(3){animation-delay:1.1s;margin-left:10px}
+.orb.online .opx:nth-of-type(4){animation-delay:1.65s;margin-left:-6px}.orb.online .opx:nth-of-type(5){animation-delay:2.2s;margin-left:16px}
+@keyframes ofloat{50%{transform:translateY(-3px)}}
+@keyframes oshake{10%,90%{transform:translateX(-1px)}20%,80%{transform:translateX(3px)}30%,50%,70%{transform:translateX(-5px)}40%,60%{transform:translateX(5px)}}
+@keyframes oflick{0%{opacity:1}6%{opacity:.35}9%{opacity:1}52%{opacity:.6}55%{opacity:1}}
+@keyframes obeam{50%{opacity:.6;transform:scaleY(.94)}}
+@keyframes ocharge{50%{transform:scaleY(.6);opacity:.8}}
+@keyframes ofade{0%{transform:scaleY(.8);opacity:.6}100%{transform:scaleY(0);opacity:0}}
+@keyframes oring{to{transform:rotate(405deg) scale(.95)}}
+@keyframes ocore{50%{opacity:.55}}
+@keyframes opx{0%{opacity:0;transform:translate(0,0) scale(1)}15%{opacity:1}100%{opacity:0;transform:translate(0,-70px) scale(.4)}}
+[data-motion=off] .orb *{animation:none!important}
+:root[data-theme=light] .oedge{stroke:color-mix(in srgb,var(--c) 70%,#1a2440)}:root[data-theme=light] .oframe polygon{stroke:rgba(255,255,255,.6)}
 .bstate h2{font-size:32px;font-weight:700;letter-spacing:-.035em;line-height:1.05}
 .bstate p{margin:6px 0 0;color:var(--ink-2)}
 .bacts{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.lstats{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:-12px;cursor:pointer}
+.ls{position:relative;padding:11px 14px;border-radius:14px;background:var(--well);box-shadow:inset 0 0 0 1px var(--line);min-width:0}
+.ls span{display:block;color:var(--ink-3);font-size:12px}
+.ls b{display:block;font:15px var(--pix);margin-top:2px;letter-spacing:.02em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ls small{display:block;font-size:12px;color:var(--ink-3);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ls b.good{color:var(--emerald)}.ls b.warn{color:var(--gold)}.ls b.bad{color:var(--redstone)}
+.lbar{display:block;height:6px;margin-top:7px;border-radius:3px;background:color-mix(in srgb,var(--ink) 12%,transparent);overflow:hidden}
+.lbar i{display:block;height:100%;width:0;border-radius:3px;background:linear-gradient(90deg,var(--lapis),var(--amethyst));transition:width .6s}
+.lbar i.warn{background:linear-gradient(90deg,var(--gold),#f0a24a)}.lbar i.bad{background:linear-gradient(90deg,#f0a24a,var(--redstone))}
 .stats div{padding:12px 14px;border-radius:14px;background:var(--well);box-shadow:inset 0 0 0 1px var(--line)}
 .stats b{display:block;font:15px var(--pix);margin-top:2px;letter-spacing:.02em}
 .stats span{color:var(--ink-3);font-size:12px}
@@ -7493,9 +7606,13 @@ details.log summary::-webkit-details-marker{display:none}
   <div class="glass banner good" id="srv-ready" hidden><span class="bi"><svg><use href="#i-check"/></svg></span><div class="t"><b>Your server is ready</b><span>Press Start, then share the address with your friends.</span></div></div>
   <div class="room">
     <div class="glass beacon" data-shine>
-      <div class="bstate"><div class="orb offline" id="orb"></div><div><h2 id="st-title">Offline</h2><p id="st-sub">Press Start when you want to play.</p></div></div>
+      <div class="bstate"><div class="orb offline" id="orb" aria-hidden="true"><div class="obeam"></div><div class="oring"></div><svg class="ocube" viewBox="0 0 100 100"><ellipse class="ohalo" cx="50" cy="90" rx="34" ry="8"/><g class="oglass"><polygon class="gl" points="14,33 50,52 50,92 14,73"/><polygon class="gr" points="86,33 50,52 50,92 86,73"/><polygon class="gt" points="50,14 86,33 50,52 14,33"/></g><g class="ocore"><polygon class="cl" points="34,46.5 50,55 50,72 34,63.5"/><polygon class="cr" points="66,46.5 50,55 50,72 66,63.5"/><polygon class="ct" points="50,38 66,46.5 50,55 34,46.5"/></g><g class="oframe"><polygon points="20,37 46,50.5 46,84 20,70.5"/><polygon points="80,37 54,50.5 54,84 80,70.5"/><polygon points="50,19 79,33 50,47 21,33"/></g><polyline class="ocrack" points="22,44 30,52 26,58 34,66 31,72"/><polyline class="ocrack" points="78,48 70,55 74,62 66,70"/><g class="oedge"><polyline points="14,33 50,14 86,33 86,73 50,92 14,73 14,33"/><polyline points="14,33 50,52 86,33"/><line x1="50" y1="52" x2="50" y2="92"/></g></svg><i class="opx"></i><i class="opx"></i><i class="opx"></i><i class="opx"></i><i class="opx"></i></div><div><h2 id="st-title">Offline</h2><p id="st-sub">Press Start when you want to play.</p></div></div>
       <div class="bacts"><button class="btn go big" id="srv-start"><svg><use href="#i-play"/></svg>Start</button><button class="btn stop big" id="srv-stop" hidden><svg><use href="#i-stop"/></svg>Stop</button><button class="btn" id="srv-restart" hidden><svg><use href="#i-restart"/></svg>Restart</button><button class="btn quiet" id="srv-folder"><svg><use href="#i-folder"/></svg>Open folder</button></div>
       <div class="stats"><div><span>Players</span><b id="stat-players">0</b></div><div><span>Memory</span><b id="stat-ram">-</b></div><div><span>Version</span><b id="stat-ver">-</b></div></div>
+      <div class="lstats" id="lstats" title="Live numbers while the server runs. More detail in the Health tab.">
+        <div class="ls" id="ls-mem-box"><span>Memory used</span><b id="ls-mem">\u2013</b><i class="lbar"><i id="ls-mem-bar"></i></i></div>
+        <div class="ls" id="ls-tick-box"><span>Average tick</span><b id="ls-tick">\u2013</b><small id="ls-tick-sub">Server offline</small></div>
+      </div>
     </div>
     <div class="glass join" data-shine>
       <div class="joinhead"><div><h3 class="sec-title">How to join</h3><p class="sec-sub" style="margin:0">In Minecraft: Multiplayer, then Add Server, then paste the address.</p></div>
@@ -7845,7 +7962,14 @@ function renderHome(){
 }
 $('#home-new').onclick=$('#empty-new').onclick=function(){go('create')};$('#empty-import').onclick=importServer;
 function importServer(){pick({kind:'dir',title:'Choose your server folder'}).then(function(p){if(!p)return;api('/api/servers/import',{dir:p}).then(function(s){toast('Added \u201c'+s.name+'\u201d');loadHome().then(function(){go('server',s.id)})}).catch(function(e){toast(e.message,true)})})}
-function paintRunPill(){var r=S.servers.filter(function(s){return s.state&&s.state!=='offline'&&s.state!=='crashed'&&s.state!=='setting_up'})[0];var p=$('#run-pill');p.hidden=!r||(S.view==='server'&&S.sid===r.id);if(r){p.lastElementChild.textContent=r.name+': '+stateText(r);p.onclick=function(){go('server',r.id)}}}
+function paintRunPill(){var rs=S.servers.filter(function(s){return s.state&&s.state!=='offline'&&s.state!=='crashed'&&s.state!=='setting_up'&&!(S.view==='server'&&S.sid===s.id)}),p=$('#run-pill');p.hidden=!rs.length;if(!rs.length)return;
+  if(rs.length===1){var r=rs[0];p.lastElementChild.textContent=r.name+': '+stateText(r);p.title='';p.onclick=function(){go('server',r.id)}}
+  else{p.lastElementChild.textContent=rs.length+' servers running';p.title=rs.map(function(r){return r.name+': '+stateText(r)}).join('\n');p.onclick=function(){go('home')}}}
+function multiWarn(m){var box=el('div');
+  box.appendChild(el('p',null,(m.running.length===1?'\u201c'+m.running[0]+'\u201d is':m.running.length+' servers are')+' already running. You can run several servers at once, but this computer may not keep up:'));
+  var ul=el('ul','mwarn');m.reasons.forEach(function(r){ul.appendChild(el('li',null,r))});box.appendChild(ul);
+  box.appendChild(el('p','muted','If players notice lag, stop one of the servers. Giving each server less memory (in its Settings) also helps.'));
+  return ask(m.level==='bad'?'Your computer may not handle another server':'Running another server may cause lag',box,'Start anyway',m.level==='bad')}
 setInterval(function(){if(S.view==='home'||S.view==='settings'||S.view==='create')api('/api/servers').then(function(d){S.servers=d.servers;if(S.view==='home')renderHome();paintRunPill()}).catch(function(){})},4000);
 
 /* ---------- memory caution ---------- */
@@ -7972,8 +8096,8 @@ $('#r-retry').onclick=function(){var b=this;if(!S.lastCreate)return;b.disabled=t
 /* ---------- server control room ---------- */
 var srv=null,conSince=0,sPollT=null,conT=null,conBusy=false,conGen=0,tab='console',lastState='';
 function ensureConsole(){if(!conT&&!conBusy)pollConsole()}
-function stopServerPolling(){clearTimeout(sPollT);clearTimeout(conT);sPollT=conT=null;conGen++;conBusy=false}
-function openServer(id){stopServerPolling();srv=null;modsData=null;$('#mods-list').textContent='';$('#mods-q').value='';plists={ops:[],whitelist:[],whitelist_on:false};S.onlinePlayers=null;setTimeout(loadPlayerLists,0);conSince=0;lastState='';$('#console').textContent='';var ce=el('div','empty-c','The server\u2019s messages appear here while it runs.');ce.id='console-empty';$('#console').appendChild(ce);
+function stopServerPolling(){clearTimeout(sPollT);clearTimeout(statsT);clearTimeout(conT);sPollT=conT=null;conGen++;conBusy=false}
+function openServer(id){stopServerPolling();srv=null;paintMini(null);setTimeout(loadStats,700);modsData=null;$('#mods-list').textContent='';$('#mods-q').value='';plists={ops:[],whitelist:[],whitelist_on:false};S.onlinePlayers=null;setTimeout(loadPlayerLists,0);conSince=0;lastState='';$('#console').textContent='';var ce=el('div','empty-c','The server\u2019s messages appear here while it runs.');ce.id='console-empty';$('#console').appendChild(ce);
   $('#srv-crash').hidden=true;$('#srv-ready').hidden=!S.justMade;S.justMade=false;setAddr('a-pub','Finding your address\u2026');$('#reach').textContent='';delete $('#reach').dataset.real;paintPrivacy();selTab('console');
   refreshServer(true);api('/api/server/public?id='+id).then(function(d){setAddr('a-pub',d.address||'Not available right now')}).catch(function(){setAddr('a-pub','Not available right now')})}
 function refreshServer(first){var id=S.sid;api('/api/server/status?id='+id).then(function(d){if(S.view!=='server'||S.sid!==id)return;srv=d;paintServer(d,first);if(first&&S.afterOpen){var af=S.afterOpen;S.afterOpen=null;setTimeout(af,0)}
@@ -7986,7 +8110,7 @@ function paintServer(d,first){var s=d.server,st=d.status||{},state=st.state||'of
   var T={offline:['Offline','Press Start when you want to play.'],starting:['Starting\u2026','Getting the world ready. Big modpacks can take a few minutes.'],online:['Online',n?(n===1?'1 person is playing.':n+' people are playing.'):'Ready for players. Share an address on the right.'],stopping:['Stopping\u2026','Saving the world before it shuts down.'],crashed:['Stopped','Something went wrong. See below.']}[state]||['Offline',''];
   $('#st-title').textContent=T[0];$('#st-sub').textContent=T[1];
   var running=state==='starting'||state==='online'||state==='stopping';$('#srv-start').hidden=running;$('#srv-stop').hidden=!running;$('#srv-restart').hidden=state!=='online';$('#srv-stop').disabled=state==='stopping';
-  $('#srv-start').disabled=!!d.other_running;$('#srv-start').title=d.other_running?'Another server is running. Stop it first.':'';
+  $('#srv-start').disabled=false;$('#srv-start').title=d.others_running?'Another server is already running. You can run this one too.':'';
   $('#stat-players').textContent=state==='online'?n+(st.max_players?' / '+st.max_players:''):'-';
   $('#srv-crash').hidden=state!=='crashed';$('#prob-badge').hidden=state!=='crashed';if(state==='crashed'&&lastState!=='crashed'){$('#srv-ready').hidden=true;api('/api/server/diagnose?id='+S.sid).then(function(dg){$('#srv-crash-text').textContent=dg.summary||'The app can usually fix this for you.';$('#srv-fix').hidden=!dg.fixable;S.diag=dg;if(tab==='problems')renderHealth()}).catch(function(){})}
   if(state==='online'&&lastState&&lastState!=='online')toast('Your server is online!');
@@ -7998,8 +8122,9 @@ function pollConsole(){var id=S.sid,g=conGen;conBusy=true;api('/api/server/conso
 function addConsole(lines){if(!lines.length)return;var c=$('#console'),e=$('#console-empty');if(e)e.remove();var near=c.scrollHeight-c.scrollTop-c.clientHeight<80,frag=document.createDocumentFragment();
   lines.forEach(function(l){var d=el('div','c '+(l.kind||'info'),maskIP(l.t));d._t=l.t;frag.appendChild(d)});c.appendChild(frag);var extra=c.childElementCount-1500;if(extra>0){var r=document.createRange();r.setStartBefore(c.firstChild);r.setEndAfter(c.children[extra-1]);r.deleteContents()}if(near)c.scrollTop=c.scrollHeight}
 $('#srv-start').onclick=function(){startServer(false)};
-function startServer(eula){var b=$('#srv-start');b.disabled=true;api('/api/server/start',{id:S.sid,eula:eula}).then(function(){$('#srv-ready').hidden=true;clearTimeout(sPollT);refreshServer(false);ensureConsole()})
-  .catch(function(e){b.disabled=false;if(e.data&&e.data.eula){ask('Agree to the Minecraft rules','To run a server you need to agree to the Minecraft EULA (Mojang\u2019s rules for servers). In short: don\u2019t sell things that change the game.','I agree',false).then(function(ok){if(ok)startServer(true)})}else toast(e.message,true)})}
+function startServer(eula,multiOk){var b=$('#srv-start');b.disabled=true;api('/api/server/start',{id:S.sid,eula:eula,multi_ok:!!multiOk}).then(function(){$('#srv-ready').hidden=true;clearTimeout(sPollT);refreshServer(false);ensureConsole()})
+  .catch(function(e){b.disabled=false;if(e.data&&e.data.eula){ask('Agree to the Minecraft rules','To run a server you need to agree to the Minecraft EULA (Mojang\u2019s rules for servers). In short: don\u2019t sell things that change the game.','I agree',false).then(function(ok){if(ok)startServer(true,multiOk)})}
+    else if(e.data&&e.data.multi){multiWarn(e.data.multi).then(function(ok){if(ok)startServer(eula,true)})}else toast(e.message,true)})}
 $('#srv-stop').onclick=function(){var n=srv&&srv.status&&(srv.status.players||[]).length;var go2=function(){api('/api/server/stop',{id:S.sid}).then(function(){clearTimeout(sPollT);refreshServer(false)}).catch(function(e){toast(e.message,true)})};
   if(n)ask('Stop the server?',n===1?'1 person is playing. They\u2019ll be disconnected. The world is saved first.':n+' people are playing. They\u2019ll be disconnected. The world is saved first.','Stop server',true).then(function(ok){if(ok)go2()});else go2()};
 $('#srv-restart').onclick=function(){api('/api/server/restart',{id:S.sid}).then(function(){toast('Restarting\u2026');clearTimeout(sPollT);refreshServer(false)}).catch(function(e){toast(e.message,true)})};
@@ -8225,8 +8350,20 @@ function paintStats(d){var on=d&&d.state==='online',run=d&&(on||d.state==='start
   var cls=d.tick_ms<40?'good':d.tick_ms<50?'warn':'bad';tk.className='hval '+cls;tk.textContent=d.tick_ms.toFixed(1)+' ms';
   $('#hs-tick-sub').textContent=(d.tps!=null?d.tps.toFixed(1)+' TPS · ':'')+(cls==='good'?'Running smoothly':cls==='warn'?'A little busy':'Lagging (it should stay under 50 ms)');
   spark($('#hs-tick-c'),d.tick_hist,Math.max(60,Math.max.apply(null,d.tick_hist||[0])),cssv(cls==='good'?'--emerald':cls==='warn'?'--gold':'--redstone','#35d48d'))}
-function loadStats(){clearTimeout(statsT);if(S.view!=='server'||tab!=='problems'||!S.sid)return;var id=S.sid;
-  api('/api/server/stats?id='+id).then(function(d){if(id===S.sid&&tab==='problems')paintStats(d)}).catch(function(){}).then(function(){statsT=setTimeout(loadStats,2000)})}
+function paintMini(d){var run=d&&(d.state==='online'||d.state==='starting');
+  var mb=$('#ls-mem'),bar=$('#ls-mem-bar'),tk=$('#ls-tick'),ts=$('#ls-tick-sub');
+  if(!run||d.mem_mb==null){mb.textContent=run?'…':'–';bar.style.width='0';bar.className=''}
+  else{var pct=d.limit_mb?Math.min(100,d.mem_mb/d.limit_mb*100):0;mb.textContent=fmtMB(d.mem_mb)+(d.limit_mb?' / '+fmtMB(d.limit_mb):'');bar.style.width=pct+'%';bar.className=pct>92?'bad':pct>80?'warn':''}
+  tk.className='';if(!run){tk.textContent='–';ts.textContent='Server offline';return}
+  if(!d.tick_supported){tk.textContent='–';ts.textContent='Not reported by this version';return}
+  if(d.tick_ms==null){tk.textContent='…';ts.textContent=d.state==='online'?'Measuring…':'Starting…';return}
+  var cls=d.tick_ms<40?'good':d.tick_ms<50?'warn':'bad';tk.className=cls;tk.textContent=d.tick_ms.toFixed(1)+' ms';ts.textContent=(d.tps!=null?d.tps.toFixed(1)+' TPS · ':'')+(cls==='good'?'Smooth':cls==='warn'?'Busy':'Lagging')}
+// One loop feeds the small boxes on the server page and the Health tab, only while a server runs.
+function loadStats(){clearTimeout(statsT);var st=srv&&srv.status&&srv.status.state,id=S.sid;
+  if(S.view!=='server'||!id){return}
+  if(st!=='online'&&st!=='starting'){paintMini(null);if(tab==='problems')paintStats(null);statsT=setTimeout(loadStats,2000);return}
+  api('/api/server/stats?id='+id).then(function(d){if(id!==S.sid)return;paintMini(d);if(tab==='problems')paintStats(d)}).catch(function(){}).then(function(){if(id===S.sid)statsT=setTimeout(loadStats,2000)})}
+$('#lstats').onclick=function(){selTab('problems')};
 
 /* ---------- app settings ---------- */
 function loadSettings(){applyTheme(themeMode(),false);$('#motion-sw').checked=motionOn();var st=S.info.settings||{};$$('#tb-seg button').forEach(function(b){b.setAttribute('aria-pressed',b.dataset.v===(st.titlebar||'custom'))});$('#tb-row').hidden=!S.info.native_capable;$('#pk-row').hidden=!S.info.native_capable;
@@ -8248,20 +8385,20 @@ var updAsked={},updBoot=Date.now();
 function pollUpdate(){api('/api/update').then(function(d){upd=d;paintUpdate();maybeAskUpdate();
   // right after opening, follow the first check closely so the prompt appears as soon as the update is downloaded
   if(Date.now()-updBoot<180000&&/^(idle|checking|downloading)$/.test(d.state))setTimeout(pollUpdate,1500)}).catch(function(){})}
-function runningServer(){return S.servers.filter(function(s){return s.state==='online'||s.state==='starting'||s.state==='stopping'})[0]}
+function runningServers(){return S.servers.filter(function(s){return s.state==='online'||s.state==='starting'||s.state==='stopping'})}
 function maybeAskUpdate(){if(upd.state!=='ready'||!upd.version||updAsked[upd.version])return;
   if(!S.booted||S.view==='install'||!$('#veil').hidden||polling){clearTimeout(S.askT);S.askT=setTimeout(maybeAskUpdate,3000);return}   // wait for a quiet moment
   updAsked[upd.version]=true;installUpdate(true)}
 $('#upd-pill').onclick=function(){installUpdate(false)};
 $('#upd-check').onclick=function(){if(upd.state==='ready'){installUpdate(false);return}api('/api/update/check',{}).then(function(d){upd=d;paintUpdate();setTimeout(pollUpdate,1500)}).catch(function(){})};
 function installUpdate(auto){api('/api/servers').then(function(d){S.servers=d.servers}).catch(function(){}).then(function(){showUpdate(auto)})}
-function showUpdate(auto){var box=el('div','notes'),cur=upd.current||S.info.version,rs=runningServer();
+function showUpdate(auto){var box=el('div','notes'),cur=upd.current||S.info.version,rl=runningServers(),rs=rl.length?rl:null;
   box.appendChild(el('p',null,'Version '+upd.version+' of Minecraft Server Manager is ready'+(cur?'. You have version '+cur+'.':'.')+' Updating takes a few seconds: the app closes, updates and opens again.'));
-  if(rs){var w=el('p',null,'\u201c'+rs.name+'\u201d is running. Updating stops it safely first (your world is saved). You can start it again afterwards.');w.style.color='var(--t-warn)';box.appendChild(w)}
+  if(rs){var w=el('p',null,rl.length===1?'\u201c'+rl[0].name+'\u201d is running. Updating stops it safely first (your world is saved). You can start it again afterwards.':rl.length+' servers are running. Updating stops them safely first (their worlds are saved). You can start them again afterwards.');w.style.color='var(--t-warn)';box.appendChild(w)}
   if(upd.notes){box.appendChild(el('h4',null,'What\u2019s new'));box.appendChild(renderNotes(upd.notes))}
   modal('Update available',box,[{t:'Remind me later',fn:function(){if(auto)toast('No problem. Click \u201cUpdate ready\u201d at the top whenever you like.')}},
     {t:'Update and restart',primary:true,fn:function(){setTimeout(function(){doUpdate(!!rs)},0)}}])}
-function doUpdate(stopping){document.body.textContent='';var p=el('p',null,stopping?'Stopping your server safely, then updating\u2026':'Updating\u2026 The app will open again in a moment.');
+function doUpdate(stopping){document.body.textContent='';var p=el('p',null,stopping?'Stopping your servers safely, then updating\u2026':'Updating\u2026 The app will open again in a moment.');
   p.style.cssText='margin:30vh auto;max-width:520px;text-align:center;font:600 18px system-ui;color:#c9d3ea;padding:0 20px';document.body.style.background='#0d1428';document.body.appendChild(p);
   api('/api/update/install',{stop_server:true}).then(function(){p.textContent='Updating\u2026 The app will open again in a moment.'}).catch(function(e){p.textContent='The update couldn\u2019t be installed: '+e.message+' Close the app and open it again to try once more.'})}
 function renderNotes(md){var box=el('div','notes'),ul=null;String(md).split(/\r?\n/).forEach(function(l){var m;

@@ -254,4 +254,22 @@ ok("offline-mode UUIDs match Minecraft's")
 assert m.tick_probe_command("1.21.4", "fabric") == "tick query" and m.tick_probe_command("1.20.1", "forge") == "forge tps"
 assert m.tick_probe_command("1.20.4", "neoforge") == "tick query" and m.tick_probe_command("1.12.2", "vanilla") is None
 ok("the right tick-speed command is used for each server")
+# 26. several servers at once: one runner per server, and a lag warning on a small computer
+app = m.WebApp("app")
+a_dir = srv("multi_a"); b_dir = srv("multi_b")
+ra = app.runner_for({"dir": str(a_dir)}, create=True); rb = app.runner_for({"dir": str(b_dir)}, create=True)
+assert ra is not rb and app.runner_for({"dir": str(a_dir)}) is ra and app.runner_for({"dir": str(TMP / "never")}) is None
+class FakeRunner:
+    state = "online"; _ram_limit = 6144
+    def status(self): return {"dir": str(a_dir)}
+old = (m.system_ram_mb, m.os.cpu_count)
+try:
+    m.system_ram_mb = lambda: 8192; m.os.cpu_count = lambda: 4
+    load = m.multi_server_load(app, {"dir": str(b_dir)}, [FakeRunner()])
+    assert load["level"] == "bad" and load["reasons"], load
+    m.system_ram_mb = lambda: 65536; m.os.cpu_count = lambda: 16
+    assert m.multi_server_load(app, {"dir": str(b_dir)}, [FakeRunner()])["level"] == "ok"
+finally:
+    m.system_ram_mb, m.os.cpu_count = old
+ok("each server gets its own runner; a small PC gets a lag warning, a big one doesn't")
 print("ALL REGRESSION TESTS PASSED")

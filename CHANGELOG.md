@@ -11,6 +11,19 @@ How to write an entry (for whoever makes the next update):
   * One short sentence per line. Bold the thing they'll look for, e.g. **Fix it for me**.
 -->
 
+## 3.7.0 - October 17, 2026
+
+### New
+- **Run several servers at once.** Start as many as you like. Each one has its own console, players and stats, and the button at the top shows how many are running.
+- If your computer may not have enough memory or processor power for another server, the app warns you before starting it, explains why it could lag, and lets you start it anyway.
+- If two servers would use the same port, the app tells you which one and how to change the port in Settings.
+- **Live memory and tick boxes** under Players, Memory and Version show how much memory the server is using and how smoothly it's running. Click them for more detail in the Health tab.
+
+### Better
+- **A new look for the server status.** The plain square is now a glowing beacon block: it charges up while starting, shoots a beam of light with sparks when online, powers down when stopping, and cracks red if the server crashes.
+- Switches are now rounded squares, matching the knob inside them.
+- When you close the app or update it, every running server is stopped safely (all worlds are saved).
+
 ## 3.6.0 - October 15, 2026
 
 A big update with lots of things you asked for.
