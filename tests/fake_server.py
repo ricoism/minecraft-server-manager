@@ -36,7 +36,8 @@ if mode == "crash" and os.path.exists("mods/fancyhud.jar"):
     sys.exit(1)
 
 srv("Starting minecraft server version " + (open("fake_version.txt").read().strip() if os.path.exists("fake_version.txt") else "1.20.1"))
-srv("Starting Minecraft server on *:" + os.environ.get("FAKE_PORT", "25570"))
+_props = dict(l.split("=", 1) for l in (open("server.properties", encoding="utf-8").read().splitlines() if os.path.exists("server.properties") else []) if "=" in l and not l.startswith("#"))
+srv("Starting Minecraft server on *:" + os.environ.get("FAKE_PORT", _props.get("server-port", "").strip() or "25570"))  # like a real server
 srv("\x1b[33mLoading properties\x1b[m")
 if mode == "slow":
     time.sleep(3600)

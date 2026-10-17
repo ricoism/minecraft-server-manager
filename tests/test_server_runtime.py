@@ -160,7 +160,7 @@ class RunnerTests(unittest.TestCase):
         self.r.start(d)
         with self.assertRaises(RuntimeError) as cm:
             self.r.start(d)
-        self.assertIn("already running", str(cm.exception))
+        self.assertIn("still running", str(cm.exception))
         wait_for(lambda: self.r.state == "online")
         with self.assertRaises(RuntimeError):
             self.r.start(make_server())

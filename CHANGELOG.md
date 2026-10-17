@@ -1,6 +1,6 @@
 # What's new
 
-Every update to Modpack Server Builder is listed here, newest first.
+Every update to Minecraft Server Manager is listed here, newest first.
 The app installs updates by itself, and shows you this list the first time it opens after an update.
 
 <!--
@@ -10,6 +10,41 @@ How to write an entry (for whoever makes the next update):
   * Group lines under "### New", "### Better" and "### Fixed". Skip groups that are empty.
   * One short sentence per line. Bold the thing they'll look for, e.g. **Fix it for me**.
 -->
+
+## 3.7.1 - October 17, 2026
+
+A full check-up of the app, with lots of fixes for things that could go wrong.
+
+### Fixed
+- **Your server list could disappear** if antivirus or OneDrive was reading the app's settings file at the wrong moment. The app now waits and tries again, keeps a backup, and never saves over settings it couldn't read.
+- **Adding a player could empty your whitelist or operator list** if the file had been edited by hand (for example saved with Notepad's "UTF-8 with BOM", or with a small typo). Those files are now read correctly. If one really can't be read, the app tells you instead of overwriting it.
+- **"Delete server" is much more careful.** It won't delete a folder like your Desktop or Downloads (for example if you ran a server there once), a folder with another server inside it, or a folder with lots of other files. The confirmation now shows exactly which folder will go to the Recycle Bin.
+- **A server could get stuck on "Stopping"** if it was stopped from inside the game and then hung while saving. It's now closed after a while, and pressing Stop closes it sooner.
+- **A new server could show an old server's crash** if you deleted a server and made a new one with the same name. Every new server now starts fresh.
+- **Two servers on the same port:** the check now looks at the port each server is really using.
+- **"Put back" could replace a newer copy of a mod**, and removing the same mod twice could lose the first copy. Both copies are now kept, and nothing is overwritten.
+- **Changing memory in Settings rewrote your own start.bat**, losing custom settings like your Java path. Now only the memory numbers change. The memory shown also comes from start.bat when that's where it's set.
+- **"Try again" after a failed setup always failed.** It now uses a fresh folder. If the server was already built, you get "Open server" instead, so you can start or fix it.
+- Some mods were wrongly flagged as "won't load" on NeoForge servers the app hadn't started yet, or as "for a different version" on snapshot servers.
+- Mods with very long file names could lose their ".jar" when added.
+- Re-adding a server that's already in your list no longer resets its name and icon.
+- Typing `tick query` yourself no longer hides the answer.
+- Pressing Stop while the app was still downloading Java left the server on "Stopping" until the download finished.
+- If an update isn't ready yet, your servers are no longer stopped for nothing.
+- Two servers that need the same Java no longer download it at the same time.
+- Downloads that can't succeed (like a mod that was removed) now fail right away instead of retrying, and no half-downloaded files are left behind.
+- A modpack updated under the same file name is now downloaded again instead of reusing the old one.
+- Clicking the Settings tab again no longer throws away changes you haven't saved.
+- Clicking "Start server" in the right-click menu and then quickly opening another server could start the wrong one.
+- After switching servers quickly, a server's page could briefly show the other server's address or settings.
+- The page checked a server's status more and more often each time you came back to it.
+- Version numbers like `1.20.1.4` in the console were hidden as if they were IP addresses.
+- The home screen and player list no longer lose keyboard focus every few seconds.
+- A message popping up (like "Mods added") no longer closes a dialog you're typing in.
+- The built-in file picker now accepts typed paths in any form (like `C:/Users/...` or `~/Documents`).
+- If a setting can't be saved, you now see a message instead of it quietly not saving.
+- The world's folder name can no longer be set to something that breaks the server.
+- Smaller fixes to uninstalling (user names with a `%`), the update helper, and file uploads.
 
 ## 3.7.0 - October 17, 2026
 

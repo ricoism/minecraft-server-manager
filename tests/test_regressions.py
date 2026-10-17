@@ -272,4 +272,134 @@ try:
 finally:
     m.system_ram_mb, m.os.cpu_count = old
 ok("each server gets its own runner; a small PC gets a lag warning, a big one doesn't")
+# 27. a settings file that can't be read for a moment (antivirus, OneDrive) or is damaged never wipes the server list
+d = srv("keepme"); (d / "server.properties").write_text(""); rec = m.add_server(d, "Keep me", {})
+sf = m.app_data_dir() / "settings.json"
+real_read = Path.read_text
+fails = {"n": 0}
+def flaky(self, *a, **k):
+    if self == sf and fails["n"] < 1:
+        fails["n"] += 1; raise PermissionError("locked")
+    return real_read(self, *a, **k)
+Path.read_text = flaky
+try:
+    assert any(x["id"] == rec["id"] for x in m.list_servers())
+    fails["n"] = -100                     # unreadable for a long time: saves keep what's known
+    def always(self, *a, **k):
+        if self == sf: raise PermissionError("locked")
+        return real_read(self, *a, **k)
+    Path.read_text = always
+    m.save_settings({"theme": "light"})
+finally:
+    Path.read_text = real_read
+assert any(x["id"] == rec["id"] for x in m.list_servers()), "server list lost"
+sf.write_text("{ broken json")            # damaged file: the backup from the last save is used
+assert any(x["id"] == rec["id"] for x in m.list_servers()), "damaged settings lost the list"
+m.save_settings({"theme": "dark"})
+assert json.loads(sf.read_text())["theme"] == "dark" and any(x["id"] == rec["id"] for x in m.list_servers())
+ok("settings survive a locked or damaged settings.json")
+
+# 28. ops/whitelist: a BOM is fine, a broken file is never overwritten, existing entries are kept as they are
+d = srv("players2"); (d / "server.properties").write_text("online-mode=false\n")
+(d / "whitelist.json").write_bytes(b"\xef\xbb\xbf" + json.dumps([{"uuid": "x", "name": "Notch"}]).encode())
+assert m.player_lists(d)["whitelist"] == ["Notch"]
+m.edit_player_list(d, "whitelist", "Steve", True)
+assert [x["name"] for x in json.loads((d / "whitelist.json").read_text())] == ["Notch", "Steve"]
+(d / "ops.json").write_text('[{"uuid":"u","name":"Alex","level":2,"bypassesPlayerLimit":true},]')
+try:
+    m.edit_player_list(d, "ops", "Bob", True); raise AssertionError("overwrote a broken ops.json")
+except ValueError as e:
+    assert "ops.json" in str(e)
+(d / "ops.json").write_text('[{"uuid":"u","name":"Alex","level":2,"bypassesPlayerLimit":true}]')
+m.edit_player_list(d, "ops", "alex", True)
+assert json.loads((d / "ops.json").read_text()) == [{"uuid": "u", "name": "Alex", "level": 2, "bypassesPlayerLimit": True}]
+ok("player lists: BOM read, broken file refused, existing entry kept")
+
+# 29. Delete server refuses a Desktop/Downloads-like folder, a folder holding another server, or lots of other files
+desk = Path.home() / "Desktop"; desk.mkdir(exist_ok=True)
+for n in ("server.properties", "eula.txt", "tax-return.pdf"): (desk / n).write_text("x")
+r1 = m.add_server(desk, "Desktop server", {})
+try:
+    m.delete_server_folder(r1["id"]); raise AssertionError("deleted the Desktop")
+except ValueError:
+    pass
+outer = srv("outer"); (outer / "server.properties").write_text(""); inner = outer / "creative"; inner.mkdir()
+(inner / "server.properties").write_text(""); ro = m.add_server(outer, "Outer", {}); m.add_server(inner, "Inner", {})
+try:
+    m.delete_server_folder(ro["id"]); raise AssertionError("deleted a folder holding another server")
+except ValueError as e:
+    assert "Inner" in str(e)
+junk = srv("junk"); (junk / "server.properties").write_text("")
+for i in range(9): (junk / f"holiday-{i}.pdf").write_text("x")
+rj = m.add_server(junk, "Junk", {})
+try:
+    m.delete_server_folder(rj["id"]); raise AssertionError("deleted a folder full of other files")
+except ValueError:
+    pass
+assert desk.exists() and outer.exists() and junk.exists()
+ok("Delete server refuses folders that hold more than the server")
+
+# 30. removing and putting back mods never overwrites a file
+d = srv("modsafe")
+jar(d / "mods/foo.jar", {"fabric.mod.json": json.dumps({"id": "foo", "version": "1"})})
+m.remove_user_mod(d, "foo.jar")
+jar(d / "mods/foo.jar", {"fabric.mod.json": json.dumps({"id": "foo", "version": "2"})})
+m.remove_user_mod(d, "foo.jar")
+assert sorted(p.name for p in (d / "mods_removed_by_you").glob("*.jar")) == ["foo (2).jar", "foo.jar"]
+jar(d / "mods/foo.jar", {"fabric.mod.json": json.dumps({"id": "foo", "version": "3"})})
+try:
+    m.restore_mod(d, "user", "foo.jar"); raise AssertionError("put back over a newer copy")
+except ValueError:
+    pass
+for bad in ("REMOVED.txt", "../x.jar"):
+    try:
+        m.restore_mod(d, "user", bad); raise AssertionError("restored " + bad)
+    except ValueError:
+        pass
+ok("mods are never overwritten when removed or put back")
+
+# 31. long names keep their extension; snapshots and unknown versions don't produce false warnings
+n = m.win_safe_filename("x" * 230 + ".jar"); assert n.endswith(".jar") and len(n) <= 200, n
+assert m.mc_req_matches(("maven", "[1.20,1.21)"), "24w14a") is None
+assert m.mc_req_matches(("fabric", ">=23w51a"), "1.20.4") is None
+assert m.mc_req_matches(("maven", "[1.20.1],[1.20.4]"), "1.20.2") is False
+assert m._loader_fits({"META-INF/mods.toml"}, "neoforge", "") is None
+ok("long names, snapshots and unknown versions are handled")
+
+# 32. memory: an existing start.bat is read, and only its -Xmx/-Xms change
+d = srv("startbat"); (d / "fabric-server-launch.jar").write_bytes(b"x")
+(d / "start.bat").write_bytes(b'@echo off\r\n"C:\\Zulu\\bin\\java.exe" -Xms2G -Xmx8G -XX:+UseG1GC -jar fabric-server-launch.jar nogui\r\n')
+assert m.read_ram_mb(d) == 8192
+m.set_ram(d, m.ctx_for_server(d), 6144)
+b = (d / "start.bat").read_bytes()
+assert b == b'@echo off\r\n"C:\\Zulu\\bin\\java.exe" -Xms3G -Xmx6G -XX:+UseG1GC -jar fabric-server-launch.jar nogui\r\n', b
+ok("memory changes keep the user's own start.bat")
+
+# 33. downloads: "not found" isn't retried, and no half file is left behind
+import urllib.error
+calls = {"n": 0}
+real_open = m.http_open
+def nf(url, headers=None):
+    calls["n"] += 1; raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+m.http_open = nf
+t0 = time.time()
+try:
+    m.download("https://x/a.jar", TMP / "dl" / "a.jar"); raise AssertionError("no error")
+except RuntimeError:
+    pass
+finally:
+    m.http_open = real_open
+assert calls["n"] == 1 and time.time() - t0 < 1 and not (TMP / "dl" / "a.jar.part").exists()
+ok("permanent download errors fail fast")
+
+# 34. a removed server's runner is forgotten, so a new server in that folder starts fresh
+app = m.WebApp("app")
+d = srv("forget"); (d / "server.properties").write_text(""); rec = m.add_server(d, "Old", {})
+old = app.runner_for(rec, create=True)
+class H:
+    def _json(self, o, code=200): self.out = o; return True
+m.api_post_extra(H(), app, "/api/servers/remove", {"id": rec["id"]})
+rec2 = m.add_server(d, "New", {})
+assert app.runner_for(rec2) is None
+ok("removing a server forgets its old console and crash")
 print("ALL REGRESSION TESTS PASSED")

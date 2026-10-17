@@ -20,15 +20,16 @@ How client-only mods are caught
        * "Fix from log": give the app a latest.log / crash report and the server
          folder, and it diagnoses and repairs what it can.
 
-Nothing is ever deleted. Removed mods go to mods_removed_*/ folders together with
-a REMOVED.txt that says why.
+Removed mods are never deleted: they go to mods_removed_*/ folders together with
+a REMOVED.txt that says why, and can be put back. ("Delete server" sends a server's
+folder to the Recycle Bin, and only after asking.)
 
 Supports CurseForge (.zip) and Modrinth (.mrpack) packs; Forge, NeoForge, Fabric,
-Quilt and vanilla. Standard library only. The interface opens in its own window (Edge/Chrome app mode, served
-from your own computer; nothing leaves it). Java is needed to run the server.
+Quilt and vanilla. Standard library only. On Windows the interface is a native window (WebView2), with a
+browser app window as the fallback; it's served from your own computer and nothing leaves it.
 
 Usage
-  python modpack_server_builder.py                     # opens the interface in your browser
+  python modpack_server_builder.py                     # opens the app
   python modpack_server_builder.py pack.zip -o my_server --ram 8G --accept-eula
   python modpack_server_builder.py --fix-log latest.log --server-dir my_server
 """
@@ -106,26 +107,87 @@ SETTINGS_KEYS = {"theme", "ram", "eula", "test", "aggressive", "cfkey", "desktop
                  "servers", "titlebar", "seen_version", "updates", "update_skip", "showprivate", "picker"}
 
 
-def load_settings() -> dict:
+_SETTINGS_CACHE = None          # the last settings read or written successfully
+
+
+class SettingsUnreadable(Exception):
+    """settings.json exists but can't be read right now (locked by antivirus/OneDrive, or damaged)."""
+
+
+def _read_settings_file() -> dict:
+    """The saved settings. {} only when there's no file yet; SettingsUnreadable when it exists but can't be read.
+    A brief lock (antivirus, OneDrive, another thread replacing it) is retried; a damaged file falls back to the
+    backup made by the previous save."""
+    p = app_data_dir() / "settings.json"
+    last = None
+    for attempt in range(5):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8-sig"))
+            if not isinstance(d, dict):
+                raise ValueError("not a JSON object")
+            return {k: v for k, v in d.items() if k in SETTINGS_KEYS}
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as e:
+            last = e
+            time.sleep(0.05 * (attempt + 1))
+    if not isinstance(last, ValueError) or _SETTINGS_CACHE is not None:
+        raise SettingsUnreadable(str(last))   # locked: wait for it; or we already know newer settings than the backup
     try:
-        d = json.loads((app_data_dir() / "settings.json").read_text(encoding="utf-8"))
-        return {k: v for k, v in d.items() if k in SETTINGS_KEYS}
-    except Exception:  # noqa: BLE001
-        return {}
+        d = json.loads((p.parent / "settings.json.bak").read_text(encoding="utf-8-sig"))
+        if isinstance(d, dict):
+            _ulog(f"settings.json unreadable ({last}); using the backup")
+            return {k: v for k, v in d.items() if k in SETTINGS_KEYS}
+    except (OSError, ValueError):
+        pass
+    raise SettingsUnreadable(str(last))
 
 
-def save_settings(upd: dict) -> dict:
+def load_settings() -> dict:
+    """Never fails: if the file can't be read right now, the last known settings are returned."""
+    global _SETTINGS_CACHE
+    try:
+        d = _read_settings_file()
+    except SettingsUnreadable as e:
+        _ulog(f"settings.json can't be read: {e}")
+        return dict(_SETTINGS_CACHE) if _SETTINGS_CACHE is not None else {}
+    _SETTINGS_CACHE = dict(d)
+    return d
+
+
+def save_settings(upd: dict, strict=False) -> dict:
+    """Merge upd into the saved settings. Never writes over settings it couldn't read (that would lose the server
+    list); keeps the previous file as settings.json.bak. strict=True raises if the save didn't happen."""
+    global _SETTINGS_CACHE
     with _SETTINGS_LOCK:
-        cur = load_settings()
+        d = app_data_dir()
+        try:
+            cur = _read_settings_file()
+        except SettingsUnreadable as e:
+            if _SETTINGS_CACHE is None:
+                _ulog(f"settings not saved, the file can't be read: {e}")
+                if strict:
+                    raise OSError("Your settings file can't be read right now, so nothing was changed. "
+                                  "Close the app and open it again.")
+                return dict(upd)
+            cur = dict(_SETTINGS_CACHE)
         cur.update({k: v for k, v in upd.items() if k in SETTINGS_KEYS})
         try:
-            d = app_data_dir()
             d.mkdir(parents=True, exist_ok=True)
             tmp = d / "settings.json.tmp"
             tmp.write_text(json.dumps(cur, indent=1), encoding="utf-8")
+            if (d / "settings.json").exists():
+                try:
+                    shutil.copyfile(d / "settings.json", d / "settings.json.bak")
+                except OSError:
+                    pass
             os.replace(tmp, d / "settings.json")
-        except OSError:
-            pass
+            _SETTINGS_CACHE = dict(cur)
+        except OSError as e:
+            _ulog(f"settings not saved: {e}")
+            if strict:
+                raise OSError("Your settings couldn't be saved. If antivirus or OneDrive is busy with the app's "
+                              "folder, wait a moment and try again.")
         return cur
 
 
@@ -210,10 +272,13 @@ def download(url, dest: Path, headers=None, sha1=None, sha512=None, retries=3, s
             raise
         except Exception as e:  # noqa: BLE001
             last = e
-            if CANCEL.wait(1.5 * (attempt + 1)):
+            # "not found" / "forbidden" won't change on a retry; timeouts and server hiccups might
+            if isinstance(e, urllib.error.HTTPError) and 400 <= e.code < 500 and e.code not in (408, 425, 429):
+                break
+            if attempt + 1 < retries and CANCEL.wait(1.5 * (attempt + 1)):
+                tmp.unlink(missing_ok=True)
                 raise Cancelled("Stopped by you.")
-    if tmp.exists():
-        tmp.unlink()
+    tmp.unlink(missing_ok=True)
     raise RuntimeError(f"{url}: {last}")
 
 
@@ -229,7 +294,25 @@ def win_safe_filename(name: str, fallback="download") -> str:
         n = fallback
     if n.split(".")[0].strip().lower() in _WIN_DEVICES:
         n = "_" + n
-    return n[:200]
+    if len(n) > 200:                       # shorten the name but keep the extension (".jar", ".mrpack", ...)
+        m = re.match(r"(.*?)((?:\.[A-Za-z0-9]{1,8}){1,2})$", n)
+        stem, ext = (m.group(1), m.group(2)) if m and m.group(1) else (n, "")
+        n = stem[:200 - len(ext)].rstrip(". ") + ext
+    return n
+
+
+def free_name(folder: Path, name: str) -> Path:
+    """folder/name, or "name (2).jar" etc. if that's taken, so nothing is ever overwritten."""
+    p = Path(folder) / name
+    if not p.exists():
+        return p
+    m = re.match(r"(.*?)((?:\.jar)?\.[A-Za-z0-9]{1,8})?$", name)
+    stem, ext = m.group(1) or name, m.group(2) or ""
+    for i in range(2, 1000):
+        p = Path(folder) / f"{stem} ({i}){ext}"
+        if not p.exists():
+            return p
+    raise OSError(f"Too many copies of {name}")
 
 
 def safe_join(base: Path, rel: str) -> Path:
@@ -371,8 +454,23 @@ def _temurin_platform():
     return os_, ("aarch64" if mach in ("arm64", "aarch64") else "x64")
 
 
+_JAVA_LOCKS = {}
+_JAVA_LOCKS_GUARD = threading.Lock()
+
+
 def download_java(want: int, log=print) -> str:
-    """Download Eclipse Temurin JRE `want` into the app's own folder. Returns the java executable path."""
+    """Download Eclipse Temurin JRE `want` into the app's own folder. Returns the java executable path.
+    Two servers (or a setup and a server) needing the same Java take turns, and the second one reuses it."""
+    with _JAVA_LOCKS_GUARD:
+        lock = _JAVA_LOCKS.setdefault(int(want), threading.Lock())
+    with lock:
+        f = find_java(want)
+        if f and java_fits(f, want):
+            return f[0]
+        return _download_java(want, log)
+
+
+def _download_java(want: int, log=print) -> str:
     check_cancel()
     os_, arch = _temurin_platform()
     q = urllib.parse.urlencode({"architecture": arch, "image_type": "jre", "os": os_, "vendor": "eclipse"})
@@ -1021,12 +1119,10 @@ def move_mod(jar: Path, server_dir: Path, bucket: str, reason: str) -> bool:
     d = server_dir / BUCKETS[bucket]
     try:
         d.mkdir(exist_ok=True)
-        dest = d / jar.name
-        if dest.exists():
-            dest.unlink()
+        dest = free_name(d, jar.name)      # never delete an earlier copy that was set aside
         shutil.move(str(jar), str(dest))
         with open(d / "REMOVED.txt", "a", encoding="utf-8") as f:
-            f.write(f"{jar.name}\t{reason.replace(chr(9), ' ')}\n")
+            f.write(f"{dest.name}\t{reason.replace(chr(9), ' ')}\n")
         return True
     except OSError:
         return False
@@ -1326,11 +1422,11 @@ def launch_spec(server_dir: Path):
 def read_ram_mb(server_dir: Path) -> int:
     """The server's memory limit. Comment lines are skipped: Forge's user_jvm_args.txt is full of examples
     like "# -Xmx3G" that aren't the real setting. The last -Xmx wins, as it does for Java."""
-    for f in ("user_jvm_args.txt", "start.sh"):
+    for f in ("user_jvm_args.txt", "start.sh", "start.bat", "run.bat", "run.sh"):
         p = server_dir / f
         if p.exists():
             text = "\n".join(l for l in p.read_text(encoding="utf-8", errors="ignore").splitlines()
-                             if not l.lstrip().startswith("#"))
+                             if not re.match(r"\s*(#|::|rem\b)", l, re.I))
             found = re.findall(r"-Xmx(\d+)([MmGg])", text)
             if found:
                 n, u = found[-1]
@@ -1396,8 +1492,30 @@ def launch_cmd(server_dir: Path, ctx: Ctx):
 
 
 def set_ram(server_dir: Path, ctx: Ctx, mb: int):
+    """Change the memory limit. Start files the user already has keep everything else (Java path, extra flags):
+    only their -Xmx / -Xms values change."""
     ctx.ram_mb = mb
-    write_start_scripts(server_dir, mb, ctx.java_script, lambda s: None)
+    xmx, xms = fmt_ram(mb), fmt_ram(min(mb, max(mb // 2, 512)))
+    spec = launch_spec(server_dir)
+    if spec and spec["mode"] == "args":
+        jvm = server_dir / "user_jvm_args.txt"
+        old = jvm.read_text(encoding="utf-8", errors="ignore").splitlines() if jvm.exists() else \
+            ["# Edit these to change memory / JVM flags"]
+        keep = [l for l in old if not re.match(r"\s*-Xm[sx]", l)]
+        write_file(jvm, "\n".join(keep + [f"-Xms{xms}", f"-Xmx{xmx}"]) + "\n")
+    for name in ("start.bat", "start.sh", "run.bat", "run.sh"):
+        p = server_dir / name
+        if not p.is_file():
+            continue
+        with open(p, encoding="utf-8", errors="surrogateescape", newline="") as f:
+            t = f.read()
+        if re.search(r"-Xmx\d+[MmGg]\b", t):
+            t = re.sub(r"-Xmx\d+[MmGg]\b", f"-Xmx{xmx}", t)
+            t = re.sub(r"-Xms\d+[MmGg]\b", f"-Xms{xms}", t)
+            with open(p, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
+                f.write(t)
+    if spec and not (server_dir / "start.bat").exists() and not (server_dir / "start.sh").exists():
+        write_start_scripts(server_dir, mb, ctx.java_script, lambda s: None)
     save_state(server_dir, ctx)
 
 
@@ -2287,7 +2405,7 @@ def process_rss_mb(pid):
             k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
             k32.K32GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
             k32.CloseHandle.argtypes = [wintypes.HANDLE]
-            h = k32.OpenProcess(0x1000, False, int(pid))            # PROCESS_QUERY_LIMITED_INFORMATION
+            h = k32.OpenProcess(0x1000 | 0x0010, False, int(pid))   # QUERY_LIMITED_INFORMATION | VM_READ
             if not h:
                 return None
             try:
@@ -2358,9 +2476,12 @@ class ServerRunner:
         self._launch_failed = False
         self._probe_cmd = None             # live stats (Health tab)
         self._probe_loader = ""
+        self._watched = None               # the process a stop watchdog is already looking after
+        self._watch_deadline = 0.0
         self._ram_limit = None
         self._stats_wanted = 0.0
         self._probe_until = 0.0
+        self._probe_hold = 0.0             # no probe while the user is running the same command themselves
         self._mem_hist = deque(maxlen=90)
         self._tick_hist = deque(maxlen=90)
         self._tick_ms = None
@@ -2397,7 +2518,7 @@ class ServerRunner:
             if self._busy:
                 raise RuntimeError("The server is being repaired right now. Please wait a moment.")
             if self._state in ("starting", "online", "stopping") or self._alive():
-                raise RuntimeError("A server is already running. Stop it before starting another one.")
+                raise RuntimeError("This server is still running or closing. Wait a moment, then press Start again.")
             if not d.is_dir():
                 raise RuntimeError("That folder doesn't exist any more. Pick the folder your server is in.")
             if not launch_spec(d):
@@ -2507,7 +2628,8 @@ class ServerRunner:
                     return
                 if mb is not None:
                     self._mem_hist.append(mb)
-                want = self._state == "online" and self._probe_cmd and now < self._stats_wanted and now >= next_probe
+                want = self._state == "online" and self._probe_cmd and now < self._stats_wanted and now >= next_probe \
+                    and now >= self._probe_hold
                 if want:
                     self._probe_until = now + 4
                     next_probe = now + 8     # each probe adds a few lines to the server's log, so not too often
@@ -2613,6 +2735,7 @@ class ServerRunner:
                 and self._state in ("online", "stopping"):
             self._stop_requested = True          # a /stop typed in-game, or a restart/scheduler mod: a clean stop
             self._state = "stopping"
+            self._watch(self._proc, 120)          # big worlds can take a while to save, but never hang forever
         if RX_DONE.search(line):
             if self._state == "starting":
                 self._state = "online"
@@ -2660,10 +2783,16 @@ class ServerRunner:
                 return
             self._stop_requested = True
             already = self._state == "stopping"
-            self._state = "stopping"
             proc = self._proc if self._alive() else None
-            if not proc or already:
-                return                        # not launched yet (e.g. still downloading Java): it won't launch
+            if not proc:
+                # not launched yet (e.g. still downloading Java): it won't launch, so it's simply off now
+                self._state = "offline"
+                return
+            self._state = "stopping"
+            if already:
+                # the server is already closing (e.g. /stop in-game); make sure it can't hang there forever
+                self._watch(proc, timeout)
+                return
             self._add("> stop", "command")
             try:
                 proc.stdin.write("stop\n")
@@ -2671,6 +2800,16 @@ class ServerRunner:
             except (OSError, ValueError):
                 proc.kill()                   # the console is gone; the reader thread finishes up
                 return
+            self._watch(proc, timeout)
+
+    def _watch(self, proc, timeout):
+        """Lock held. Force the process closed if it hasn't ended after `timeout` s (once per process)."""
+        if proc is None:
+            return
+        deadline = time.time() + timeout
+        if self._watched is proc and deadline >= self._watch_deadline:
+            return                             # an earlier (or equal) deadline is already being watched
+        self._watched, self._watch_deadline = proc, deadline
         threading.Thread(target=self._watchdog, args=(proc, timeout), daemon=True, name="server-stop").start()
 
     def _watchdog(self, proc, timeout):
@@ -2695,20 +2834,20 @@ class ServerRunner:
         with self._lock:
             if self._state not in ("starting", "online") or not self._alive():
                 raise RuntimeError("The server isn't running, so it can't take commands right now.")
-            if cmd.split()[0].lower() == "stop":
+            word = cmd.split()[0].lower()
+            if word == "stop":
                 self._stop_requested = True
                 self._state = "stopping"
-                proc = self._proc
-            else:
-                proc = None
+                self._watch(self._proc, 60)
+            if self._probe_cmd and word == self._probe_cmd.split()[0]:
+                self._probe_until = 0              # the user asked for it: show the answer, don't hide it as ours
+                self._probe_hold = time.time() + 10
             self._add("> " + cmd, "command")
             try:
                 self._proc.stdin.write(cmd + "\n")
                 self._proc.stdin.flush()
             except (OSError, ValueError) as e:
                 raise RuntimeError("The server isn't accepting commands (it may be closing).") from e
-        if proc:
-            threading.Thread(target=self._watchdog, args=(proc, 60), daemon=True, name="server-stop").start()
 
     def wait(self, timeout=None):
         """Block until the server process has ended (True) or `timeout` passes (False)."""
@@ -3227,7 +3366,6 @@ def _C(key, label, default, choices, help, group):
             "group": group}
 
 
-PROPERTY_GROUPS = ["Basics", "Players", "World", "Performance", "Advanced"]
 PROPERTY_SCHEMA = [
     # ---- Basics
     _T("motd", "Server MOTD", "A Minecraft Server",
@@ -3426,7 +3564,12 @@ def apply_settings(server_dir, values: dict) -> dict:
                 raise ValueError(f"'{label}' can't contain line breaks or special control characters.")
             if len(s) > spec.get("max_length", 200):
                 raise ValueError(f"'{label}' is too long (at most {spec.get('max_length', 200)} characters).")
-            upd[key] = s.strip() if key == "level-seed" else s
+            if key == "level-name" and s.strip() != (cur.get(key) or "").strip():
+                n = s.strip()
+                if not n or n in (".", "..") or re.search(r'[<>:"/\\|?*]', n) or n != win_safe_filename(n, ""):
+                    raise ValueError(f"'{label}' is the world's folder name, so it can only use letters, numbers, "
+                                     f"spaces and simple punctuation (no / \\ : * ? \" < > |).")
+            upd[key] = s.strip() if key in ("level-seed", "level-name") else s
     if upd:
         write_properties(server_dir, upd)
     return upd
@@ -3975,10 +4118,15 @@ def finish_update_mode(target, source=None, wait=90.0) -> bool:
             os.replace(new, target)
             break
         except FileNotFoundError:
+            if not target.parent.is_dir() or time.monotonic() - start >= wait:
+                new.unlink(missing_ok=True)          # the app's folder is gone (uninstalled?): nothing to update
+                _ulog(f"finish-update: {target.parent} is gone; giving up")
+                return False
             try:                                     # someone cleaned our .new away; copy again
                 shutil.copyfile(src, new)
             except OSError:
                 pass
+            time.sleep(0.5)
         except OSError as e:
             waited = time.monotonic() - start
             if waited >= wait:
@@ -4198,6 +4346,14 @@ def folder_taken(p: Path) -> bool:
     return any(_same_folder(s.get("dir", ""), p) for s in list_servers())
 
 
+def _folder_key(p) -> str:
+    """One spelling per folder (case, .., symlinks), for comparing and for dictionary keys."""
+    try:
+        return os.path.normcase(str(Path(p).resolve()))
+    except (OSError, ValueError):
+        return os.path.normcase(os.path.abspath(str(p)))
+
+
 def _same_folder(a, b) -> bool:
     try:
         return os.path.normcase(str(Path(a).resolve())) == os.path.normcase(str(Path(b).resolve()))
@@ -4224,7 +4380,12 @@ def _looks_like_server(d: Path) -> bool:
 
 
 def list_servers() -> list:
-    st = load_settings()
+    try:
+        st = _read_settings_file()
+    except SettingsUnreadable:
+        st = load_settings()                # last known list; never migrate or save from a failed read
+        if "servers" not in st:
+            return []
     servers = st.get("servers")
     if servers is None:                     # first run of this version: bring over servers from "recent"
         servers = []
@@ -4252,7 +4413,7 @@ def _server_record(d: Path, name: str, extra=None) -> dict:
 
 def add_server(d: Path, name: str, extra=None) -> dict:
     with _SERVERS_LOCK:
-        servers = [s for s in list_servers() if Path(s["dir"]) != Path(d)]
+        servers = [s for s in list_servers() if not _same_folder(s["dir"], d)]
         rec = _server_record(Path(d), name, extra)
         servers.insert(0, {k: v for k, v in rec.items() if k != "missing"})
         save_settings({"servers": [{k: v for k, v in s.items() if k != "missing"} for s in servers]})
@@ -4292,20 +4453,69 @@ def send_to_recycle_bin(path: Path):
     shutil.rmtree(path)
 
 
+SERVER_ENTRY_RX = re.compile(
+    r"(?i)^(.*\.(jar|jar\.disabled|txt|json|json5|properties|log|bat|sh|cmd|ps1|toml|cfg|yml|yaml|png|zip|mrpack|gz|"
+    r"lock|dat|dat_old|old|bak|tmp|part)|mods|config|defaultconfigs|libraries|logs|crash-reports|world.*|versions|"
+    r"kubejs|scripts|resourcepacks|datapacks|global_packs|journeymap|cache|\.cache|\.fabric|\.quilt|debug|backups?|"
+    r"mods_removed_.*|local|patchouli_books|packmenu|openloader|tacz|fancymenu_data|essential|data|plugins|"
+    r"server-icon\.png|usercache\.json|user_jvm_args\.txt|ops\.json|whitelist\.json|banned-.*\.json|"
+    r"eula\.txt|run\.bat|run\.sh|start\.bat|start\.sh|\.modpack_builder\.json|desktop\.ini|thumbs\.db)$")
+
+
+def _protected_folders():
+    """Folders that must never be deleted, nor anything that contains them."""
+    out = {Path.home(), Path.home().parent, documents_dir(), documents_dir() / "Minecraft Servers", app_data_dir()}
+    for sub in ("Desktop", "Downloads", "Pictures", "Music", "Videos", "OneDrive", "Documents"):
+        out.add(Path.home() / sub)
+    for env in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial", "USERPROFILE", "PUBLIC", "ProgramFiles",
+                "ProgramFiles(x86)", "SystemRoot", "LOCALAPPDATA", "APPDATA"):
+        if os.environ.get(env):
+            out.add(Path(os.environ[env]))
+    if IS_WIN:
+        for fid in (FOLDER_DESKTOP, "374DE290-123F-4565-9164-39C4925E467B", "33E28130-4E1E-4676-835A-98395C3BC3BB",
+                    "4BD8D571-6D19-48D3-BE97-422220080E43", "18989B1D-99B5-455B-841C-AB7C74E4DDFC"):
+            try:
+                k = known_folder(fid)
+                if k:
+                    out.add(Path(k))
+            except Exception:  # noqa: BLE001
+                pass
+    return out
+
+
+def _inside(child, parent) -> bool:
+    """True when child is parent or somewhere inside it."""
+    try:
+        c, p_ = Path(_folder_key(child)), Path(_folder_key(parent))
+    except (OSError, ValueError):
+        return False
+    return c == p_ or p_ in c.parents
+
+
 def delete_server_folder(sid: str):
-    """Delete a server for good: its folder goes to the Recycle Bin and it leaves the list."""
+    """Delete a server for good: its folder goes to the Recycle Bin and it leaves the list.
+    Refuses anything that could take other files with it."""
     s = get_server(sid)
     d = Path(s["dir"])
     if d.exists():
-        bad = {Path.home(), documents_dir(), documents_dir() / "Minecraft Servers", app_data_dir()}
         r = d.resolve()
-        if r.parent == r or any(_same_folder(r, b) for b in bad if b.exists()):
-            raise ValueError("That folder holds more than just this server, so the app won't delete it. "
-                             "Use \"Remove from list\" instead, and delete the files yourself if you want.")
-        if not any((d / n).exists() for n in ("server.properties", "server.jar", "eula.txt", "mods", ".modpack_builder.json",
+        keep_out = "Use \u201cRemove from list\u201d instead, and delete the files yourself if you want."
+        if r.parent == r or any(_inside(b, r) for b in _protected_folders()):
+            raise ValueError(f"That folder ({r}) holds more than just this server, so the app won't delete it. {keep_out}")
+        others = [x for x in list_servers() if x["id"] != sid and _inside(x["dir"], r)]
+        if others:
+            raise ValueError(f"\u201c{others[0]['name']}\u201d is inside this server's folder, so the app won't delete it. "
+                             f"{keep_out}")
+        if not any((d / n).exists() for n in ("server.properties", "server.jar", "eula.txt", "mods", STATE_FILE,
                                                "run.bat", "start.bat", "start.sh", "world", "libraries")):
-            raise ValueError("That folder doesn't look like a Minecraft server, so the app won't delete it. "
-                             "Use \"Remove from list\" instead.")
+            raise ValueError(f"That folder doesn't look like a Minecraft server, so the app won't delete it. {keep_out}")
+        try:
+            strange = [e.name for e in os.scandir(d) if not SERVER_ENTRY_RX.match(e.name)]
+        except OSError:
+            strange = []
+        if len(strange) > 6:
+            raise ValueError(f"That folder also holds other files (like \u201c{strange[0]}\u201d), so the app won't delete "
+                             f"it in case they're yours. {keep_out}")
         send_to_recycle_bin(d)
     remove_server(sid)
 
@@ -4315,7 +4525,7 @@ def remove_server(sid: str):
         return
     if re.fullmatch(r"[0-9a-f]{6,32}", sid):
         try:
-            (app_data_dir() / "icons" / f"{sid}.png").unlink()
+            (icon_store() / f"{sid}.png").unlink()
         except OSError:
             pass
     with _SERVERS_LOCK:
@@ -4336,7 +4546,10 @@ def import_server(d: Path, name="") -> dict:
     if not _looks_like_server(d):
         raise ValueError("That folder doesn't look like a Minecraft server. Pick the folder that contains "
                          "the 'mods' folder or the server's .jar file.")
-    return add_server(d, name or d.name)
+    for s in list_servers():
+        if _same_folder(s["dir"], d):
+            return s                       # already in the list: keep its name, icon and history
+    return add_server(Path(os.path.normpath(str(d))), name or d.name)
 
 
 # ---- finding modpacks (Modrinth) -------------------------------------------------------------
@@ -4373,7 +4586,9 @@ def modrinth_pack_download(project_id: str, log=print):
         raise RuntimeError("That modpack's download isn't in a format the app understands.")
     dest = app_data_dir() / "downloads" / win_safe_filename(f["filename"], "modpack.mrpack")
     hashes = f.get("hashes") or {}
-    if not dest.exists():
+    if dest.exists() and hashes.get("sha1") and sha1_file(dest) != str(hashes["sha1"]).lower():
+        dest.unlink()                        # an older file with the same name: get the real one
+    if not dest.exists() or not hashes.get("sha1"):
         log(f"Downloading the modpack {proj.get('title', '')} {v.get('version_number', '')}...")
         download(f["url"], dest, sha1=hashes.get("sha1"), sha512=hashes.get("sha512"))
     return dest, proj.get("title") or dest.stem, proj.get("icon_url") or ""
@@ -4461,6 +4676,7 @@ def create_server(job, b: dict):
                     shutil.rmtree(out, ignore_errors=True)
             else:
                 update_server(rec["id"], setup="")
+                job.kept_server_id = rec["id"]  # the page offers "Open server" (Start / Fix it) instead of a retry
         except Exception:  # noqa: BLE001
             pass
         raise
@@ -4596,38 +4812,66 @@ def player_profile(server_dir: Path, name: str) -> dict:
     return {"uuid": f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}", "name": d.get("name") or name}
 
 
-def _read_list(path: Path) -> list:
+def _read_list(path: Path, strict=False) -> list:
+    """Entries of ops.json / whitelist.json ([] if there's no file). strict=True raises if the file exists but
+    can't be read, so a hand-edited file with a typo is never overwritten with only the new name."""
     try:
-        d = json.loads(path.read_text(encoding="utf-8"))
-        return [x for x in d if isinstance(x, dict) and x.get("name")] if isinstance(d, list) else []
-    except (OSError, ValueError):
+        d = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
         return []
+    except (OSError, ValueError):
+        if strict:
+            raise ValueError(f"{path.name} in the server folder can't be read (it may have a typo from a hand edit). "
+                             f"Open it in a text editor and fix it, or delete it, then try again.") from None
+        return []
+    if not isinstance(d, list):
+        if strict:
+            raise ValueError(f"{path.name} in the server folder isn't in the format Minecraft uses. Fix or delete it, "
+                             f"then try again.")
+        return []
+    return d
+
+
+def _names(items) -> list:
+    return [x["name"] for x in items if isinstance(x, dict) and x.get("name")]
 
 
 def player_lists(server_dir: Path) -> dict:
     props = read_properties(server_dir)
-    return {"ops": [x["name"] for x in _read_list(server_dir / "ops.json")],
-            "whitelist": [x["name"] for x in _read_list(server_dir / "whitelist.json")],
+    return {"ops": _names(_read_list(server_dir / "ops.json")),
+            "whitelist": _names(_read_list(server_dir / "whitelist.json")),
             "whitelist_on": str(props.get("white-list", "false")).strip().lower() == "true"}
 
 
 def edit_player_list(server_dir: Path, which: str, name: str, add: bool) -> str:
-    """Change ops.json / whitelist.json while the server is stopped. -> the stored name."""
+    """Change ops.json / whitelist.json while the server is stopped. -> the stored name.
+    Entries the app doesn't touch are kept exactly as they were."""
     path = server_dir / ("ops.json" if which == "ops" else "whitelist.json")
-    items = _read_list(path)
+    items = _read_list(path, strict=True)
     name = check_player_name(name)
-    keep = [x for x in items if str(x.get("name", "")).lower() != name.lower()]
+    same = lambda x: isinstance(x, dict) and str(x.get("name", "")).lower() == name.lower()
     if add:
+        existing = next((x for x in items if same(x)), None)
+        if existing is not None:
+            return existing["name"]        # already there: keep its uuid, level and spelling
         prof = player_profile(server_dir, name)
         entry = {"uuid": prof["uuid"], "name": prof["name"]}
         if which == "ops":
             level = _int_or(read_properties(server_dir).get("op-permission-level"), 4)
             entry.update(level=level if 1 <= level <= 4 else 4, bypassesPlayerLimit=False)
-        keep.append(entry)
+        items.append(entry)
         name = prof["name"]
-    elif len(keep) == len(items):
-        return name
-    write_file(path, json.dumps(keep, indent=2))
+    else:
+        keep = [x for x in items if not same(x)]
+        if len(keep) == len(items):
+            return name
+        items = keep
+    if path.exists():
+        try:
+            shutil.copyfile(path, path.with_name(path.name + ".bak"))
+        except OSError:
+            pass
+    write_file(path, json.dumps(items, indent=2))
     return name
 
 # ---- extra API routes for the app screens -------------------------------------------------------
@@ -4664,6 +4908,9 @@ def _whats_new(app, force=False):
         return None
 
 
+LIVE_STATES = ("starting", "online", "stopping")
+
+
 def _server_running(app, s) -> bool:
     r = app.runner_for(s)
     return bool(r and r.state in ("starting", "online", "stopping"))
@@ -4675,10 +4922,10 @@ def multi_server_load(app, s, others):
     sys_mb = system_ram_mb() or 8192
     cores = os.cpu_count() or 4
     names, planned = [], read_ram_mb(Path(s["dir"])) or 4096
-    recs = {os.path.normcase(str(Path(x["dir"]).resolve())): x for x in list_servers() if not x.get("missing")}
+    recs = {_folder_key(x["dir"]): x for x in list_servers() if not x.get("missing")}
     for r in others:
         d = r.status().get("dir") or ""
-        rec = recs.get(os.path.normcase(str(Path(d).resolve()))) if d else None
+        rec = recs.get(_folder_key(d)) if d else None
         names.append(rec["name"] if rec else Path(d).name)
         planned += (r._ram_limit or (read_ram_mb(Path(d)) if d else 0) or 4096)
     n = len(others) + 1
@@ -4785,16 +5032,21 @@ def api_post_extra(h, app, path, body):
         if folder_taken(out):
             raise ValueError("That folder already has files in it (or another server uses it). Pick an empty "
                              "folder, or press Change and choose where to save it again.")
+        app.forget_runner(out)
         app.start_job("build", lambda job: create_server(job, body))
         return h._json({"ok": True})
     if path == "/api/servers/import":
-        return h._json(import_server(user_path(body.get("dir")), str(body.get("name") or "")))
+        d = user_path(body.get("dir"))
+        app.forget_runner(d)
+        return h._json(import_server(d, str(body.get("name") or "")))
     if path == "/api/servers/remove":
         sid = str(body.get("id") or "")
         s = next((x for x in list_servers() if x["id"] == sid), None)
         if s and not s.get("missing") and _server_running(app, s):
             raise ValueError("Stop the server before removing it from the list.")
         remove_server(sid)
+        if s:
+            app.forget_runner(s["dir"])
         return h._json({"ok": True})
     if path.startswith("/api/server/mods/"):
         s = get_server(str(body.get("id") or ""))
@@ -4838,6 +5090,7 @@ def api_post_extra(h, app, path, body):
         if s.get("setup") and app.busy():
             raise ValueError("This server is still being set up. Stop the setup first.")
         delete_server_folder(sid)
+        app.forget_runner(s["dir"])
         return h._json({"ok": True})
     if path == "/api/server/icon":
         return h._json(set_server_icon(str(body.get("id") or ""), body.get("png"),
@@ -4856,28 +5109,31 @@ def api_post_extra(h, app, path, body):
         r = app.runner_for(s, create=True)
         if r is None:
             raise ValueError("Servers can only be started from the app.")
-        if path.endswith("restart") and r.state in ("starting", "online"):
-            r.stop()
+        restart = path.endswith("restart")
+        if restart and r.state in LIVE_STATES:
+            if r.state != "stopping":
+                r.stop()
             for _ in range(240):
                 if r.state in ("offline", "crashed"):
                     break
                 time.sleep(0.25)
-        elif r.state in ("starting", "online", "stopping"):
+            else:
+                raise ValueError("The server is taking a long time to close. Wait a moment, then press Start.")
+        elif r.state in LIVE_STATES:
             return h._json({"ok": True})
-        else:
-            others = [x for x in app.active_runners() if x is not r]
-            port = server_port(Path(s["dir"]))
-            for o in others:
-                od = o.status().get("dir")
-                if od and server_port(Path(od)) == port:
-                    other = next((x["name"] for x in list_servers() if _same_folder(x["dir"], od)), Path(od).name)
-                    raise ValueError(f"\u201c{other}\u201d is already using port {port}, and two servers can't share a port. "
-                                     f"Open this server's Settings, change \u201cServer port\u201d to another number "
-                                     f"(for example {port + 1}), save, then press Start again.")
-            if others and not body.get("multi_ok"):
-                load = multi_server_load(app, s, others)
-                if load["level"] != "ok":
-                    return h._json({"error": "This computer may struggle to run another server.", "multi": load}, 409)
+        others = [x for x in app.active_runners() if x is not r]
+        port = server_port(Path(s["dir"]))
+        for o in others:
+            st_ = o.status()
+            if st_.get("dir") and st_.get("port") == port:     # the port it's really using, not what its file says now
+                other = next((x["name"] for x in list_servers() if _same_folder(x["dir"], st_["dir"])), Path(st_["dir"]).name)
+                raise ValueError(f"\u201c{other}\u201d is already using port {port}, and two servers can't share a port. "
+                                 f"Open this server's Settings, change \u201cServer port\u201d to another number "
+                                 f"(for example {port + 1}), save, then press Start again.")
+        if others and not restart and not body.get("multi_ok"):
+            load = multi_server_load(app, s, others)
+            if load["level"] != "ok":
+                return h._json({"error": "This computer may struggle to run another server.", "multi": load}, 409)
         try:
             r.start(Path(s["dir"]), accept_eula=bool(body.get("eula") or load_settings().get("eula")))
         except EulaRequired as e:
@@ -4929,13 +5185,15 @@ def api_post_extra(h, app, path, body):
             app.updater.check_now()
         return h._json(app.updater.status() if app.updater else {"state": "disabled"})
     if path == "/api/update/install":
-        if app.active_runners():
+        if app.busy():
+            raise ValueError("Wait for the current task to finish, then install the update.")
+        if not app.updater or app.updater.status().get("state") != "ready":
+            raise ValueError("The update isn't ready yet.")
+        if app.active_runners():                  # only now, once we know the update will go ahead
             if not body.get("stop_server"):
                 raise ValueError("Stop your servers first, then install the update.")
             app.shutdown_servers()               # saves the worlds and stops the servers, then we update
-        if app.busy():
-            raise ValueError("Wait for the current task to finish, then install the update.")
-        if not (app.updater and app.updater.install_now()):
+        if not app.updater.install_now():
             raise ValueError("The update isn't ready yet.")
         h._json({"ok": True})
         app.request_quit()
@@ -5072,7 +5330,8 @@ def explain_error(e) -> dict:
                  "pause them for a moment.", retry)
     if "mismatch" in low or "checksum" in low:
         return T("A download got damaged on the way", "This usually fixes itself.", retry)
-    if "badzipfile" in details.lower() or "not a zip file" in low or "manifest" in low or "isn't a modpack" in low:
+    if "badzipfile" in details.lower() or "not a zip file" in low or "manifest.json" in low or "modrinth.index.json" in low \
+            or "isn't a modpack" in low:
         return T("That file isn\u2019t a modpack the app can read",
                  "Download the modpack again from CurseForge or Modrinth (the normal download, a .zip or .mrpack file).",
                  "Then start again and choose that file.")
@@ -5122,6 +5381,8 @@ class Job:
     def fail(self, message, cancelled=False, explained=None):
         with self.lock:
             self.result, self.state = {"error": message, "cancelled": cancelled}, "error"
+            if getattr(self, "kept_server_id", None):
+                self.result["server_id"] = self.kept_server_id
             if explained:
                 self.result.update(error=explained["title"], steps=explained["steps"], details=explained["details"])
             self.lines.append(("STOPPED: " if cancelled else "ERROR: ") + message)
@@ -5162,6 +5423,8 @@ def list_dir(path, want_files=False, exts=()):
     p = Path(path).expanduser() if path else Path.home()
     if not p.is_absolute():
         p = Path.home()
+    exact = p.is_dir()                       # the typed path is itself a folder
+    asked_file = str(p.resolve()) if p.is_file() else None
     while not p.is_dir() and p != p.parent:
         p = p.parent
     dirs, files, error, details = [], [], None, {}
@@ -5195,6 +5458,7 @@ def list_dir(path, want_files=False, exts=()):
     parent = str(p.parent) if p.parent != p else ("" if IS_WIN else None)
     return {"path": str(p), "parent": parent, "crumbs": crumbs, "dirs": dirs[:2000], "files": files[:2000],
             "details": {k: v for k, v in details.items() if k in set(dirs[:2000]) | set(files[:2000])},
+            "exact": exact, "file": asked_file,
             "sep": os.sep, "error": error}
 
 
@@ -5261,7 +5525,12 @@ def _fabric_cond(cond, mc):
     if not m:
         return None
     op, ver = m.group(1) or "", m.group(2).split("-")[0].split("+")[0]
+    if not re.match(r"^\d+\.\d+", ver):
+        return None                                           # snapshot names such as 23w51a
     parts = ver.split(".")
+    if any(p in ("x", "X", "*") for p in parts) and op not in ("", "="):
+        ver = ".".join("0" if p in ("x", "X", "*") else p for p in parts)     # ">=1.20.x" means ">=1.20.0"
+        parts = ver.split(".")
     if any(p in ("x", "X", "*") for p in parts):              # 1.20.x
         fixed = []
         for p_ in parts:
@@ -5283,6 +5552,8 @@ def _fabric_cond(cond, mc):
 
 def mc_req_matches(req, mc_version):
     """True/False when a mod says which Minecraft versions it supports; None when that can't be told."""
+    if not re.match(r"^\d+\.\d+", str(mc_version or "").strip()):
+        return None                        # snapshots like 24w14a can't be compared reliably
     mc = _vt(mc_version)
     if not req or not mc:
         return None
@@ -5305,8 +5576,9 @@ def mc_req_matches(req, mc_version):
         ranges = re.findall(r"([\[(])\s*([^,\])]*?)\s*(?:,\s*([^\])]*?)\s*)?([\])])", spec)
         if not ranges:
             return None                                        # a bare version is only a recommendation
-        for lo_b, lo, hi, hi_b in ranges:
-            if "," not in spec and not hi:                     # [1.20.1] exact
+        whole = re.findall(r"[\[(][^\])]*[\])]", spec)
+        for (lo_b, lo, hi, hi_b), raw in zip(ranges, whole):
+            if "," not in raw:                                  # [1.20.1] exact
                 if _vt(lo) == mc:
                     return True
                 continue
@@ -5368,7 +5640,9 @@ def _loader_fits(files, loader, mc):
         if "META-INF/neoforge.mods.toml" in files:
             return True
         v = _vt(mc)
-        return "META-INF/mods.toml" in files and bool(v) and v < (1, 20, 5)
+        if "META-INF/mods.toml" not in files:
+            return False
+        return None if not v else v < (1, 20, 5)      # unknown version: can't tell, so don't warn
     return None
 
 
@@ -5478,8 +5752,7 @@ def add_mods(d: Path, paths, rec=None, online=True):
         if dest.exists() and sha1_file(dest) == sha1_file(src):
             skipped.append({"file": src.name, "why": "It's already in the mods folder."})
             continue
-        if dest.exists():
-            dest = mods / (dest.stem + "-new.jar")
+        dest = free_name(mods, dest.name)
         shutil.copy2(src, dest)
         added.append(dest)
     sides = {}
@@ -5510,12 +5783,20 @@ def remove_user_mod(d: Path, name: str):
 
 
 def restore_mod(d: Path, bucket, name):
-    if bucket not in BUCKETS or Path(name).name != name or not (d / "mods").is_dir():
+    name = str(name or "")
+    if bucket not in BUCKETS or Path(name).name != name or not re.search(r"(?i)\.jar(\.disabled)?$", name) \
+            or not (d / "mods").is_dir():
         raise ValueError("Can't restore that file.")
     src = d / BUCKETS[bucket] / name
     if not src.is_file():
         raise ValueError("That mod is no longer in the removed folder.")
-    shutil.move(str(src), str(d / "mods" / name))
+    # a removed copy may have been saved as "foo (2).jar"; put it back under its plain name if that's free
+    plain = re.sub(r" \(\d+\)(?=\.jar)", "", name)
+    dest = d / "mods" / plain
+    if dest.exists() or (d / "mods" / (plain + ".disabled")).exists() or \
+            (plain.endswith(".disabled") and (d / "mods" / plain[:-9]).exists()):
+        raise ValueError(f"There's already a {plain} in the mods folder. Remove that one first if you want this one back.")
+    shutil.move(str(src), str(dest))
     rf = d / BUCKETS[bucket] / "REMOVED.txt"
     if rf.exists():
         keep = [l for l in rf.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -5666,12 +5947,21 @@ class WebApp:
         """The runner for this server (a record with "dir"), or None if it has never been started."""
         if not self.can_run:
             return None
-        key = os.path.normcase(str(Path(s["dir"]).resolve()))
+        key = _folder_key(s["dir"])
         with self.lock:
             r = self.runners.get(key)
             if r is None and create:
                 r = self.runners[key] = ServerRunner()
             return r
+
+    def forget_runner(self, folder):
+        """Drop a stopped server's runner, so a new server in the same folder doesn't inherit its old console,
+        crash or repair choices."""
+        key = _folder_key(folder)
+        with self.lock:
+            r = self.runners.get(key)
+            if r is not None and r.state not in LIVE_STATES and not getattr(r, "_busy", False):
+                del self.runners[key]
 
     def active_runners(self):
         with self.lock:
@@ -5761,9 +6051,13 @@ def make_handler(app: WebApp):
             return hmac.compare_digest(tok, app.token)
 
         def _body_json(self):
-            n = int(self.headers.get("Content-Length") or 0)
-            if n > 4 << 20:
-                raise ValueError("Request too large.")
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = -1
+            if n < 0 or n > 4 << 20:
+                self.close_connection = True     # the unread body must never be read as the next request
+                raise ValueError("Request too large." if n > 0 else "Bad request.")
             d = json.loads(self.rfile.read(n) or b"{}")
             if not isinstance(d, dict):
                 raise ValueError("Bad request.")
@@ -5778,6 +6072,7 @@ def make_handler(app: WebApp):
                 if f:
                     return self._send(200, f, "font/woff", {"Cache-Control": "max-age=86400"})
             if not self._auth(q):
+                self.close_connection = True         # don't read a body we ignore as another request
                 return self._send(403, "Forbidden", "text/plain")
             app.last_seen = time.time()
             try:
@@ -5813,20 +6108,6 @@ def make_handler(app: WebApp):
                     if (q.get("places") or ["0"])[0] == "1":
                         out.update(picker_places())
                     return self._json(out)
-                if u.path == "/api/latestlog":
-                    raw = (q.get("dir") or [""])[0].strip()
-                    try:
-                        p = user_path(raw) / "logs" / "latest.log" if raw else None
-                    except ValueError:
-                        p = None
-                    if p is None:
-                        return self._json({"path": ""})
-                    return self._json({"path": str(p) if p.is_file() else ""})
-                if u.path == "/api/summary":
-                    d = user_path((q.get("dir") or [""])[0])
-                    if not d.is_dir():
-                        return self._err("Folder not found.", 404)
-                    return self._json(summarize_server(d))
                 if u.path == "/api/events":
                     try:
                         since = max(0, int((q.get("since") or ["0"])[0]))
@@ -5850,12 +6131,13 @@ def make_handler(app: WebApp):
             u = urlparse(self.path)
             q = parse_qs(u.query)
             if not self._auth(q):
+                self.close_connection = True         # don't read a body we ignore as another request
                 return self._send(403, "Forbidden", "text/plain")
             app.last_seen = time.time()
             try:
                 if u.path == "/api/upload":
-                    name = _safe_name(Path((q.get("name") or ["upload"])[0]).stem, "upload") + \
-                        re.sub(r"[^\w.]", "", Path((q.get("name") or [""])[0]).suffix)[:12]
+                    name = win_safe_filename(_safe_name(Path((q.get("name") or ["upload"])[0]).stem, "upload") +
+                                             re.sub(r"[^\w.]", "", Path((q.get("name") or [""])[0]).suffix)[:12], "upload")
                     kind = (q.get("kind") or ["file"])[0][:10]
                     old = app.uploads.pop(kind, None)
                     if old:
@@ -5863,7 +6145,13 @@ def make_handler(app: WebApp):
                     d = Path(tempfile.mkdtemp(prefix="msb-upload-"))
                     app.uploads[kind] = d
                     dest = d / name
-                    left = int(self.headers.get("Content-Length") or 0)
+                    try:
+                        left = int(self.headers.get("Content-Length") or -1)
+                    except ValueError:
+                        left = -1
+                    if left < 0 or left > 8 << 30:
+                        self.close_connection = True
+                        return self._err("That file is too big to add here.")
                     with open(dest, "wb") as f:
                         while left > 0:
                             chunk = self.rfile.read(min(left, 1 << 20))
@@ -5871,6 +6159,10 @@ def make_handler(app: WebApp):
                                 break
                             f.write(chunk)
                             left -= len(chunk)
+                    if left > 0:                       # the upload was cut off: don't use half a file
+                        self.close_connection = True
+                        dest.unlink(missing_ok=True)
+                        return self._err("The file didn't arrive completely. Try again.")
                     return self._json({"path": str(dest)})
                 body = self._body_json()
                 r = api_post_extra(self, app, u.path, body)
@@ -5884,7 +6176,7 @@ def make_handler(app: WebApp):
                         with zipfile.ZipFile(path) as zf:
                             p = parse_modpack(zf)
                     except (zipfile.BadZipFile, ValueError, KeyError) as e:
-                        if path.parent.name.startswith("msb-upload-"):
+                        if any(_same_folder(path.parent, x) for x in app.uploads.values()):
                             shutil.rmtree(path.parent, ignore_errors=True)
                         if isinstance(e, zipfile.BadZipFile):
                             return self._err("That file isn't a modpack archive (.zip or .mrpack).")
@@ -5896,10 +6188,6 @@ def make_handler(app: WebApp):
                     return self._json({"name": p.name, "mc": p.mc, "loader": p.loader, "loader_ver": p.loader_ver,
                                        "kind": p.kind, "mods": len(p.files), "size": path.stat().st_size,
                                        "suggested_out": str(sug)})
-                if u.path == "/api/build":
-                    return self._start_build(body)
-                if u.path == "/api/fix":
-                    return self._start_fix(body)
                 if u.path == "/api/restore":
                     restore_mod(user_path(body.get("dir")), str(body.get("bucket") or ""), str(body.get("jar") or ""))
                     return self._json({"ok": True})
@@ -5940,7 +6228,7 @@ def make_handler(app: WebApp):
                         upd.pop("titlebar")
                     if upd.get("picker") not in (None, "windows", "builtin"):
                         upd.pop("picker")
-                    cur = save_settings(upd)
+                    cur = save_settings(upd, strict=True)
                     if "theme" in body and app.window:
                         app.window.set_theme(theme_is_dark(body.get("theme")))
                     return self._json(cur)
@@ -5960,35 +6248,6 @@ def make_handler(app: WebApp):
                 return self._err(str(e))
             except Exception as e:  # noqa: BLE001
                 return self._err(f"{type(e).__name__}: {e}", 500)
-
-        def _start_build(self, b):
-            if not b.get("pack") or not str(b.get("out") or "").strip():
-                return self._err("Choose a modpack and a server folder first.")
-            pack, out = user_path(b.get("pack"), "file"), user_path(b.get("out"))
-            ram = str(b.get("ram") or "6G")
-            excl = [e.strip() for e in str(b.get("exclude") or "").split(",") if e.strip()]
-
-            def fn(job):
-                res = build_server(pack, out, ram, bool(b.get("eula")), (b.get("key") or None), excl, False,
-                                   bool(b.get("test", True)), bool(b.get("aggressive")), 8, True, job.log)
-                job.finish(dir=str(res.server_dir), ok=res.test_ok, failures=res.failures)
-            app.start_job("build", fn)
-            self._json({"ok": True})
-
-        def _start_fix(self, b):
-            if not b.get("log") or not str(b.get("dir") or "").strip():
-                return self._err("Choose the server folder and its log file first.")
-            log_path, sdir = user_path(b.get("log"), "file"), user_path(b.get("dir"))
-            retest, report_only = bool(b.get("retest")), bool(b.get("report_only"))
-
-            def fn(job):
-                info = {}
-                ok = fix_from_log(log_path, sdir, bool(b.get("eula")), bool(b.get("aggressive")),
-                                  report_only, retest, True, job.log, info)
-                job.finish(dir=str(sdir), ok=ok, retest=retest, report_only=report_only, eula=bool(b.get("eula")),
-                           **info)
-            app.start_job("fix", fn)
-            self._json({"ok": True})
 
     return H
 
@@ -6121,7 +6380,7 @@ class NativeWindow:
         if n:
             return ("Your server is still running.\n\nStop it safely (saving the world) and close the app?" if n == 1 else
                     f"{n} servers are still running.\n\nStop them safely (saving their worlds) and close the app?")
-        if self.app.busy():
+        if self.app.busy() or any(getattr(r, "_busy", False) for r in list(getattr(self.app, "runners", {}).values())):
             return f"A task is still running.\n\nStop it and close {APP_NAME}?"
         if getattr(self.app, "ui_dirty", False):
             return "You have server settings that aren't saved yet.\n\nClose without saving them?"
@@ -6727,11 +6986,13 @@ def _remove_folder_after_exit(d: Path):
     script = Path(tempfile.gettempdir()) / f"msb-uninstall-{os.getpid()}.cmd"
     script.write_text("@echo off\r\nchcp 65001 >nul\r\n"
                       "for /l %%i in (1,1,60) do (\r\n"
-                      f'  rmdir /s /q "{d}" 2>nul\r\n'
-                      f'  if not exist "{d}" goto done\r\n'
+                      '  rmdir /s /q "%MSB_RMDIR%" 2>nul\r\n'
+                      '  if not exist "%MSB_RMDIR%" goto done\r\n'
                       "  ping -n 2 127.0.0.1 >nul\r\n"
                       ")\r\n:done\r\n(goto) 2>nul & del \"%~f0\"\r\n", encoding="utf-8")
+    # the folder comes in through an environment variable: a "%" in a user name can't break the script
     subprocess.Popen(["cmd", "/c", str(script)], shell=False, creationflags=0x08000000, close_fds=True,
+                     env=dict(os.environ, MSB_RMDIR=str(d)),
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -6794,18 +7055,6 @@ def open_app_window(url, on_close, browser=None, extra_args=()):
     return True
 
 
-def system_prefers_dark():
-    if IS_WIN:
-        try:
-            import winreg
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
-                return winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 0
-        except OSError:
-            pass
-    return True
-
-
 def run_web(port=0, open_browser=True, app_window=True, browser=None, browser_args=(), mode="app"):
     app = WebApp(mode)
     httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler(app))
@@ -6825,7 +7074,8 @@ def run_web(port=0, open_browser=True, app_window=True, browser=None, browser_ar
         while not app.stop_evt.is_set():
             time.sleep(1)
             idle = time.time() - app.last_seen > IDLE_LIMIT
-            if app.window is None and not app.busy() and (app.window_closed or idle):
+            # a page that's only throttled (browser tab in the background) must never stop running servers
+            if app.window is None and not app.busy() and (app.window_closed or (idle and not app.active_runners())):
                 app.stop_evt.set()
                 if app.native_failed:           # main thread may be stuck inside WebView2 start-up
                     time.sleep(1)
@@ -6894,10 +7144,6 @@ def theme_is_dark(theme):
         return theme == "dark"
     h = time.localtime().tm_hour          # "auto": the app's sky follows the time of day
     return not (5 <= h < 17)
-
-
-def run_gui(**kw):
-    run_web(**kw)
 
 
 PAGE_HTML = r"""<!doctype html>
@@ -7427,15 +7673,6 @@ details.log summary::-webkit-details-marker{display:none}
 .xp-ftype{max-width:260px}
 .xp-status{width:100%;font-size:12px;color:var(--ink-3);white-space:pre}
 @media (max-width:700px){.xp-wrap{grid-template-columns:1fr}.xp-side{display:none}.xp-row{grid-template-columns:minmax(0,1fr) 84px}.xp-col-date,.xp-col-type{display:none}.xp .xp-search{flex-basis:110px;width:110px}}
-.crumbs{display:flex;flex-wrap:wrap;gap:2px;margin:10px 0 8px;font-size:13px}
-.crumbs button{all:unset;cursor:pointer;padding:3px 8px;border-radius:8px;color:var(--ink-2)}.crumbs button:hover{background:var(--field)}
-.crumbs span{color:var(--ink-3);align-self:center}
-.list{overflow:auto;flex:1;min-height:200px;display:grid;align-content:start}
-.list[aria-busy=true]{opacity:.45;pointer-events:none}
-.list button{all:unset;box-sizing:border-box;display:flex;align-items:center;gap:12px;padding:9px 12px;border-radius:12px;cursor:pointer;min-width:0}
-.list button:hover{background:var(--field)}.list button:focus-visible{outline:2px solid var(--t-acc)}
-.list button span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.list svg{width:18px;height:18px;flex:none;color:var(--t-acc)}
 .notes{font-size:14px;color:var(--ink-2)}.notes h4{font:650 15px var(--display);color:var(--ink);margin:14px 0 6px}.notes ul{margin:0;padding-left:20px;display:grid;gap:4px}
 .toast{position:fixed;left:50%;bottom:26px;z-index:60;transform:translate(-50%,30px);opacity:0;pointer-events:none;transition:all .35s cubic-bezier(.3,1.3,.5,1);padding:12px 20px;border-radius:14px;font-weight:600;
   background:var(--glass-hi);-webkit-backdrop-filter:blur(22px);backdrop-filter:blur(22px);box-shadow:inset 0 0 0 1px var(--line),var(--shadow);max-width:min(92vw,560px)}
@@ -7730,7 +7967,7 @@ details.log summary::-webkit-details-marker{display:none}
 'use strict';
 var $=function(s,r){return (r||document).querySelector(s)},$$=function(s,r){return Array.prototype.slice.call((r||document).querySelectorAll(s))};
 var TOKEN=new URLSearchParams(location.search).get('t')||'';
-var S={info:{},servers:[],view:'',sid:null,src:null,ram:4,sysgb:8,dir:'',dirTouched:false,sep:'/',home:'',page:0,q:'',jobKind:'build',pollT:null};
+var S={info:{},servers:[],view:'',sid:null,src:null,ram:4,sysgb:8,dir:'',dirTouched:false,sep:'/',home:'',page:0,q:'',jobKind:'build'};
 var root=document.documentElement;
 
 /* ---------- helpers ---------- */
@@ -7740,9 +7977,7 @@ function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!=null
 function icon(id){var s=document.createElementNS('http://www.w3.org/2000/svg','svg'),u=document.createElementNS('http://www.w3.org/2000/svg','use');u.setAttribute('href','#i-'+id);s.appendChild(u);return s}
 var toastT;function toast(m,bad){var t=$('#toast');t.textContent=m;t.className='toast show'+(bad?' bad':'');clearTimeout(toastT);toastT=setTimeout(function(){t.className='toast'},3800)}
 function fmtNum(n){return n>=1e6?(n/1e6).toFixed(1).replace(/\.0$/,'')+'M':n>=1e3?Math.round(n/1e3)+'K':String(n)}
-function fmtSize(n){return n>1048576?(n/1048576).toFixed(1)+' MB':Math.max(1,Math.round(n/1024))+' KB'}
-function baseName(p){return String(p||'').split(/[\\/]/).pop()}
-function isAbs(p){return /^([A-Za-z]:[\\/]|\\\\|\/|~)/.test(p||'')}
+function saveSetting(o){return api('/api/settings',o).catch(function(e){toast(e.message,true)})}
 function parentDir(p){var m=(p||'').match(/^(.*?[\\/])[^\\/]+[\\/]?$/);if(!m)return '';var r=m[1];return /^([A-Za-z]:\\|\\\\[^\\]+\\[^\\]+\\|\/)$/.test(r)||/^[A-Za-z]:[\\/]$/.test(r)?r:r.replace(/[\\/]+$/,'')}
 function joinPath(b,n){if(!b)return n;return b.charAt(b.length-1)===S.sep?b+n:b+S.sep+n}
 function prettyDir(p){if(!p)return '';var h=S.home;if(h&&p.indexOf(h)===0)p=p.slice(h.length).replace(/^[\\/]/,'');return p.split(/[\\/]/).filter(Boolean).join('  \u203a  ')}
@@ -7786,7 +8021,7 @@ function applyTheme(mode,save){
   $('#theme-color').setAttribute('content',t==='dark'?'#121a3d':'#dcecfb');
   $$('#theme-seg button').forEach(function(b){b.setAttribute('aria-pressed',b.dataset.v===mode)});
   if(changedSky||!$('#scene').firstChild)buildScene();
-  if(save)api('/api/settings',{theme:mode==='auto'?'auto':t}).catch(function(){});
+  if(save)saveSetting({theme:mode==='auto'?'auto':t});
 }
 setInterval(function(){applyTheme(themeMode(),false)},5*60*1000);
 
@@ -7813,7 +8048,9 @@ function paintMax(){win('state').then(function(st){var m=st&&st.max;$('#max-ic')
 /* ---------- modal ---------- */
 var modalPrev=null,modalClose=null;
 function modal(title,body,buttons,onClose){
-  modalPrev=document.activeElement;modalClose=onClose||null;$('#veil .sheet').classList.remove('wide');$('#m-title').textContent=title;var b=$('#m-body');b.textContent='';
+  if(!$('#veil').hidden&&modalClose){var prevClose=modalClose;modalClose=null;try{prevClose()}catch(e){}}
+  else if($('#veil').hidden)modalPrev=document.activeElement;
+  modalClose=onClose||null;$('#veil .sheet').classList.remove('wide');$('#m-title').textContent=title;var b=$('#m-body');b.textContent='';
   if(typeof body==='string'){b.appendChild(el('p',null,body))}else if(body)b.appendChild(body);
   var f=$('#m-foot');f.textContent='';(buttons||[{t:'OK',primary:true}]).forEach(function(x){var bt=el('button','btn'+(x.primary?' primary':x.danger?' stop':' quiet'),x.t);bt.onclick=function(){if(x.fn&&x.fn()===false)return;closeModal()};f.appendChild(bt)});
   $('#veil').hidden=false;var first=f.querySelector('.primary,.stop')||$('#m-x');setTimeout(function(){first.focus()},30);
@@ -7821,7 +8058,7 @@ function modal(title,body,buttons,onClose){
 function closeModal(){if($('#veil').hidden)return;$('#veil').hidden=true;pk=null;var c=modalClose;modalClose=null;if(c)c();if(modalPrev&&modalPrev.focus)modalPrev.focus()}
 $('#m-x').onclick=closeModal;$('#veil').addEventListener('mousedown',function(e){if(e.target.id==='veil')closeModal()});
 document.addEventListener('keydown',function(e){if($('#veil').hidden)return;if(e.key==='Escape'){closeModal();return}
-  if(e.key==='Tab'){var f=$$('.sheet button:not([disabled]),.sheet input,.sheet select,.sheet a').filter(function(x){return x.offsetParent!==null});if(!f.length)return;var i=f.indexOf(document.activeElement);if(e.shiftKey&&i<=0){e.preventDefault();f[f.length-1].focus()}else if(!e.shiftKey&&i===f.length-1){e.preventDefault();f[0].focus()}}});
+  if(e.key==='Tab'){var f=$$('.sheet button:not([disabled]),.sheet input,.sheet select,.sheet a,.sheet [tabindex="0"]').filter(function(x){return x.offsetParent!==null});if(!f.length)return;var i=f.indexOf(document.activeElement);if(e.shiftKey&&i<=0){e.preventDefault();f[f.length-1].focus()}else if(!e.shiftKey&&i===f.length-1){e.preventDefault();f[0].focus()}}});
 function ask(title,text,okText,danger){return new Promise(function(res){var done=false;modal(title,text,[{t:'Cancel',fn:function(){done=true;res(false)}},{t:okText,primary:!danger,danger:danger,fn:function(){done=true;res(true)}}],function(){if(!done)res(false)})})}
 function prompt2(title,text,ph,okText){return new Promise(function(res){var box=el('div'),p=el('p',null,text),inp=el('input');inp.type='text';inp.placeholder=ph||'';inp.maxLength=60;box.appendChild(p);box.appendChild(inp);var done=false;
   modal(title,box,[{t:'Cancel',fn:function(){done=true;res(null)}},{t:okText,primary:true,fn:function(){var v=inp.value.trim();if(!v){inp.focus();return false}done=true;res(v)}}],function(){if(!done)res(null)});
@@ -7833,7 +8070,7 @@ function useNativePicker(){var st=S.info.settings||{};return !!S.info.native_cap
 // opt.kind: 'file' | 'files' (several) | 'dir'. Resolves to a path (or an array of paths for 'files'), or null.
 function pick(opt){if(!useNativePicker())return pickBuiltin(opt);
   return api('/api/pickfile',{kind:opt.kind,exts:opt.exts||[],title:opt.title||'',start:opt.start||''}).then(function(d){
-    if(d.unsupported){S.noNativePick=true;return pick(opt)}var ps=d.paths||[];if(!ps.length)return null;return opt.kind==='files'?ps:ps[0]}).catch(function(){S.noNativePick=true;return pick(opt)})}
+    if(d.unsupported){S.noNativePick=true;return pick(opt)}var ps=d.paths||[];if(!ps.length)return null;return opt.kind==='files'?ps:ps[0]}).catch(function(){return pickBuiltin(opt)})}   // one failed call: use the built-in picker this time only
 function pickBuiltin(opt){return new Promise(function(resolve){
   // Laid out like File Explorer: Back/Forward/Up, address bar, search, Quick access on the left, details on the right.
   var multi=opt.kind==='files',wantFiles=opt.kind!=='dir',exts=opt.exts||[],allTypes=false;
@@ -7853,9 +8090,12 @@ function pickBuiltin(opt){return new Promise(function(resolve){
   var done=false,cur=null,data=null,items=[],sel=new Set(),anchor=-1,back=[],fwd=[],sortK='name',sortUp=true;
   function finish(v){done=true;closeModal();resolve(v)}
   function choose(){var t=nameBox.value.trim();
-    if(t&&(/^([A-Za-z]:|\\\\|\/)/.test(t)||t.indexOf('…')<0&&!items.some(function(x){return x.name===t})&&/[\\/]/.test(t))){   // a typed path
-      api('/api/fs?path='+encodeURIComponent(t)+'&files=1').then(function(d){var norm=function(x){return x.replace(/[\\/]+$/,'').toLowerCase()};
-        if(norm(d.path)===norm(t)){if(wantFiles)go2(d.path);else finish(d.path)}else{var nm=t.split(/[\\/]/).pop();if(wantFiles&&(d.files||[]).indexOf(nm)>=0)finish(multi?[joinPath(d.path,nm)]:joinPath(d.path,nm));else toast('Windows can’t find “'+t+'”. Check the spelling and try again.',true)}}).catch(function(e){toast(e.message,true)});return false}
+    if(t&&(/^([A-Za-z]:|\\\\|\/|~)/.test(t)||t.indexOf('…')<0&&!items.some(function(x){return x.name===t})&&/[\\/]/.test(t))){   // a typed path
+      var full=/^([A-Za-z]:|\\\\|\/|~)/.test(t)?t:joinPath(cur,t);      // relative paths are inside the folder shown
+      api('/api/fs?path='+encodeURIComponent(full)+'&files=1').then(function(d){
+        if(d.exact){if(wantFiles)go2(d.path);else finish(d.path)}
+        else if(d.file&&wantFiles)finish(multi?[d.file]:d.file);
+        else toast('Windows can’t find “'+t+'”. Check the spelling and try again.',true)}).catch(function(e){toast(e.message,true)});return false}
     var picked=items.filter(function(x,i){return sel.has(i)});
     if(!picked.length&&t){var hit=items.filter(function(x){return x.name.toLowerCase()===t.toLowerCase()})[0];if(hit)picked=[hit]}
     if(picked.length===1&&picked[0].dir&&wantFiles){go2(picked[0].path);return false}
@@ -7927,6 +8167,7 @@ var VIEWS=['home','create','build','server','settings','install'];
 function go(v,arg){
   if(S.view==='server'&&tab==='settings'&&setDirty&&!(v==='server'&&arg===S.sid)){guardLeave(function(){go(v,arg)});return}
   if(S.view==='server'&&v!=='server')stopServerPolling();
+  if(S.afterOpen&&!(v==='server'&&arg===S.afterOpen.id))S.afterOpen=null;
   S.view=v;VIEWS.forEach(function(x){$('#v-'+x).hidden=x!==v});$('#main').scrollTop=0;
   var cr=$('#crumb');cr.textContent='';
   function crumb(t){cr.appendChild(icon('chev'));cr.appendChild(el('span',null,t))}
@@ -7946,7 +8187,9 @@ document.addEventListener('contextmenu',function(e){if(!(e.target.closest&&e.tar
 /* ---------- home ---------- */
 function stateText(s){var n=(s.players||[]).length;return({online:n?'Online, '+n+' playing':'Online',starting:'Starting\u2026',stopping:'Stopping\u2026',crashed:'Stopped with a problem',setting_up:'Setting up\u2026'})[s.state]||'Offline'}
 function loadHome(){return api('/api/servers').then(function(d){S.servers=d.servers;renderHome();paintRunPill()}).catch(function(e){toast(e.message,true)})}
-function renderHome(){
+var homeKey='';
+function renderHome(force){
+  var key=JSON.stringify(S.servers);if(!force&&key===homeKey&&$('#servers').childElementCount)return;homeKey=key;
   var box=$('#servers');box.textContent='';var has=S.servers.length>0;
   $('#home-empty').hidden=has;$('#home-new').hidden=!has;$('#home-title').hidden=!has;$('#home-lede').hidden=!has;
   S.servers.forEach(function(s){
@@ -7970,7 +8213,7 @@ function multiWarn(m){var box=el('div');
   var ul=el('ul','mwarn');m.reasons.forEach(function(r){ul.appendChild(el('li',null,r))});box.appendChild(ul);
   box.appendChild(el('p','muted','If players notice lag, stop one of the servers. Giving each server less memory (in its Settings) also helps.'));
   return ask(m.level==='bad'?'Your computer may not handle another server':'Running another server may cause lag',box,'Start anyway',m.level==='bad')}
-setInterval(function(){if(S.view==='home'||S.view==='settings'||S.view==='create')api('/api/servers').then(function(d){S.servers=d.servers;if(S.view==='home')renderHome();paintRunPill()}).catch(function(){})},4000);
+setInterval(function(){if(S.view!=='install')api('/api/servers').then(function(d){S.servers=d.servers;if(S.view==='home')renderHome();paintRunPill()}).catch(function(){})},4000);
 
 /* ---------- memory caution ---------- */
 function memWarn(gb,rec,sys,onUse){var high=gb>sys*0.7,much=gb>=Math.max(rec*2,rec+4);if(!(high||much)||gb<=rec)return null;
@@ -7985,7 +8228,7 @@ function memWarn(gb,rec,sys,onUse){var high=gb>sys*0.7,much=gb>=Math.max(rec*2,r
 /* ---------- create wizard ---------- */
 function setStep(n){[1,2,3].forEach(function(i){$('#w'+i).hidden=i!==n;var s=$('#wsteps [data-s="'+i+'"]');s.className='s'+(i===n?' on':i<n?' done':'')});
   var f=$('#w'+n+' input,#w'+n+' button');}
-function startWizard(){S.src=null;S.fileSrc=null;S.dirTouched=false;S.dirBase=null;S.ramTouched=false;S.ramFor=null;$$('.choice').forEach(function(c){c.setAttribute('aria-pressed','false')});['modrinth','file','vanilla'].forEach(function(k){$('#src-'+k).hidden=true});
+function startWizard(){S.dir='';S.src=null;S.fileSrc=null;S.dirTouched=false;S.dirBase=null;S.ramTouched=false;S.ramFor=null;$$('.choice').forEach(function(c){c.setAttribute('aria-pressed','false')});['modrinth','file','vanilla'].forEach(function(k){$('#src-'+k).hidden=true});
   $('#w-eula').checked=!!(S.info.settings&&S.info.settings.eula);$('#file-picked').hidden=true;$('#drop').hidden=false;setStep(1);validateW()}
 $$('.choice').forEach(function(c){c.onclick=function(){$$('.choice').forEach(function(x){x.setAttribute('aria-pressed',x===c)});var k=c.dataset.src;['modrinth','file','vanilla'].forEach(function(x){$('#src-'+x).hidden=x!==k});
   S.src=null;$$('.pack').forEach(function(p){p.setAttribute('aria-pressed','false')});
@@ -8026,7 +8269,7 @@ $('#w-dir-change').onclick=function(){pick({kind:'dir',title:'Choose where to sa
 $('#w2-back').onclick=function(){setStep(1)};$('#w3-back').onclick=function(){setStep(2)};
 $('#w2-next').onclick=function(){if(!$('#w-name').value.trim()){$('#w-name').focus();return}var sm=$('#w-summary');sm.textContent='';var t=el('div','t');t.appendChild(el('b',null,$('#w-name').value.trim()));
   t.appendChild(el('span',null,(S.src.type==='vanilla'?'Minecraft '+S.src.version:S.src.title+(S.src.mc?', Minecraft '+S.src.mc:''))+', '+S.ram+' GB memory'));sm.appendChild(t);setStep(3);validateW()};
-$('#w-create').onclick=function(){var b=this;if(!$('#w-eula').checked)return;b.disabled=true;
+$('#w-create').onclick=function(){var b=this;if(!$('#w-eula').checked)return;if(!S.dir){toast('Still choosing a folder for the server. Try again in a second.',true);return}b.disabled=true;
   api('/api/create',S.lastCreate={source:S.src,name:$('#w-name').value.trim(),dir:S.dir,ram_mb:S.ram*1024,eula:true,test:$('#w-test').checked,aggressive:!!(S.info.settings&&S.info.settings.aggressive),cfkey:(S.info.settings&&S.info.settings.cfkey)||''})
     .then(function(){S.jobName=$('#w-name').value.trim();S.jobSid=null;api('/api/settings',{eula:true}).catch(function(){});S.info.settings=S.info.settings||{};S.info.settings.eula=true;startProgress('build',S.src.type)}).catch(function(e){b.disabled=false;toast(e.message,true)})};
 
@@ -8091,17 +8334,23 @@ function showResult(d){var r=d.result||{};doneJob=null;paintJobPill();
   loadHome().then(function(){var known=sid&&S.servers.some(function(x){return x.id===sid});$('#r-open').hidden=!known;$('#r-open').onclick=function(){go('server',sid)}});$('#r-title').focus()}
 $('#r-home').onclick=function(){go('home')};
 $('#r-copy').onclick=function(){var t=$('#r-details-text').textContent;(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(function(){toast('Details copied')}).catch(function(){toast('Couldn\u2019t copy. Select the text and copy it.',true)})};
-$('#r-retry').onclick=function(){var b=this;if(!S.lastCreate)return;b.disabled=true;api('/api/create',S.lastCreate).then(function(){b.disabled=false;S.jobSid=null;startProgress('build',S.lastCreate.source&&S.lastCreate.source.type)}).catch(function(e){b.disabled=false;toast(e.message,true)})};
+$('#r-retry').onclick=function(){var b=this;if(!S.lastCreate)return;b.disabled=true;var lc=S.lastCreate;
+  // a fresh free folder next to the last one, in case the failed attempt left files behind
+  api('/api/defaults?name='+encodeURIComponent(lc.name||'My server')+'&base='+encodeURIComponent(parentDir(lc.dir))).then(function(d){lc.dir=d.dir}).catch(function(){}).then(function(){return api('/api/create',lc)}).then(function(){b.disabled=false;S.jobSid=null;startProgress('build',S.lastCreate.source&&S.lastCreate.source.type)}).catch(function(e){b.disabled=false;toast(e.message,true)})};
 
 /* ---------- server control room ---------- */
 var srv=null,conSince=0,sPollT=null,conT=null,conBusy=false,conGen=0,tab='console',lastState='';
 function ensureConsole(){if(!conT&&!conBusy)pollConsole()}
-function stopServerPolling(){clearTimeout(sPollT);clearTimeout(statsT);clearTimeout(conT);sPollT=conT=null;conGen++;conBusy=false}
-function openServer(id){stopServerPolling();srv=null;paintMini(null);setTimeout(loadStats,700);modsData=null;$('#mods-list').textContent='';$('#mods-q').value='';plists={ops:[],whitelist:[],whitelist_on:false};S.onlinePlayers=null;setTimeout(loadPlayerLists,0);conSince=0;lastState='';$('#console').textContent='';var ce=el('div','empty-c','The server\u2019s messages appear here while it runs.');ce.id='console-empty';$('#console').appendChild(ce);
+var sGen=0;
+function stopServerPolling(){sGen++;clearTimeout(sPollT);clearTimeout(statsT);clearTimeout(conT);sPollT=conT=null;conGen++;conBusy=false}
+function openServer(id){stopServerPolling();srv=null;S.diag=null;paintMini(null);setTimeout(loadStats,700);modsData=null;$('#mods-list').textContent='';$('#mods-q').value='';plists={ops:[],whitelist:[],whitelist_on:false};S.onlinePlayers=null;setTimeout(loadPlayerLists,0);conSince=0;lastState='';$('#console').textContent='';var ce=el('div','empty-c','The server\u2019s messages appear here while it runs.');ce.id='console-empty';$('#console').appendChild(ce);
   $('#srv-crash').hidden=true;$('#srv-ready').hidden=!S.justMade;S.justMade=false;setAddr('a-pub','Finding your address\u2026');$('#reach').textContent='';delete $('#reach').dataset.real;paintPrivacy();selTab('console');
-  refreshServer(true);api('/api/server/public?id='+id).then(function(d){setAddr('a-pub',d.address||'Not available right now')}).catch(function(){setAddr('a-pub','Not available right now')})}
-function refreshServer(first){var id=S.sid;api('/api/server/status?id='+id).then(function(d){if(S.view!=='server'||S.sid!==id)return;srv=d;paintServer(d,first);if(first&&S.afterOpen){var af=S.afterOpen;S.afterOpen=null;setTimeout(af,0)}
-  sPollT=setTimeout(function(){refreshServer(false)},d.status.state==='starting'||d.status.state==='stopping'?1000:2500)}).catch(function(e){if(S.view!=='server')return;toast(e.message,true);go('home')})}
+  refreshServer(true);api('/api/server/public?id='+id).then(function(d){if(S.sid===id)setAddr('a-pub',d.address||'Not available right now')}).catch(function(){if(S.sid===id)setAddr('a-pub','Not available right now')})}
+function refreshServer(first){clearTimeout(sPollT);var id=S.sid,g=++sGen;   // a newer call (or leaving) makes older replies stale
+  api('/api/server/status?id='+id).then(function(d){if(g!==sGen||S.view!=='server'||S.sid!==id)return;srv=d;paintServer(d,first);
+    if(first&&S.afterOpen&&S.afterOpen.id===id){var af=S.afterOpen.fn;S.afterOpen=null;setTimeout(af,0)}
+    sPollT=setTimeout(function(){refreshServer(false)},d.status.state==='starting'||d.status.state==='stopping'?1000:2500)})
+  .catch(function(e){if(g!==sGen||S.view!=='server'||S.sid!==id)return;S.afterOpen=null;toast(e.message,true);go('home')})}
 function paintServer(d,first){var s=d.server,st=d.status||{},state=st.state||'offline';
   if(first){$('#srv-name').textContent=s.name;packIcon($('#srv-icon'),iconUrl(s));var ch=$('#srv-chips');ch.textContent='';if(s.mc)ch.appendChild(el('span','chip pix',s.mc));if(s.loader)ch.appendChild(el('span','chip',loaderName(s.loader)));if(s.pack&&s.pack!==s.name)ch.appendChild(el('span','chip',s.pack));
     $('#stat-ver').textContent=s.mc||'-';$('#tab-mods').hidden=s.loader==='vanilla';if(s.loader==='vanilla'&&tab==='mods')selTab('console');$('#h-mods').hidden=s.loader==='vanilla'||!s.loader;var cr=$('#crumb span');if(cr)cr.textContent=s.name}
@@ -8112,7 +8361,7 @@ function paintServer(d,first){var s=d.server,st=d.status||{},state=st.state||'of
   var running=state==='starting'||state==='online'||state==='stopping';$('#srv-start').hidden=running;$('#srv-stop').hidden=!running;$('#srv-restart').hidden=state!=='online';$('#srv-stop').disabled=state==='stopping';
   $('#srv-start').disabled=false;$('#srv-start').title=d.others_running?'Another server is already running. You can run this one too.':'';
   $('#stat-players').textContent=state==='online'?n+(st.max_players?' / '+st.max_players:''):'-';
-  $('#srv-crash').hidden=state!=='crashed';$('#prob-badge').hidden=state!=='crashed';if(state==='crashed'&&lastState!=='crashed'){$('#srv-ready').hidden=true;api('/api/server/diagnose?id='+S.sid).then(function(dg){$('#srv-crash-text').textContent=dg.summary||'The app can usually fix this for you.';$('#srv-fix').hidden=!dg.fixable;S.diag=dg;if(tab==='problems')renderHealth()}).catch(function(){})}
+  $('#srv-crash').hidden=state!=='crashed';$('#prob-badge').hidden=state!=='crashed';if(state==='crashed'&&lastState!=='crashed'){$('#srv-ready').hidden=true;var did=S.sid;api('/api/server/diagnose?id='+did).then(function(dg){if(did!==S.sid)return;$('#srv-crash-text').textContent=dg.summary||'The app can usually fix this for you.';$('#srv-fix').hidden=!dg.fixable;S.diag=dg;if(tab==='problems')renderHealth()}).catch(function(){})}
   if(state==='online'&&lastState&&lastState!=='online')toast('Your server is online!');
   lastState=state;renderPlayers(st.players||[],state);
   if(running)ensureConsole();
@@ -8136,7 +8385,7 @@ $('#help-net').addEventListener('toggle',function(){if(!this.open||!srv||srv.sta
   api('/api/server/reach?id='+S.sid).then(function(d){r.textContent='';var dt=el('i','dot '+(d.reachable===true?'online':d.reachable===false?'crashed':''));r.appendChild(dt);r.dataset.real=d.detail||'';r.appendChild(document.createTextNode(maskIP(d.detail||'')))}).catch(function(){r.textContent=''})});
 /* tabs */
 function selTab(t){if(tab==='settings'&&t!=='settings'&&setDirty){guardLeave(function(){selTab(t)});return}tab=t;$$('#tabs button').forEach(function(b){b.setAttribute('aria-selected',b.dataset.tab===t)});['console','players','mods','settings','problems'].forEach(function(x){$('#t-'+x).hidden=x!==t});
-  if(t==='settings')loadSrvSettings();if(t==='problems'){renderHealth();loadStats()}if(t==='players')loadPlayerLists();if(t==='mods')loadMods()}
+  if(t==='settings'&&!setDirty)loadSrvSettings();if(t==='problems'){renderHealth();loadStats()}if(t==='players')loadPlayerLists();if(t==='mods')loadMods()}
 $$('#tabs button').forEach(function(b){b.onclick=function(){selTab(b.dataset.tab)}});
 $('#cmd-form').onsubmit=function(e){e.preventDefault();var c=$('#cmd').value.trim();if(!c)return;sendCmd(c);$('#cmd').value=''};
 function sendCmd(c){if(!srv||srv.status.state!=='online'){toast('Start the server first, then send commands.',true);return}api('/api/server/command',{id:S.sid,command:c}).then(function(){ensureConsole()}).catch(function(e){toast(e.message,true)})}
@@ -8147,7 +8396,8 @@ $$('[data-q]').forEach(function(b){b.onclick=function(){var q=b.dataset.q;
 function head(n){var im=new Image();im.alt='';im.referrerPolicy='no-referrer';im.src='https://mc-heads.net/avatar/'+encodeURIComponent(n)+'/36';im.onerror=function(){im.style.visibility='hidden'};return im}
 var plists={ops:[],whitelist:[],whitelist_on:false};
 function isOp(n){return plists.ops.some(function(x){return x.toLowerCase()===String(n).toLowerCase()})}
-function renderPlayers(list,state){var box=$('#players');box.textContent='';S.onlinePlayers=list;if(!list.length){box.appendChild(el('p','muted',state==='online'?'No one is playing yet. Share an address from “How to join” with your friends.':'Players show up here while the server is online.'));return}
+var plKey='';
+function renderPlayers(list,state){var box=$('#players'),key=JSON.stringify([list,state,plists.ops]);S.onlinePlayers=list;if(key===plKey&&box.childElementCount)return;plKey=key;box.textContent='';if(!list.length){box.appendChild(el('p','muted',state==='online'?'No one is playing yet. Share an address from “How to join” with your friends.':'Players show up here while the server is online.'));return}
   list.forEach(function(n){var p=el('div','player');p.appendChild(head(n));p.appendChild(el('b',null,n));
     if(isOp(n))p.appendChild(el('span','tag-op','OP'));else{var a=el('button','btn sm quiet','Make operator');a.onclick=function(){playerAction('op',n)};p.appendChild(a)}box.appendChild(p)})}
 function paintPlists(){function chips(box,names,action,label){box.textContent='';if(!names.length){box.appendChild(el('span','empty-c',label));return}
@@ -8172,7 +8422,8 @@ function valOf(i){return i.type==='checkbox'?i.checked:i.value}
 function markSet(){setDirty=Object.keys(setVals).some(function(k){return String(valOf(setVals[k]))!==String(setInit[k])});
   var bar=$('#savebar');bar.classList.toggle('dirty',setDirty);$('#savebar-text').textContent=setDirty?'You have unsaved changes':'All changes saved';
   $('#set-save').disabled=!setDirty;$('#set-discard').hidden=!setDirty;api('/api/uistate',{dirty:setDirty}).catch(function(){})}
-function loadSrvSettings(){api('/api/server/settings?id='+S.sid).then(function(d){var box=$('#setlist');box.textContent='';setVals={};setInit={};
+var setSeq=0;
+function loadSrvSettings(){var sid=S.sid,q=++setSeq;api('/api/server/settings?id='+sid).then(function(d){if(q!==setSeq||sid!==S.sid)return;var box=$('#setlist');box.textContent='';setVals={};setInit={};
   var groups={},order=[];function grp(name){if(!groups[name]){var g=el('section','setgroup');g.appendChild(el('h4',null,name));box.appendChild(g);groups[name]=g;order.push(name)}return groups[name]}
   var ram=el('div','set'),rl=el('div');rl.appendChild(el('b',null,'Memory'));rl.appendChild(el('span',null,'How much of your computer’s memory the server can use. More helps big modpacks.'));ram.appendChild(rl);
   var rc=el('div','ctl'),rs=el('select');var sys=Math.max(4,Math.floor(d.system_mb/1024*.8));for(var g=2;g<=sys;g++){var o=el('option',null,g+' GB');o.value=g*1024;rs.appendChild(o)}var curMb=Math.max(2048,Math.round(d.ram_mb/1024)*1024);if(!rs.querySelector('option[value="'+curMb+'"]')){var oc=el('option',null,Math.round(curMb/1024)+' GB');oc.value=curMb;rs.appendChild(oc)}rs.value=curMb;rs.setAttribute('aria-label','Memory');rc.appendChild(rs);ram.appendChild(rc);
@@ -8225,13 +8476,13 @@ function openIconPicker(){if(!srv)return;var s=srv.server,picked=null;
 $('#srv-delete').onclick=function(){if(!srv)return;var st=srv.status&&srv.status.state;if(st==='online'||st==='starting'||st==='stopping'){toast('Stop the server before deleting it.',true);return}deleteServer(srv.server)};
 $('#srv-icon').onclick=openIconPicker;$('#srv-icon-btn').onclick=openIconPicker;
 $('#srv-rename').onclick=function(){prompt2('Rename server','Give it a name you\u2019ll recognise.',srv.server.name,'Rename').then(function(n){if(!n)return;api('/api/servers/rename',{id:S.sid,name:n}).then(function(s){srv.server.name=s.name;$('#srv-name').textContent=s.name;var c=$('#crumb span');if(c)c.textContent=s.name;toast('Renamed')}).catch(function(e){toast(e.message,true)})})};
-$('#srv-remove').onclick=function(){ask('Remove from your list?','The server disappears from the app, but its folder and world stay on your computer. You can add it back any time.','Remove',true).then(function(ok){if(ok)api('/api/servers/remove',{id:S.sid}).then(function(){toast('Removed from your list');S.sid=null;go('home')}).catch(function(e){toast(e.message,true)})})};
+$('#srv-remove').onclick=function(){ask('Remove from your list?','The server disappears from the app, but its folder and world stay on your computer. You can add it back any time.','Remove',true).then(function(ok){if(ok)api('/api/servers/remove',{id:S.sid}).then(function(){toast('Removed from your list');dropUnsaved();S.sid=null;go('home')}).catch(function(e){toast(e.message,true)})})};
 /* health */
 function renderHealth(){var h=$('#health');h.textContent='';var st=srv&&srv.status&&srv.status.state;
   if(st==='crashed'&&S.diag){h.appendChild(el('h3','sec-title','What went wrong'));h.appendChild(el('p','sec-sub',S.diag.summary||''));(S.diag.findings||[]).forEach(function(f){var x=el('div','finding '+(f.action==='manual'?'t-warn':'t-bad'));x.appendChild(icon('alert'));x.appendChild(el('div',null,f.message));h.appendChild(x)});
     var b=el('button','btn primary');b.style.marginTop='14px';b.appendChild(icon('wrench'));b.appendChild(document.createTextNode(S.diag.fixable?'Fix it for me':'Try to fix it'));b.onclick=function(){$('#srv-fix').click()};h.appendChild(b)}
   else{var ok=el('div','finding t-ok');ok.appendChild(icon('check'));ok.appendChild(el('div',null,st==='online'?'Everything looks good. Your server is running.':'No problems found. If the server stops unexpectedly, the app explains why here and offers to fix it.'));h.appendChild(ok)}
-  api('/api/server/removed?id='+S.sid).then(function(s){var box=$('#rm-list');box.textContent='';$('#rm-title').hidden=!s.removed.length;box.previousElementSibling.hidden=!s.removed.length;
+  var rid=S.sid;api('/api/server/removed?id='+rid).then(function(s){if(rid!==S.sid)return;var box=$('#rm-list');box.textContent='';$('#rm-title').hidden=!s.removed.length;box.previousElementSibling.hidden=!s.removed.length;
     s.removed.forEach(function(m){var it=el('div','item'),t=el('div','t');t.appendChild(el('b',null,m.jar));t.appendChild(el('small',null,m.reason));it.appendChild(t);var b=el('button','btn sm quiet');b.appendChild(icon('undo'));b.appendChild(document.createTextNode('Put back'));
       b.onclick=function(){b.disabled=true;api('/api/restore',{dir:srv.server.dir,bucket:m.bucket,jar:m.jar}).then(function(){it.remove();toast('Put back '+m.jar)}).catch(function(e){b.disabled=false;toast(e.message,true)})};it.appendChild(b);box.appendChild(it)})}).catch(function(){})}
 $('#srv-checklog').onclick=function(){pick({kind:'file',exts:['log','txt'],title:'Choose the log file',start:srv?joinPath(srv.server.dir,'logs'):S.home}).then(function(p){if(!p)return;
@@ -8242,7 +8493,7 @@ function closeMenu(){var m=$('#ctxmenu');if(m)m.remove();document.removeEventLis
 function menuOutside(e){var m=$('#ctxmenu');if(m&&!m.contains(e.target))closeMenu()}
 window.addEventListener('blur',closeMenu);window.addEventListener('resize',closeMenu);document.addEventListener('scroll',closeMenu,true);
 document.addEventListener('keydown',function(e){if(e.key==='Escape'&&$('#ctxmenu')){closeMenu();e.stopPropagation()}},true);
-function openWith(id,fn){S.afterOpen=fn||null;go('server',id)}
+function openWith(id,fn){S.afterOpen=fn?{id:id,fn:fn}:null;go('server',id)}
 function serverMenu(s,x,y){closeMenu();var m=el('div','ctxmenu');m.id='ctxmenu';m.setAttribute('role','menu');
   var running=s.state==='online'||s.state==='starting',busy=s.state==='stopping'||s.state==='setting_up';
   function item(ic,label,fn,cls,dis){var b=el('button',cls||null);b.setAttribute('role','menuitem');b.appendChild(icon(ic));b.appendChild(document.createTextNode(label));b.disabled=!!dis;b.onclick=function(){closeMenu();fn()};m.appendChild(b);return b}
@@ -8266,12 +8517,15 @@ function serverMenu(s,x,y){closeMenu();var m=el('div','ctxmenu');m.id='ctxmenu';
   setTimeout(function(){document.addEventListener('mousedown',menuOutside,true)},0);var f=m.querySelector('button:not(:disabled)');if(f)f.focus();
   m.addEventListener('keydown',function(e){var bs=[].slice.call(m.querySelectorAll('button:not(:disabled)')),i=bs.indexOf(document.activeElement);
     if(e.key==='ArrowDown'||e.key==='ArrowUp'){e.preventDefault();bs[(i+(e.key==='ArrowDown'?1:-1)+bs.length)%bs.length].focus()}})}
-function deleteServer(s){ask('Delete “'+s.name+'”?','This deletes the server and its world'+(IS_WINDOWS()?'. The folder goes to the Recycle Bin, so you can still get it back from there if you change your mind.':' from your computer.'),'Delete server',true).then(function(ok){if(!ok)return;
-  api('/api/servers/delete',{id:s.id}).then(function(){toast('Deleted “'+s.name+'”');if(S.view==='server'&&S.sid===s.id){S.sid=null;go('home')}else loadHome()}).catch(function(e){toast(e.message,true)})})}
+function deleteServer(s){var box=el('div');box.appendChild(el('p',null,'This deletes the server and its world'+(IS_WINDOWS()?'. The folder goes to the Recycle Bin, so you can still get it back from there if you change your mind.':' from your computer.')));
+  var pth=el('p','muted',s.dir);pth.style.cssText='font:13px var(--mono);overflow-wrap:anywhere';box.appendChild(pth);
+  ask('Delete “'+s.name+'”?',box,'Delete server',true).then(function(ok){if(!ok)return;
+  api('/api/servers/delete',{id:s.id}).then(function(){toast('Deleted “'+s.name+'”');if(S.view==='server'&&S.sid===s.id){dropUnsaved();S.sid=null;go('home')}else loadHome()}).catch(function(e){toast(e.message,true)})})}
+function dropUnsaved(){if(setDirty){setDirty=false;api('/api/uistate',{dirty:false}).catch(function(){})}}   // the server is gone; its settings no longer matter
 function IS_WINDOWS(){return /Windows/i.test(navigator.userAgent)}
 
 /* ---------- privacy: addresses are hidden unless the user shows them ---------- */
-var RX_IP=/\b(?:\d{1,3}\.){3}\d{1,3}\b|\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\b|\b(?:[0-9a-f]{1,4}:){1,6}:(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?(?![\w:])/gi;
+var RX_IP=/(?<![\w.-])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?!\.?\d)(?![\w-])|\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\b|\b(?:[0-9a-f]{1,4}:){1,6}:(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?(?![\w:])/gi;
 function showPrivate(){return !!(S.info&&S.info.settings&&S.info.settings.showprivate)}
 function maskIP(t){if(t==null||showPrivate())return t;return String(t).replace(RX_IP,function(ip){return ip==='127.0.0.1'||ip==='0.0.0.0'?ip:ip.indexOf(':')>=0?'••••:••••:••••':'•••.•••.•••.•••'})}
 function setAddr(id,real){var x=$('#'+id);if(!x)return;x.dataset.real=real;x.textContent=maskIP(real)}
@@ -8279,7 +8533,7 @@ function paintPrivacy(){var on=showPrivate(),b=$('#priv-btn');b.querySelector('u
   b.setAttribute('aria-pressed',on);b.title=on?'Hide your addresses (useful before sharing your screen or streaming).':'Your addresses are hidden so they don’t show up in screenshots or streams. Copy still copies the real address.';
   ['a-local','a-lan','a-pub','h-lan'].forEach(function(id){var x=$('#'+id);if(x&&x.dataset.real!=null)x.textContent=maskIP(x.dataset.real)});
   $$('#console .c').forEach(function(d){if(d._t!=null)d.textContent=maskIP(d._t)});var r=$('#reach');if(r&&r.dataset.real!=null)r.lastChild.textContent=maskIP(r.dataset.real)}
-$('#priv-btn').onclick=function(){S.info.settings=S.info.settings||{};S.info.settings.showprivate=!showPrivate();paintPrivacy();api('/api/settings',{showprivate:S.info.settings.showprivate}).catch(function(){})};
+$('#priv-btn').onclick=function(){S.info.settings=S.info.settings||{};S.info.settings.showprivate=!showPrivate();paintPrivacy();saveSetting({showprivate:S.info.settings.showprivate})};
 
 /* ---------- Mods tab ---------- */
 var modsData=null,modsSeq=0;
@@ -8313,7 +8567,8 @@ $('#mods-folder').onclick=function(){api('/api/server/mods/folder',{id:S.sid}).c
 $('#mods-add').onclick=function(){pick({kind:'files',exts:['jar'],title:'Choose mods to add',start:S.home}).then(function(ps){if(ps&&ps.length)addMods(ps)})};
 function addMods(paths){var b=$('#mods-add');b.disabled=true;toast('Checking '+paths.length+' mod'+(paths.length===1?'':'s')+'…');
   api('/api/server/mods/add',{id:S.sid,paths:paths}).then(function(r){b.disabled=false;showAddResults(r);loadMods()}).catch(function(e){b.disabled=false;toast(e.message,true)})}
-function showAddResults(r){var box=el('div','addres');
+function whenNoModal(fn){if($('#veil').hidden)fn();else setTimeout(function(){whenNoModal(fn)},300)}   // results wait for the user's open dialog
+function showAddResults(r){if(!$('#veil').hidden){whenNoModal(function(){showAddResults(r)});return}var box=el('div','addres');
   var bad=r.added.filter(function(m){return m.warnings.some(function(w){return w.level==='bad'})}),warn=r.added.filter(function(m){return m.warnings.length&&bad.indexOf(m)<0}),good=r.added.filter(function(m){return !m.warnings.length});
   if(good.length){var g=el('div','ar');g.appendChild(el('b',null,good.length===1?good[0].name+' was added and looks good.':good.length+' mods were added and look good.'));if(good.length>1&&good.length<=8)g.appendChild(el('small','muted',good.map(function(m){return m.name}).join(', ')));box.appendChild(g)}
   bad.concat(warn).forEach(function(m){var a=el('div','ar');a.appendChild(el('b',null,m.name));a.appendChild(warnLines(m.warnings));
@@ -8329,7 +8584,7 @@ function showAddResults(r){var box=el('div','addres');
   tp.addEventListener('drop',function(e){var fs=[].slice.call((e.dataTransfer&&e.dataTransfer.files)||[]);if(!fs.length)return;
     var jars=fs.filter(function(f){return /\.jar$/i.test(f.name)});if(!jars.length){toast('Mods are .jar files. Drop .jar files here.',true);return}
     if(fs.length>jars.length)toast('Only .jar files were added. Other files were left out.');
-    Promise.all(jars.map(function(f,i){return upload(f,'mod'+i)})).then(function(rs){addMods(rs.map(function(x){return x.path}))}).catch(function(e){toast(e.message,true)})})})();
+    Promise.all(jars.map(function(f,i){return upload(f,'m'+(Date.now()%100000)+'_'+i)})).then(function(rs){addMods(rs.map(function(x){return x.path}))}).catch(function(e){toast(e.message,true)})})})();
 
 /* ---------- live stats (Health tab) ---------- */
 var statsT=null;
@@ -8371,27 +8626,28 @@ function loadSettings(){applyTheme(themeMode(),false);$('#motion-sw').checked=mo
   $('#aggr').checked=!!st.aggressive;$('#cfkey').value=st.cfkey||'';$('#about-text').textContent='Version '+S.info.version+'. Made to turn modpacks into servers without the headaches.';paintUpdate()}
 $$('#theme-seg button').forEach(function(b){b.onclick=function(){applyTheme(b.dataset.v,true)}});
 $$('#tb-seg button').forEach(function(b){b.onclick=function(){$$('#tb-seg button').forEach(function(x){x.setAttribute('aria-pressed',x===b)});S.info.settings.titlebar=b.dataset.v;api('/api/settings',{titlebar:b.dataset.v}).then(function(){toast('Saved. It changes the next time you open the app.')}).catch(function(){})}});
-$$('#pk-seg button').forEach(function(b){b.onclick=function(){$$('#pk-seg button').forEach(function(x){x.setAttribute('aria-pressed',x===b)});S.info.settings.picker=b.dataset.v;S.noNativePick=false;api('/api/settings',{picker:b.dataset.v}).catch(function(){})}});
-$('#priv-sw').onchange=function(){S.info.settings.showprivate=this.checked;api('/api/settings',{showprivate:this.checked}).catch(function(){})};
-$('#aggr').onchange=function(){S.info.settings.aggressive=this.checked;api('/api/settings',{aggressive:this.checked}).catch(function(){})};
+$$('#pk-seg button').forEach(function(b){b.onclick=function(){$$('#pk-seg button').forEach(function(x){x.setAttribute('aria-pressed',x===b)});S.info.settings.picker=b.dataset.v;S.noNativePick=false;saveSetting({picker:b.dataset.v})}});
+$('#priv-sw').onchange=function(){S.info.settings.showprivate=this.checked;saveSetting({showprivate:this.checked})};
+$('#aggr').onchange=function(){S.info.settings.aggressive=this.checked;saveSetting({aggressive:this.checked})};
 $('#motion-sw').onchange=function(){setMotion(this.checked)};
-$('#cfkey').onchange=function(){S.info.settings.cfkey=this.value.trim();api('/api/settings',{cfkey:this.value.trim()}).catch(function(){})};
+$('#cfkey').onchange=function(){S.info.settings.cfkey=this.value.trim();saveSetting({cfkey:this.value.trim()})};
 
 /* ---------- updates ---------- */
 var upd={state:'idle'};
 function paintUpdate(){var t={idle:'Up to date.',checking:'Checking for updates\u2026',downloading:'Downloading version '+(upd.version||'')+'\u2026',ready:'Version '+(upd.version||'')+' is ready to install.',up_to_date:'You have the newest version.',error:'Couldn\u2019t check for updates right now.',disabled:'Updates are switched off in this copy.'}[upd.state]||'';
   $('#upd-text').textContent=t;var p=$('#upd-pill');p.hidden=upd.state!=='ready';$('#upd-check').textContent=upd.state==='ready'?'Install now':'Check now'}
 var updAsked={},updBoot=Date.now();
-function pollUpdate(){api('/api/update').then(function(d){upd=d;paintUpdate();maybeAskUpdate();
+var updT=null;
+function pollUpdate(){clearTimeout(updT);api('/api/update').then(function(d){upd=d;paintUpdate();maybeAskUpdate();
   // right after opening, follow the first check closely so the prompt appears as soon as the update is downloaded
-  if(Date.now()-updBoot<180000&&/^(idle|checking|downloading)$/.test(d.state))setTimeout(pollUpdate,1500)}).catch(function(){})}
+  if(Date.now()-updBoot<180000&&/^(idle|checking|downloading)$/.test(d.state))updT=setTimeout(pollUpdate,1500)}).catch(function(){})}
 function runningServers(){return S.servers.filter(function(s){return s.state==='online'||s.state==='starting'||s.state==='stopping'})}
 function maybeAskUpdate(){if(upd.state!=='ready'||!upd.version||updAsked[upd.version])return;
   if(!S.booted||S.view==='install'||!$('#veil').hidden||polling){clearTimeout(S.askT);S.askT=setTimeout(maybeAskUpdate,3000);return}   // wait for a quiet moment
   updAsked[upd.version]=true;installUpdate(true)}
 $('#upd-pill').onclick=function(){installUpdate(false)};
 $('#upd-check').onclick=function(){if(upd.state==='ready'){installUpdate(false);return}api('/api/update/check',{}).then(function(d){upd=d;paintUpdate();setTimeout(pollUpdate,1500)}).catch(function(){})};
-function installUpdate(auto){api('/api/servers').then(function(d){S.servers=d.servers}).catch(function(){}).then(function(){showUpdate(auto)})}
+function installUpdate(auto){api('/api/servers').then(function(d){S.servers=d.servers}).catch(function(){}).then(function(){if(auto)whenNoModal(function(){showUpdate(auto)});else showUpdate(auto)})}
 function showUpdate(auto){var box=el('div','notes'),cur=upd.current||S.info.version,rl=runningServers(),rs=rl.length?rl:null;
   box.appendChild(el('p',null,'Version '+upd.version+' of Minecraft Server Manager is ready'+(cur?'. You have version '+cur+'.':'.')+' Updating takes a few seconds: the app closes, updates and opens again.'));
   if(rs){var w=el('p',null,rl.length===1?'\u201c'+rl[0].name+'\u201d is running. Updating stops it safely first (your world is saved). You can start it again afterwards.':rl.length+' servers are running. Updating stops them safely first (their worlds are saved). You can start them again afterwards.');w.style.color='var(--t-warn)';box.appendChild(w)}
@@ -8413,7 +8669,7 @@ $('#go-install').onclick=function(){var b=this;if(installed){b.disabled=true;api
     $('#inst-sub').textContent='You\u2019ll find it in your Start menu'+($('#i-desktop').checked?' and on your desktop.':'.')}).catch(function(e){b.disabled=false;b.textContent='Install';toast(e.message,true)})};
 
 /* ---------- close protection (browser/Edge window only; the native window asks itself) ---------- */
-window.addEventListener('beforeunload',function(e){if(S.info.native)return;var running=S.servers.some(function(s){return s.state==='online'||s.state==='starting'});if(polling||running||setDirty){e.preventDefault();e.returnValue=''}});
+window.addEventListener('beforeunload',function(e){if(S.info.native)return;var running=runningServers().length>0;if(polling||running||setDirty){e.preventDefault();e.returnValue=''}});
 
 /* ---------- boot ---------- */
 api('/api/info').then(function(d){S.info=d;S.home=d.home;S.sep=d.win?'\\':'/';var st=d.settings||{};
