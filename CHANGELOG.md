@@ -11,6 +11,12 @@ How to write an entry (for whoever makes the next update):
   * One short sentence per line. Bold the thing they'll look for, e.g. **Fix it for me**.
 -->
 
+## 3.7.2 - October 18, 2026
+
+### Fixed
+- **Memory used could read higher than the memory you gave your server**, which made it look like the setting wasn't working. It was counting all of Java, which always needs some room of its own on top of your setting. It now shows what your setting actually limits, the same number Minecraft's own server window shows, with Java's total underneath.
+- **The memory bar no longer turns red just because memory fills up.** Java fills its memory and then clears it out, over and over, and that's normal. The bar now only warns you when memory stays full even right after a clear-out, and tells you to give the server more.
+
 ## 3.7.1 - October 17, 2026
 
 A full check-up of the app, with lots of fixes for things that could go wrong.

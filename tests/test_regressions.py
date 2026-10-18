@@ -402,4 +402,28 @@ m.api_post_extra(H(), app, "/api/servers/remove", {"id": rec["id"]})
 rec2 = m.add_server(d, "New", {})
 assert app.runner_for(rec2) is None
 ok("removing a server forgets its old console and crash")
+# 35. memory: the heap (what the memory setting caps) is read from Java's own counters file
+import struct
+def perf_file(path, entries):
+    """A small hsperfdata file with long counters, laid out the way Java writes it."""
+    body = b""
+    for name, val in entries:
+        nm = name.encode() + b"\0"
+        nm += b"\0" * (-(20 + len(nm)) % 8)
+        ln = 20 + len(nm) + 8
+        body += struct.pack("<iiicccci", ln, 20, 0, b"J", b"\0", b"\0", b"\0", 20 + len(nm)) + nm + struct.pack("<q", val)
+    head = b"\xca\xfe\xc0\xc0" + bytes([1, 2, 0, 0]) + b"\0" * 16 + struct.pack("<ii", 32, len(entries))
+    path.write_bytes(head + body)
+pf = TMP / "hsperf"
+MB = 1024 * 1024
+perf_file(pf, [("sun.gc.generation.0.space.0.used", 300 * MB), ("sun.gc.generation.0.space.1.used", 20 * MB),
+               ("sun.gc.generation.1.space.0.used", 2000 * MB), ("sun.gc.generation.1.space.0.capacity", 4096 * MB),
+               ("sun.gc.metaspace.used", 400 * MB)])
+assert m.jvm_heap_mb(pf) == 2320, m.jvm_heap_mb(pf)
+perf_file(pf, [("sun.gc.metaspace.used", 400 * MB)])
+assert m.jvm_heap_mb(pf) is None
+pf.write_bytes(b"not a perf file")
+assert m.jvm_heap_mb(pf) is None and m.jvm_heap_mb(TMP / "missing") is None
+assert m.jvm_perf_file(999999999) is None
+ok("memory used is the heap Java reports, not the whole program")
 print("ALL REGRESSION TESTS PASSED")

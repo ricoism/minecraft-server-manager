@@ -2425,6 +2425,50 @@ def process_rss_mb(pid):
     return None
 
 
+def jvm_perf_file(pid):
+    """The file a running Java process publishes its own counters to (what jstat reads), or None.
+    Java leaves it out when started with -XX:+PerfDisableSharedMem or -XX:-UsePerfData."""
+    try:
+        import tempfile as _tf
+        roots = [_tf.gettempdir()] if IS_WIN else ["/tmp"]
+        for root in roots:
+            for d in glob.glob(os.path.join(root, "hsperfdata_*")):
+                f = os.path.join(d, str(int(pid)))
+                if os.path.isfile(f):
+                    return f
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def jvm_heap_mb(path):
+    """How much of its heap (the part your memory setting caps) a Java process is using, in MB, or None.
+    Read from the counters file Java keeps for tools like jstat."""
+    import struct
+    try:
+        with open(path, "rb") as f:
+            b = f.read(1 << 20)
+        if len(b) < 32 or b[:4] != b"\xca\xfe\xc0\xc0":
+            return None
+        e = "<" if b[4] == 1 else ">"
+        off, n = struct.unpack_from(e + "ii", b, 24)
+        used, found = 0, False
+        for _ in range(max(0, min(n, 5000))):
+            ln, name_off, vec_len, typ, _fl, _un, _va, data_off = struct.unpack_from(e + "iiicccci", b, off)
+            if ln <= 0:
+                break
+            end = b.find(b"\0", off + name_off)
+            name = b[off + name_off:end]
+            if typ == b"J" and vec_len == 0 and name.startswith(b"sun.gc.generation.") \
+                    and b".space." in name and name.endswith(b".used"):
+                used += struct.unpack_from(e + "q", b, off + data_off)[0]
+                found = True
+            off += ln
+        return int(used // (1024 * 1024)) if found else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def tick_probe_command(mc: str, loader: str):
     """A command that reports tick speed on this server, or None if it has none."""
     v = version_tuple(mc or "")
@@ -2483,6 +2527,7 @@ class ServerRunner:
         self._probe_until = 0.0
         self._probe_hold = 0.0             # no probe while the user is running the same command themselves
         self._mem_hist = deque(maxlen=90)
+        self._heap_hist = deque(maxlen=90)   # heap in use: what the memory setting actually caps
         self._tick_hist = deque(maxlen=90)
         self._tick_ms = None
         atexit.register(self._atexit)
@@ -2601,6 +2646,7 @@ class ServerRunner:
             self._probe_loader = ctx.loader
             self._ram_limit = ctx.ram_mb
             self._mem_hist.clear()
+            self._heap_hist.clear()
             self._tick_hist.clear()
             self._tick_ms = None
         threading.Thread(target=self._sampler, args=(proc, run_id), daemon=True).start()
@@ -2614,20 +2660,28 @@ class ServerRunner:
             t = self._tick_ms
             return {"state": self._state, "mem_mb": self._mem_hist[-1] if self._mem_hist else None,
                     "limit_mb": self._ram_limit, "mem_hist": list(self._mem_hist),
+                    "heap_mb": self._heap_hist[-1] if self._heap_hist else None, "heap_hist": list(self._heap_hist),
                     "tick_ms": t, "tps": round(min(20.0, 1000.0 / max(t, 0.01)), 1) if t is not None else None,
                     "tick_hist": list(self._tick_hist), "tick_supported": bool(self._probe_cmd)}
 
     def _sampler(self, proc, run_id):
         next_probe = 0.0
+        perf, perf_tries = None, 0
         while run_id == self._run_id and proc.poll() is None:
             time.sleep(2)
             mb = process_rss_mb(proc.pid)
+            if perf is None and perf_tries < 30:      # Java writes it a moment after starting, if at all
+                perf_tries += 1
+                perf = jvm_perf_file(proc.pid)
+            heap = jvm_heap_mb(perf) if perf else None
             now = time.time()
             with self._lock:
                 if run_id != self._run_id:
                     return
                 if mb is not None:
                     self._mem_hist.append(mb)
+                if heap is not None:
+                    self._heap_hist.append(heap)
                 want = self._state == "online" and self._probe_cmd and now < self._stats_wanted and now >= next_probe \
                     and now >= self._probe_hold
                 if want:
@@ -8593,13 +8647,26 @@ function spark(c,vals,max,col){var x=c.getContext('2d'),w=c.width,h=c.height;x.c
   var m=max||Math.max.apply(null,vals)||1,n=vals.length;x.beginPath();vals.forEach(function(v,i){var px=i/(n-1)*w,py=h-2-Math.min(1,v/m)*(h-4);i?x.lineTo(px,py):x.moveTo(px,py)});
   x.strokeStyle=col;x.lineWidth=2;x.lineJoin='round';x.stroke();x.lineTo(w,h);x.lineTo(0,h);x.closePath();x.globalAlpha=.15;x.fillStyle=col;x.fill();x.globalAlpha=1}
 function cssv(n,f){var v=getComputedStyle(document.documentElement).getPropertyValue(n).trim();return v||f}
+// Your memory setting caps Java's heap (what the game itself uses). Java as a whole always sits above that,
+// because Java needs room of its own on top, so the heap is what gets compared with the setting.
+function memSummary(d){var lim=d.limit_mb,tot=d.mem_mb;
+  if(d.heap_mb!=null){var h=d.heap_mb,hist=d.heap_hist||[],pct=lim?Math.min(100,h/lim*100):0,cls='';
+    // The heap fills up and empties in waves, so a high reading on its own is normal. It is only short on memory
+    // when it stays high right after Java has cleared out what it no longer needs.
+    if(lim&&hist.length>=10){var low=Math.min.apply(null,hist.slice(-30))/lim;cls=low>0.9?'bad':low>0.8?'warn':''}
+    var sub=(lim?'of '+fmtMB(lim)+' you gave it':'')+(tot!=null&&tot>h?(lim?' · ':'')+'Java uses '+fmtMB(tot)+' in total':'');
+    if(cls==='bad')sub='Almost all of the '+fmtMB(lim)+' you gave it stays in use, even right after Java clears out what it no longer needs. Give it more memory in Settings.';
+    return {val:fmtMB(h),short:fmtMB(h)+(lim?' / '+fmtMB(lim):''),sub:sub,pct:pct,cls:cls,hist:hist,max:lim||0}}
+  if(tot==null)return {val:'…',short:'…',sub:'Measuring…',pct:0,cls:'',hist:[],max:0};
+  return {val:fmtMB(tot),short:fmtMB(tot),pct:0,cls:'',hist:d.mem_hist||[],max:lim?Math.max(lim*1.4,tot):0,
+    sub:'All of Java'+(lim?'. It normally sits above the '+fmtMB(lim)+' you gave it, because Java needs some room of its own on top':'')}}
 function paintStats(d){var on=d&&d.state==='online',run=d&&(on||d.state==='starting');
   var mem=$('#hs-mem'),tk=$('#hs-tick'),note=$('#hs-note');
-  if(!run){mem.textContent='–';tk.textContent='–';tk.className='hval';$('#hs-mem-sub').textContent='';$('#hs-tick-sub').textContent='';
+  if(!run){mem.textContent='–';mem.className='hval';tk.textContent='–';tk.className='hval';$('#hs-mem-sub').textContent='';$('#hs-tick-sub').textContent='';
     note.hidden=false;note.textContent='Start the server to see how much memory it uses and how fast it runs.';spark($('#hs-mem-c'),[]);spark($('#hs-tick-c'),[]);return}
   note.hidden=true;
-  if(d.mem_mb!=null){mem.textContent=fmtMB(d.mem_mb);$('#hs-mem-sub').textContent=d.limit_mb?'of '+fmtMB(d.limit_mb)+' you gave it':''}else{mem.textContent='…';$('#hs-mem-sub').textContent='Measuring…'}
-  spark($('#hs-mem-c'),d.mem_hist,d.limit_mb?d.limit_mb*1.1:0,cssv('--lapis','#5b80ff'));
+  var ms=memSummary(d),sub=$('#hs-mem-sub');mem.textContent=ms.val;mem.className='hval'+(ms.cls?' '+ms.cls:'');sub.textContent=ms.sub;
+  spark($('#hs-mem-c'),ms.hist,ms.max,cssv('--lapis','#5b80ff'));
   if(!d.tick_supported){tk.textContent='–';tk.className='hval';$('#hs-tick-sub').textContent='This Minecraft version can’t report its tick speed.';spark($('#hs-tick-c'),[]);return}
   if(d.tick_ms==null){tk.textContent='…';tk.className='hval';$('#hs-tick-sub').textContent=on?'Measuring…':'Waiting for the server to finish starting…';spark($('#hs-tick-c'),[]);return}
   var cls=d.tick_ms<40?'good':d.tick_ms<50?'warn':'bad';tk.className='hval '+cls;tk.textContent=d.tick_ms.toFixed(1)+' ms';
@@ -8607,8 +8674,9 @@ function paintStats(d){var on=d&&d.state==='online',run=d&&(on||d.state==='start
   spark($('#hs-tick-c'),d.tick_hist,Math.max(60,Math.max.apply(null,d.tick_hist||[0])),cssv(cls==='good'?'--emerald':cls==='warn'?'--gold':'--redstone','#35d48d'))}
 function paintMini(d){var run=d&&(d.state==='online'||d.state==='starting');
   var mb=$('#ls-mem'),bar=$('#ls-mem-bar'),tk=$('#ls-tick'),ts=$('#ls-tick-sub');
-  if(!run||d.mem_mb==null){mb.textContent=run?'…':'–';bar.style.width='0';bar.className=''}
-  else{var pct=d.limit_mb?Math.min(100,d.mem_mb/d.limit_mb*100):0;mb.textContent=fmtMB(d.mem_mb)+(d.limit_mb?' / '+fmtMB(d.limit_mb):'');bar.style.width=pct+'%';bar.className=pct>92?'bad':pct>80?'warn':''}
+  var box=$('#ls-mem-box');
+  if(!run||(d.mem_mb==null&&d.heap_mb==null)){mb.textContent=run?'…':'–';bar.style.width='0';bar.className='';box.title=''}
+  else{var ms=memSummary(d);mb.textContent=ms.short;bar.style.width=ms.pct+'%';bar.className=ms.cls;box.title=ms.sub}
   tk.className='';if(!run){tk.textContent='–';ts.textContent='Server offline';return}
   if(!d.tick_supported){tk.textContent='–';ts.textContent='Not reported by this version';return}
   if(d.tick_ms==null){tk.textContent='…';ts.textContent=d.state==='online'?'Measuring…':'Starting…';return}
