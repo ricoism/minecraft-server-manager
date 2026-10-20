@@ -426,4 +426,106 @@ pf.write_bytes(b"not a perf file")
 assert m.jvm_heap_mb(pf) is None and m.jvm_heap_mb(TMP / "missing") is None
 assert m.jvm_perf_file(999999999) is None
 ok("memory used is the heap Java reports, not the whole program")
+# 36. updating the modpack: new folder, world + players + settings + the user's own mods come over; keep / undo
+def mrpack(path, name, version, mc="1.21.1"):
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("modrinth.index.json", json.dumps({"name": name, "versionId": version, "files": [],
+                                                       "dependencies": {"minecraft": mc, "fabric-loader": "0.16.0"}}))
+    return path
+app = m.WebApp("app")
+old = srv("Pack Server"); (old / "fabric-server-launch.jar").write_bytes(b"x")
+(old / "server.properties").write_text("server-port=25570\nmotd=Our server\nlevel-name=world\n")
+(old / "world/region").mkdir(parents=True); (old / "world/region/r.0.0.mca").write_bytes(b"mine" * 100)
+(old / "world/session.lock").write_bytes(b"x"); (old / "world_nether").mkdir()
+(old / "whitelist.json").write_text('[{"name":"Steve"}]'); (old / "ops.json").write_text('[{"name":"Alex"}]')
+(old / "user_jvm_args.txt").write_text("-Xms3G\n-Xmx6G\n")
+fabric(old / "mods/packmod-1.jar", "packmod"); fabric(old / "mods/offmod-1.jar.disabled", "offmod")
+fabric(old / "mods/gonemod-1.jar", "gonemod")
+m.add_mods(old, [fabric(TMP / "dl/mymod.jar", "mymod"), fabric(TMP / "dl/nowinpack.jar", "nowinpack")], online=False)
+rec = m.add_server(old, "Pack Server", {"pack": "Cool Pack", "pack_version": "1.0", "mc": "1.21.1", "loader": "fabric"})
+seen = {}
+def fake_build(pack, out, ram="6G", accept_eula=False, *a, before_test=None, **k):
+    out = Path(out); (out / "mods").mkdir(parents=True)
+    (out / "fabric-server-launch.jar").write_bytes(b"x")
+    (out / "server.properties").write_text("server-port=25565\nnew-setting=1\nlevel-name=world\n")
+    (out / "world").mkdir(); (out / "world/level.dat").write_bytes(b"pack's own world")
+    for mid in ("packmod", "offmod", "nowinpack"): fabric(out / f"mods/{mid}-2.jar", mid)
+    m.save_state(out, m.Ctx("1.21.4", "fabric", "0.16.0", True, False, "java", "java", m.parse_ram_mb(ram), log, True), "Cool Pack")
+    seen["ram"] = ram
+    if before_test: before_test(out)
+    return m.BuildResult(out, True, 0)
+real_build = m.build_server; m.build_server = fake_build
+newpack = mrpack(TMP / "cool-2.0.mrpack", "Cool Pack", "2.0", mc="1.21.4")
+c = m.update_check(app, rec["id"], {"type": "file", "path": str(newpack)})
+assert not c["blocked"] and c["new"]["version"] == "2.0" and any("Minecraft 1.21.4" in w for w in c["warnings"]), c
+older = mrpack(TMP / "cool-old.mrpack", "Cool Pack", "0.9", mc="1.20.1")
+assert "older Minecraft" in m.update_check(app, rec["id"], {"type": "file", "path": str(older)})["blocked"]
+other = mrpack(TMP / "other.mrpack", "Totally Different Thing", "1", mc="1.21.1")
+assert any("different modpack" in w for w in m.update_check(app, rec["id"], {"type": "file", "path": str(other)})["warnings"])
+job = m.Job("update")
+m.update_modpack(job, app, {"id": rec["id"], "source": {"type": "file", "path": str(newpack)}})
+m.build_server = real_build
+assert job.state == "done" and job.result["updated"], (job.state, job.result, job.lines[-5:])
+s = m.get_server(rec["id"]); new = Path(s["dir"])
+assert new != old and new.parent == old.parent and new.name == "Pack Server 2.0", new
+assert s["pack_version"] == "2.0" and s["mc"] == "1.21.4" and s["previous"]["dir"] == str(old) and s["previous"]["pack_version"] == "1.0"
+assert (new / "world/region/r.0.0.mca").read_bytes() == b"mine" * 100 and not (new / "world/level.dat").exists()
+assert not (new / "world/session.lock").exists() and (new / "world_nether").is_dir()
+props = m.read_properties(new)
+assert props["server-port"] == "25570" and props["motd"] == "Our server" and props["new-setting"] == "1", props
+assert (new / "whitelist.json").read_text() == '[{"name":"Steve"}]' and (new / "ops.json").exists()
+mods = sorted(p.name for p in (new / "mods").iterdir())
+assert mods == ["mymod.jar", "nowinpack-2.jar", "offmod-2.jar.disabled", "packmod-2.jar"], mods
+assert s["updated"]["kept"] == ["mymod"] and s["updated"]["missing"] == ["gonemod-1"], s["updated"]
+assert seen["ram"] == "6144M" and (old / "world/region/r.0.0.mca").exists() and (old / "mods/gonemod-1.jar").exists()
+assert "carry" in m.STAGE_ORDER["update"] and job.stage == "carry", job.stage
+assert "Keep or undo" in m.update_check(app, rec["id"], {"type": "file", "path": str(newpack)})["blocked"]
+m.update_undo(app, rec["id"])
+s = m.get_server(rec["id"])
+assert s["dir"] == str(old) and s["pack_version"] == "1.0" and s["mc"] == "1.21.1" and not s.get("previous") and not new.exists()
+ok("undo puts the server back on the old folder and removes the updated copy")
+# again, then keep (and move the old copy away)
+m.build_server = fake_build
+job = m.Job("update"); m.update_modpack(job, app, {"id": rec["id"], "source": {"type": "file", "path": str(newpack)}})
+m.build_server = real_build
+s = m.get_server(rec["id"]); assert job.state == "done" and Path(s["dir"]).is_dir()
+m.update_keep(app, rec["id"], delete_old=True)
+s = m.get_server(rec["id"]); assert not s.get("previous") and not old.exists() and Path(s["dir"]).name == "Pack Server 2.0"
+ok("updating the modpack keeps the world, players, settings and the user's own mods; keep and undo work")
+# a failed build leaves nothing behind and the server untouched
+def broken(pack, out, *a, **k):
+    Path(out).mkdir(parents=True); (Path(out) / "junk").write_text("x"); raise RuntimeError("download failed")
+m.build_server = broken
+cur = m.get_server(rec["id"])["dir"]
+job = m.Job("update")
+try:
+    m.update_modpack(job, app, {"id": rec["id"], "source": {"type": "file", "path": str(mrpack(TMP / "c3.mrpack", "Cool Pack", "3.0", mc="1.21.4"))}})
+    raise AssertionError("no error")
+except RuntimeError:
+    pass
+m.build_server = real_build
+s = m.get_server(rec["id"])
+assert s["dir"] == cur and not s.get("previous") and not s.get("setup") and not (Path(cur).parent / "Pack Server 2.0 3.0").exists()
+ok("a failed update leaves the server exactly as it was")
+# 37. a renamed or moved server folder can be found again (name, icon and history stay)
+d = srv("Moved Pack"); (d / "fabric-server-launch.jar").write_bytes(b"x")
+m.save_state(d, m.Ctx("1.21.1", "fabric", "0.16", True, False, "java", "java", 4096, log, True), "Moved Pack Modpack")
+rec = m.add_server(d, "My moved server", {"pack": "Moved Pack Modpack"})
+newd = d.with_name("Moved Pack renamed"); d.rename(newd)
+assert next(x for x in m.list_servers() if x["id"] == rec["id"])["missing"]
+assert m.guess_moved_folder(rec["id"]) == str(newd), m.guess_moved_folder(rec["id"])
+other = srv("not a server dir"); (other / "mods").rmdir()
+try:
+    m.relocate_server(rec["id"], other); raise AssertionError("accepted a non-server folder")
+except ValueError:
+    pass
+taken = m.get_server(m.list_servers()[1]["id"])
+try:
+    m.relocate_server(rec["id"], Path(taken["dir"])); raise AssertionError("accepted another server's folder")
+except ValueError as e:
+    assert "already in your list" in str(e)
+r = m.relocate_server(rec["id"], newd)
+s2 = m.get_server(rec["id"])
+assert s2["dir"] == str(newd) and not s2.get("missing") and s2["name"] == "My moved server" and s2["id"] == rec["id"]
+ok("a renamed server folder is suggested and can be pointed to again")
 print("ALL REGRESSION TESTS PASSED")

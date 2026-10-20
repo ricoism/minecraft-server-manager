@@ -1165,6 +1165,7 @@ class Pack:
     def __init__(self):
         self.kind = ""
         self.name = "modpack"
+        self.version = ""
         self.mc = ""
         self.loader = "vanilla"
         self.loader_ver = ""
@@ -1179,6 +1180,7 @@ def parse_modpack(zf: zipfile.ZipFile) -> Pack:
         idx = json.loads(zf.read("modrinth.index.json"))
         p.kind = "modrinth"
         p.name = idx.get("name", "modpack")
+        p.version = str(idx.get("versionId") or "")[:40]
         deps = idx.get("dependencies", {})
         p.mc = deps.get("minecraft", "")
         for key, loader in (("neoforge", "neoforge"), ("forge", "forge"),
@@ -1201,6 +1203,7 @@ def parse_modpack(zf: zipfile.ZipFile) -> Pack:
         m = json.loads(zf.read("manifest.json"))
         p.kind = "curseforge"
         p.name = m.get("name", "modpack")
+        p.version = str(m.get("version") or "")[:40]
         mc = m.get("minecraft", {})
         p.mc = mc.get("version", "")
         loaders = mc.get("modLoaders", [])
@@ -2185,7 +2188,7 @@ def write_report(server_dir: Path, ctx: Ctx, title):
 
 def build_server(pack_path, out_dir, ram="6G", accept_eula=False, curse_key=None, excludes=(),
                  keep_client_mods=False, test_run=True, aggressive=False, max_attempts=8,
-                 online=True, log=print):
+                 online=True, log=print, before_test=None):
     pack_path = Path(pack_path)
     if not pack_path.is_file():
         raise FileNotFoundError(f"Modpack file not found: {pack_path}")
@@ -2262,6 +2265,9 @@ def build_server(pack_path, out_dir, ram="6G", accept_eula=False, curse_key=None
     write_file(server_dir / "eula.txt", "# https://aka.ms/MinecraftEULA\n"
                f"eula={'true' if accept_eula else 'false'}\n")
     save_state(server_dir, ctx, pack.name)
+    if before_test:                 # an update brings the old world over here, so the test start uses it
+        check_cancel()
+        before_test(server_dir)
 
     ok = None
     if test_run:
@@ -4474,12 +4480,16 @@ def add_server(d: Path, name: str, extra=None) -> dict:
         return rec
 
 
+UPDATABLE_FIELDS = ("name", "icon", "mc", "loader", "pack", "setup", "pack_icon", "pack_version", "src_id",
+                    "dir", "previous", "updated")
+
+
 def update_server(sid: str, **fields) -> dict:
     with _SERVERS_LOCK:
         servers = list_servers()
         for s in servers:
             if s["id"] == sid:
-                s.update({k: v for k, v in fields.items() if k in ("name", "icon", "mc", "loader", "pack", "setup", "pack_icon")})
+                s.update({k: v for k, v in fields.items() if k in UPDATABLE_FIELDS})
                 save_settings({"servers": [{k: v for k, v in x.items() if k != "missing"} for x in servers]})
                 return s
     raise ValueError("That server isn't in your list any more.")
@@ -4587,10 +4597,10 @@ def remove_server(sid: str):
         save_settings({"servers": [{k: v for k, v in x.items() if k != "missing"} for x in servers]})
 
 
-def get_server(sid: str) -> dict:
+def get_server(sid: str, allow_missing=False) -> dict:
     for s in list_servers():
         if s["id"] == sid:
-            if s["missing"]:
+            if s["missing"] and not allow_missing:
                 raise ValueError(f"The folder for '{s['name']}' can't be found. It may have been moved or deleted.")
             return s
     raise ValueError("That server isn't in your list any more.")
@@ -4604,6 +4614,43 @@ def import_server(d: Path, name="") -> dict:
         if _same_folder(s["dir"], d):
             return s                       # already in the list: keep its name, icon and history
     return add_server(Path(os.path.normpath(str(d))), name or d.name)
+
+
+def relocate_server(sid: str, d: Path) -> dict:
+    """Point a server whose folder was renamed or moved at its new place. Name, icon and history stay."""
+    s = get_server(sid, allow_missing=True)
+    if not _looks_like_server(d):
+        raise ValueError("That folder doesn't look like a Minecraft server. Pick the folder that contains "
+                         "the 'mods' folder or the server's .jar file.")
+    for x in list_servers():
+        if x["id"] != sid and _same_folder(x["dir"], d):
+            raise ValueError(f"That folder is already in your list as \u201c{x['name']}\u201d.")
+    env = detect_server_env(d)
+    extra = {k: env[k] for k in ("mc", "loader") if env.get(k)}
+    return update_server(s["id"], dir=os.path.normpath(str(d)), **extra)
+
+
+def guess_moved_folder(sid: str) -> str:
+    """If a missing server's folder was just renamed, find it next to where it was: a server folder that isn't
+    in the list yet and has the same modpack. Only an unambiguous match is suggested."""
+    s = get_server(sid, allow_missing=True)
+    old = Path(s["dir"])
+    parent = old.parent
+    if old.exists() or not parent.is_dir():
+        return ""
+    known = [x["dir"] for x in list_servers()]
+    hits = []
+    try:
+        kids = [c for c in parent.iterdir() if c.is_dir()][:500]
+    except OSError:
+        return ""
+    for c in kids:
+        if any(_same_folder(k, c) for k in known) or not _looks_like_server(c):
+            continue
+        pack = detect_server_env(c).get("pack", "")
+        if s.get("pack") and pack and _name_key(pack) == _name_key(s["pack"]):
+            hits.append(c)
+    return str(hits[0]) if len(hits) == 1 else ""
 
 
 # ---- finding modpacks (Modrinth) -------------------------------------------------------------
@@ -4627,14 +4674,19 @@ def modrinth_search_packs(query="", offset=0, limit=18) -> dict:
     return {"total": d.get("total_hits", len(hits)), "hits": hits}
 
 
-def modrinth_pack_download(project_id: str, log=print):
-    """Download the newest release of a Modrinth modpack. -> (path to .mrpack, title, icon)"""
+def modrinth_newest(project_id: str):
+    """-> (project, newest version): releases first, then the most recent."""
     proj = get_json(f"{MODRINTH}/project/{urllib.parse.quote(project_id)}")
     versions = get_json(f"{MODRINTH}/project/{urllib.parse.quote(project_id)}/version")
     if not versions:
         raise RuntimeError("That modpack has no downloadable versions.")
     versions.sort(key=lambda v: (v.get("version_type") == "release", v.get("date_published", "")), reverse=True)
-    v = versions[0]
+    return proj, versions[0]
+
+
+def modrinth_pack_download(project_id: str, log=print):
+    """Download the newest release of a Modrinth modpack. -> (path to .mrpack, title, icon)"""
+    proj, v = modrinth_newest(project_id)
     f = next((x for x in v.get("files", []) if x.get("primary")), (v.get("files") or [None])[0])
     if not f or not f.get("filename", "").endswith(".mrpack"):
         raise RuntimeError("That modpack's download isn't in a format the app understands.")
@@ -4714,10 +4766,13 @@ def create_server(job, b: dict):
     try:
         if kind == "modrinth":
             pack, title, icon = modrinth_pack_download(str(src.get("id") or ""), job.log)
-            update_server(rec["id"], icon=icon, pack=title)
+            update_server(rec["id"], icon=icon, pack=title, src_id=str(src.get("id") or ""),
+                          pack_version=peek_pack(pack).get("version", ""))
             res = build_server(pack, out, ram, eula, None, (), False, test, bool(b.get("aggressive")), 8, True, job.log)
         elif kind == "file":
-            res = build_server(user_path(src.get("path"), "file"), out, ram, eula, (b.get("cfkey") or None), (), False,
+            pf = user_path(src.get("path"), "file")
+            update_server(rec["id"], pack_version=peek_pack(pf).get("version", ""))
+            res = build_server(pf, out, ram, eula, (b.get("cfkey") or None), (), False,
                                test, bool(b.get("aggressive")), 8, True, job.log)
         else:
             res = build_vanilla_server(str(src.get("version") or ""), out, ram, eula, test, True, job.log)
@@ -4743,6 +4798,270 @@ def create_server(job, b: dict):
     update_server(rec["id"], **upd)
     job.finish(dir=str(res.server_dir), ok=res.test_ok, failures=res.failures, server_id=rec["id"],
                skipped=res.test_ok is None and test)
+
+
+# ---- updating a server to a new version of its modpack ---------------------------------------
+# The new version is built in a folder of its own next to the old one, the world and everything the
+# user set up is copied into it, and only then does the server in the list point at the new folder.
+# The old folder isn't touched, so "Undo" just points back at it.
+
+CARRY_FILES = ("whitelist.json", "ops.json", "banned-players.json", "banned-ips.json", "usercache.json",
+               "server-icon.png", "server-icon.original.png", "eula.txt")
+
+
+def peek_pack(path) -> dict:
+    """Name, version, Minecraft version and loader of a modpack file, or {} if it can't be read."""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            p = parse_modpack(zf)
+        return {"name": p.name, "version": p.version, "mc": p.mc, "loader": p.loader, "mods": len(p.files)}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _world_dirs(d: Path) -> list:
+    level = (read_properties(d).get("level-name") or "world").strip() or "world"
+    if Path(level).name != level or level in (".", ".."):
+        level = "world"
+    return [d / n for n in (level, level + "_nether", level + "_the_end") if (d / n).is_dir()]
+
+
+def _folder_mb(d: Path) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(d):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total // (1024 * 1024)
+
+
+def _name_key(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(s or "").lower())
+
+
+def _mod_ids(folder: Path) -> dict:
+    """mod id -> jar file, for every mod (on or off) in a folder."""
+    out = {}
+    if folder.is_dir():
+        for p in folder.iterdir():
+            if p.is_file() and re.search(r"\.jar(\.disabled)?$", p.name, re.I):
+                info = _mod_info_cached(p)[0]
+                for i in (info.own_ids if info else ()):
+                    out.setdefault(i, p)
+    return out
+
+
+class PlainError(ValueError):
+    """A message already written for the user: shown as it is, without the generic advice."""
+
+
+def update_check(app, sid: str, src: dict, in_job=False) -> dict:
+    """What updating would do, for the confirmation screen. Nothing is changed."""
+    s = get_server(sid)
+    d = Path(s["dir"])
+    cur = {"name": s.get("pack") or s.get("name"), "version": s.get("pack_version", ""), "mc": s.get("mc", ""),
+           "loader": s.get("loader", "")}
+    kind = src.get("type")
+    if kind == "modrinth":
+        proj, v = modrinth_newest(str(src.get("id") or ""))
+        loaders = [x for x in (v.get("loaders") or []) if x != "minecraft"]
+        new = {"name": proj.get("title") or "", "version": str(v.get("version_number") or ""),
+               "mc": (v.get("game_versions") or [""])[0], "loader": (loaders or [""])[0], "icon": proj.get("icon_url") or ""}
+    elif kind == "file":
+        new = peek_pack(user_path(src.get("path"), "file"))
+        if not new:
+            raise ValueError("That file isn't a modpack the app can read. Choose the modpack's .zip or .mrpack file.")
+    else:
+        raise ValueError("Choose the new version of the modpack first.")
+    blocked, warns = "", []
+    if s.get("missing"):
+        blocked = "This server's folder can't be found."
+    elif _server_running(app, s):
+        blocked = "Stop the server first. It can't be updated while it's running."
+    elif app.busy() and not in_job:
+        blocked = "Wait for the current task to finish first."
+    elif s.get("previous"):
+        blocked = "Keep or undo the last update first (on the server's page)."
+    elif new.get("mc") and cur["mc"] and version_tuple(new["mc"]) < version_tuple(cur["mc"]):
+        blocked = (f"That version is for an older Minecraft ({new['mc']}) than your world ({cur['mc']}). "
+                   "Opening a world in an older Minecraft can break it, so the app won't do this.")
+    world_mb = sum(_folder_mb(w) for w in _world_dirs(d))
+    try:
+        free_mb = shutil.disk_usage(d.parent).free // (1024 * 1024)
+    except OSError:
+        free_mb = None
+    if not blocked and free_mb is not None and free_mb < world_mb + 3072:
+        blocked = (f"There isn't enough free space on this drive. The update needs about "
+                   f"{(world_mb + 3072) / 1024:.1f} GB free (a copy of your world plus the new mods). "
+                   f"Free some space and try again.")
+    a, b = _name_key(cur["name"]), _name_key(new.get("name"))
+    if a and b and a not in b and b not in a and __import__("difflib").SequenceMatcher(None, a, b).ratio() < 0.6:
+        warns.append(f"This looks like a different modpack ({new.get('name')}) from the one on this server "
+                     f"({cur['name']}). Only carry on if that's what you want.")
+    if cur["version"] and new.get("version") and cur["version"] == new["version"]:
+        warns.append("This is the version you already have.")
+    if new.get("loader") and cur["loader"] and new["loader"] != cur["loader"] and cur["loader"] != "vanilla":
+        warns.append(f"It uses {loaderish(new['loader'])} instead of {loaderish(cur['loader'])}. "
+                     "Your world may not come over cleanly.")
+    if new.get("mc") and cur["mc"] and version_tuple(new["mc"]) > version_tuple(cur["mc"]):
+        warns.append(f"It moves to Minecraft {new['mc']}. Your world gets upgraded and can't be opened by the "
+                     f"old version afterwards. The old copy is kept, so you can still undo.")
+    return {"current": cur, "new": new, "warnings": warns, "blocked": blocked, "world_mb": world_mb}
+
+
+def loaderish(l: str) -> str:
+    return {"neoforge": "NeoForge", "forge": "Forge", "fabric": "Fabric", "quilt": "Quilt"}.get(str(l).lower(), str(l))
+
+
+def carry_over(old: Path, new: Path, log=print) -> dict:
+    """Copy the world, players, settings and the user's own mods from the old server folder into the new one."""
+    log("\nBringing over your world, players and settings from the old version...")
+
+    def cp(src, dst, *, follow_symlinks=True):
+        check_cancel()
+        return shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
+    for w in _world_dirs(old):
+        target = new / w.name
+        if target.exists():                      # a world that came with the modpack: theirs wins
+            shutil.rmtree(target)
+        mb = _folder_mb(w)
+        log(f"  Copying {w.name} ({mb / 1024:.1f} GB)..." if mb >= 1024 else f"  Copying {w.name} ({mb} MB)...")
+        shutil.copytree(w, target, copy_function=cp, ignore=shutil.ignore_patterns("session.lock"))
+    props = read_properties(old)
+    if props:
+        write_properties(new, props)
+        log("  Kept your server settings (server.properties)")
+    for name in CARRY_FILES:
+        if (old / name).is_file():
+            shutil.copy2(old / name, new / name)
+    log("  Kept your whitelist, operators and bans")
+
+    new_ids = _mod_ids(new / "mods")
+    removed_ids = {}
+    for b in BUCKETS.values():
+        removed_ids.update(_mod_ids(new / b))
+    mine = set(added_mods(old))
+    kept, already, missing = [], [], []
+    for p in sorted((old / "mods").iterdir() if (old / "mods").is_dir() else [], key=lambda x: x.name.lower()):
+        if not (p.is_file() and re.search(r"\.jar(\.disabled)?$", p.name, re.I)):
+            continue
+        info = _mod_info_cached(p)[0]
+        ids = info.own_ids if info else set()
+        title = (info.title if info and info.title else re.sub(r"\.jar(\.disabled)?$", "", p.name, flags=re.I))
+        off = p.name.lower().endswith(".disabled")
+        base = p.name[:-len(".disabled")] if off else p.name
+        same = next((new_ids[i] for i in ids if i in new_ids), None)
+        if base in mine:
+            if same is not None:
+                already.append(title)            # the new version of the pack comes with it now
+                continue
+            dest = free_name(new / "mods", p.name)
+            shutil.copy2(p, dest)
+            note_added_mods(new, [base])
+            kept.append(title)
+            log(f"  Kept a mod you added: {title}")
+        elif off:
+            if same is not None and same.name.lower().endswith(".jar"):
+                same.rename(same.with_name(same.name + ".disabled"))
+                log(f"  Kept turned off: {title}")
+        elif ids and same is None and not any(i in removed_ids for i in ids):
+            missing.append(title)
+    if missing:
+        log(f"  {len(missing)} mod(s) from the old version aren't in the new one: " + ", ".join(missing[:30]))
+    return {"kept": kept, "already": already, "missing": missing}
+
+
+def update_modpack(job, app, b: dict):
+    sid = str(b.get("id") or "")
+    src = b.get("source") or {}
+    chk = update_check(app, sid, src, in_job=True)
+    if chk["blocked"]:
+        raise PlainError(chk["blocked"])
+    s = get_server(sid)
+    old = Path(s["dir"])
+    job.server_id = sid
+    update_server(sid, setup="running")
+    new = None
+    try:
+        job.log(f"Updating {s['name']} to {chk['new'].get('name') or 'the new version'} {chk['new'].get('version') or ''}".rstrip())
+        if src.get("type") == "modrinth":
+            pack, _title, _icon = modrinth_pack_download(str(src.get("id") or ""), job.log)
+        else:
+            pack = user_path(src.get("path"), "file")
+        info = peek_pack(pack)
+        if info.get("mc") and s.get("mc") and version_tuple(info["mc"]) < version_tuple(s["mc"]):
+            raise PlainError("That version is for an older Minecraft than your world, so the app won't use it.")
+        ver = info.get("version") or chk["new"].get("version") or ""
+        new = default_server_dir(f"{old.name} {ver}".strip() if ver else f"{old.name} new version", old.parent)
+        job.log(f"The new version goes in its own folder: {new}\nYour current server isn't changed.")
+        eula = load_settings().get("eula") is True or "eula=true" in _read_text(old / "eula.txt").lower()
+        carried = {}
+        res = build_server(pack, new, f"{read_ram_mb(old)}M", eula, load_settings().get("cfkey") or None, (), False,
+                           bool(b.get("test", True)), False, 8, True, job.log,
+                           before_test=lambda d: carried.update(carry_over(old, Path(d), job.log)))
+    except BaseException:
+        update_server(sid, setup="")
+        if new is not None and new.exists() and not _same_folder(new, old):
+            shutil.rmtree(new, ignore_errors=True)
+        raise
+    env = detect_server_env(Path(res.server_dir))
+    prev = {k: s.get(k, "") for k in ("dir", "pack", "pack_version", "mc", "loader")}
+    update_server(sid, dir=str(res.server_dir), previous=prev, setup="",
+                  pack=info.get("name") or s.get("pack", ""), pack_version=ver,
+                  mc=env.get("mc") or info.get("mc") or s.get("mc", ""), loader=env.get("loader") or s.get("loader", ""),
+                  updated={"at": int(time.time()), "kept": carried.get("kept", []), "missing": carried.get("missing", [])},
+                  **({"src_id": str(src.get("id"))} if src.get("type") == "modrinth" else {}))
+    app.forget_runner(old)
+    job.finish(dir=str(res.server_dir), ok=res.test_ok, failures=res.failures, server_id=sid, updated=True,
+               skipped=res.test_ok is None and bool(b.get("test", True)))
+
+
+def _read_text(p: Path) -> str:
+    try:
+        return p.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+def update_keep(app, sid: str, delete_old=False) -> dict:
+    s = get_server(sid)
+    prev = s.get("previous") or {}
+    old = Path(prev["dir"]) if prev.get("dir") else None
+    msg = ""
+    if delete_old and old and old.is_dir() and not _same_folder(old, s["dir"]) \
+            and not any(_same_folder(x["dir"], old) for x in list_servers() if x["id"] != sid):
+        try:
+            send_to_recycle_bin(old)
+        except OSError as e:
+            msg = str(e)
+    update_server(sid, previous=None, updated=None)
+    return {"ok": True, "warning": msg}
+
+
+def update_undo(app, sid: str) -> dict:
+    s = get_server(sid)
+    prev = s.get("previous") or {}
+    if not prev.get("dir"):
+        raise ValueError("There's no update to undo.")
+    if _server_running(app, s):
+        raise ValueError("Stop the server first.")
+    if app.busy():
+        raise ValueError("Wait for the current task to finish first.")
+    old, cur = Path(prev["dir"]), Path(s["dir"])
+    if not old.is_dir():
+        raise ValueError(f"The old version's folder can't be found any more ({old}), so the update can't be undone.")
+    update_server(sid, dir=str(old), previous=None, updated=None,
+                  **{k: prev.get(k, "") for k in ("pack", "pack_version", "mc", "loader")})
+    app.forget_runner(cur)
+    msg = ""
+    if cur.is_dir() and not _same_folder(cur, old):
+        try:
+            send_to_recycle_bin(cur)
+        except OSError as e:
+            msg = f"The updated copy is still at {cur}. {e}"
+    return {"ok": True, "warning": msg}
 
 
 # ---- custom server icons ---------------------------------------------------------------------
@@ -5011,6 +5330,11 @@ def api_get_extra(h, app, path, q):
         return h._json({"servers": out})
     if path == "/api/modpacks":
         return h._json(modrinth_search_packs(arg("q"), int(arg("offset", "0") or 0)))
+    if path == "/api/servers/guess":
+        return h._json({"dir": guess_moved_folder(arg("id"))})
+    if path == "/api/server/update/check":
+        src = {"type": arg("type"), "id": arg("project"), "path": arg("path")}
+        return h._json(update_check(app, arg("id"), src))
     if path == "/api/vanilla":
         return h._json({"versions": vanilla_versions()})
     if path == "/api/defaults":
@@ -5089,6 +5413,20 @@ def api_post_extra(h, app, path, body):
         app.forget_runner(out)
         app.start_job("build", lambda job: create_server(job, body))
         return h._json({"ok": True})
+    if path == "/api/servers/relocate":
+        sid = str(body.get("id") or "")
+        old = get_server(sid, allow_missing=True)["dir"]
+        rec = relocate_server(sid, user_path(body.get("dir")))
+        app.forget_runner(old)
+        return h._json(rec)
+    if path == "/api/server/update":
+        get_server(str(body.get("id") or ""))
+        app.start_job("update", lambda job: update_modpack(job, app, body))
+        return h._json({"ok": True})
+    if path == "/api/server/update/keep":
+        return h._json(update_keep(app, str(body.get("id") or ""), bool(body.get("delete_old"))))
+    if path == "/api/server/update/undo":
+        return h._json(update_undo(app, str(body.get("id") or "")))
     if path == "/api/servers/import":
         d = user_path(body.get("dir"))
         app.forget_runner(d)
@@ -5110,6 +5448,8 @@ def api_post_extra(h, app, path, body):
             (d / "mods").mkdir(exist_ok=True)
             open_in_file_manager(d / "mods")
             return h._json({"ok": True})
+        if app.busy() and getattr(app.job, "server_id", None) == s["id"]:
+            raise ValueError("Wait until the update has finished.")
         if act == "add":
             paths = body.get("paths") or []
             if not isinstance(paths, list) or len(paths) > 500:
@@ -5315,7 +5655,9 @@ FIX_RULES = [
     (re.compile(r"^\s+(Removed|Installed|Raised|Lowered|Set eula)|^Things you need|^Fixes applied|^\(Report only"), "repair"),
     (re.compile(r"^Test launch \d+/\d+"), "test"),
 ]
+UPDATE_RULES = BUILD_RULES[:-1] + [(re.compile(r"^Bringing over your world"), "carry"), BUILD_RULES[-1]]
 STAGE_ORDER = {"build": ["read", "mods", "detect", "loader", "test"],
+               "update": ["read", "mods", "detect", "loader", "carry", "test"],
                "fix": ["read", "diagnose", "repair", "test"]}
 
 
@@ -5411,7 +5753,7 @@ class Job:
         self.result = {}
         self.server_id = None           # the server this job is making or fixing
         self.lock = threading.Lock()
-        self.rules = BUILD_RULES if kind == "build" else FIX_RULES
+        self.rules = {"build": BUILD_RULES, "update": UPDATE_RULES}.get(kind, FIX_RULES)
 
     def log(self, msg):
         with self.lock:
@@ -5438,7 +5780,10 @@ class Job:
             if getattr(self, "kept_server_id", None):
                 self.result["server_id"] = self.kept_server_id
             if explained:
-                self.result.update(error=explained["title"], steps=explained["steps"], details=explained["details"])
+                steps = explained["steps"]
+                if self.kind == "update":
+                    steps = [t.replace("Press Try again", "Press Update modpack again") for t in steps]
+                self.result.update(error=explained["title"], steps=steps, details=explained["details"])
             self.lines.append(("STOPPED: " if cancelled else "ERROR: ") + message)
 
 
@@ -5809,6 +6154,8 @@ def add_mods(d: Path, paths, rec=None, online=True):
         dest = free_name(mods, dest.name)
         shutil.copy2(src, dest)
         added.append(dest)
+    if added:
+        note_added_mods(d, [p.name for p in added])
     sides = {}
     if added and online:
         sides = modrinth_sides(added, lambda s: None)
@@ -5820,6 +6167,27 @@ def add_mods(d: Path, paths, rec=None, online=True):
         out.append({"file": p.name, "name": (info.title if info and info.title else p.stem),
                     "warnings": mod_warnings(p, d, loader, mc, infos, sides.get(p.name))})
     return {"added": out, "skipped": skipped}
+
+
+ADDED_MODS_FILE = ".msb_added_mods.json"
+
+
+def added_mods(d: Path) -> list:
+    """File names of mods the user added in the Mods tab (not part of the modpack)."""
+    try:
+        v = json.loads((Path(d) / ADDED_MODS_FILE).read_text(encoding="utf-8"))
+        return [str(x) for x in v if isinstance(x, str)] if isinstance(v, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def note_added_mods(d: Path, names):
+    cur = added_mods(d)
+    cur += [n for n in names if n not in cur]
+    try:
+        write_file(Path(d) / ADDED_MODS_FILE, json.dumps(cur[-2000:], indent=1))
+    except OSError:
+        pass
 
 
 def set_mod_enabled(d: Path, name: str, on: bool):
@@ -6048,6 +6416,8 @@ class WebApp:
                 fn(job)
             except Cancelled as e:
                 job.fail(str(e), cancelled=True)
+            except PlainError as e:
+                job.fail(str(e))
             except Exception as e:  # noqa: BLE001
                 job.fail(str(e), explained=explain_error(e))
             finally:
@@ -7639,6 +8009,11 @@ details.log summary::-webkit-details-marker{display:none}
 .steps li{counter-increment:st;display:grid;grid-template-columns:auto 1fr;gap:12px;align-items:start;padding:12px 14px;border-radius:14px;background:var(--well);box-shadow:inset 0 0 0 1px var(--line);font-size:14px;line-height:1.45;overflow-wrap:anywhere}
 .steps li::before{content:counter(st);display:grid;place-items:center;width:24px;height:24px;border-radius:8px;font:700 13px/1 var(--display);color:#fff;background:linear-gradient(135deg,var(--lapis),var(--amethyst))}
 #r-details pre{white-space:pre-wrap;word-break:break-word;max-height:180px;overflow:auto;font:12px/1.5 var(--mono);margin:8px 0}
+.updopts{display:grid;gap:10px;margin-top:14px}
+.updopt{display:flex;gap:12px;align-items:center;width:100%;text-align:left;padding:12px 14px;border:0;border-radius:14px;background:var(--glass-lo);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--ink) 12%,transparent);color:inherit;font:inherit;cursor:pointer}
+.updopt:hover,.updopt:focus-visible{box-shadow:inset 0 0 0 1.5px var(--lapis)}.updopt svg{width:20px;height:20px;flex:none}.updopt b{display:block;font-weight:650}.updopt small{display:block;color:var(--ink-2);font-size:13px;margin-top:2px}
+.updcmp{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:center;margin:14px 0}.updcmp>div{padding:10px 12px;border-radius:12px;background:var(--glass-lo);min-width:0}.updcmp>.arr{padding:0;background:none;color:var(--ink-2)}.updcmp .arr svg{display:block;width:22px;height:22px}.updcmp small{display:block;color:var(--ink-2);font-size:12px}.updcmp b{display:block;overflow-wrap:anywhere}
+.updnote{display:flex;gap:10px;align-items:flex-start;margin-top:10px;padding:10px 12px;border-radius:12px;font-size:14px;background:color-mix(in srgb,var(--gold) 14%,transparent)}.updnote.bad{background:color-mix(in srgb,var(--redstone) 16%,transparent)}.updnote svg{width:16px;height:16px;flex:none;margin-top:2px}
 .modhead{display:flex;gap:14px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap}
 .modacts{display:flex;gap:8px;flex-wrap:wrap}
 .modnote{display:flex;gap:10px;align-items:flex-start;margin-top:14px;padding:11px 14px;border-radius:14px;background:color-mix(in srgb,var(--gold) 14%,transparent);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--gold) 40%,transparent);font-size:14px}
@@ -7895,6 +8270,7 @@ details.log summary::-webkit-details-marker{display:none}
   <div class="shead"><button class="picon editable" id="srv-icon" title="Change icon" aria-label="Change this server’s icon"></button><div style="min-width:0"><h1 id="srv-name"></h1><div class="chips" id="srv-chips"></div></div></div>
   <div class="glass banner bad" id="srv-crash" hidden><span class="bi"><svg><use href="#i-alert"/></svg></span><div class="t"><b>Your server stopped because of a problem</b><span id="srv-crash-text">The app can usually fix this for you.</span></div><button class="btn primary" id="srv-fix"><svg><use href="#i-wrench"/></svg>Fix it for me</button></div>
   <div class="glass banner good" id="srv-ready" hidden><span class="bi"><svg><use href="#i-check"/></svg></span><div class="t"><b>Your server is ready</b><span>Press Start, then share the address with your friends.</span></div></div>
+  <div class="glass banner good" id="srv-updated" hidden><span class="bi"><svg><use href="#i-sparkle"/></svg></span><div class="t"><b id="upd-title">Updated</b><span id="upd-text"></span></div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" id="upd-undo"><svg><use href="#i-undo"/></svg>Undo update</button><button class="btn primary" id="upd-keep"><svg><use href="#i-check"/></svg>Keep it</button></div></div>
   <div class="room">
     <div class="glass beacon" data-shine>
       <div class="bstate"><div class="orb offline" id="orb" aria-hidden="true"><div class="obeam"></div><div class="oring"></div><svg class="ocube" viewBox="0 0 100 100"><ellipse class="ohalo" cx="50" cy="90" rx="34" ry="8"/><g class="oglass"><polygon class="gl" points="14,33 50,52 50,92 14,73"/><polygon class="gr" points="86,33 50,52 50,92 86,73"/><polygon class="gt" points="50,14 86,33 50,52 14,33"/></g><g class="ocore"><polygon class="cl" points="34,46.5 50,55 50,72 34,63.5"/><polygon class="cr" points="66,46.5 50,55 50,72 66,63.5"/><polygon class="ct" points="50,38 66,46.5 50,55 34,46.5"/></g><g class="oframe"><polygon points="20,37 46,50.5 46,84 20,70.5"/><polygon points="80,37 54,50.5 54,84 80,70.5"/><polygon points="50,19 79,33 50,47 21,33"/></g><polyline class="ocrack" points="22,44 30,52 26,58 34,66 31,72"/><polyline class="ocrack" points="78,48 70,55 74,62 66,70"/><g class="oedge"><polyline points="14,33 50,14 86,33 86,73 50,92 14,73 14,33"/><polyline points="14,33 50,52 86,33"/><line x1="50" y1="52" x2="50" y2="92"/></g></svg><i class="opx"></i><i class="opx"></i><i class="opx"></i><i class="opx"></i><i class="opx"></i></div><div><h2 id="st-title">Offline</h2><p id="st-sub">Press Start when you want to play.</p></div></div>
@@ -7951,7 +8327,7 @@ details.log summary::-webkit-details-marker{display:none}
   </div>
   <div class="glass tabpanel" id="t-mods" hidden data-shine>
     <div class="modhead"><div><h3 class="sec-title">Mods</h3><p class="sec-sub" id="mods-sub" style="margin:0">The mods this server loads.</p></div>
-      <div class="modacts"><button class="btn primary" id="mods-add"><svg><use href="#i-plus"/></svg>Add mods</button><button class="btn" id="mods-folder"><svg><use href="#i-folder"/></svg>Open mods folder</button></div></div>
+      <div class="modacts"><button class="btn" id="pack-update"><svg><use href="#i-sparkle"/></svg>Update modpack</button><button class="btn primary" id="mods-add"><svg><use href="#i-plus"/></svg>Add mods</button><button class="btn" id="mods-folder"><svg><use href="#i-folder"/></svg>Open mods folder</button></div></div>
     <div class="modnote" id="mods-running" hidden><svg><use href="#i-alert"/></svg><span>The server is running. Stop it to turn mods on or off or remove them. New mods load the next time it starts.</span></div>
     <div class="moddrop" id="mods-drop"><svg><use href="#i-plus"/></svg><span>Drop <b>.jar</b> mod files here to add them. The app checks each one for you.</span></div>
     <div class="modtools"><div class="search"><div class="sicon"><svg><use href="#i-search"/></svg><input type="search" id="mods-q" placeholder="Find a mod" autocomplete="off" spellcheck="false" aria-label="Find a mod"></div></div>
@@ -8227,7 +8603,7 @@ function go(v,arg){
   function crumb(t){cr.appendChild(icon('chev'));cr.appendChild(el('span',null,t))}
   if(v==='home'){loadHome()}
   else if(v==='create'){crumb('New server');startWizard()}
-  else if(v==='build'){crumb(S.jobKind==='fix'?'Fixing':'Setting up')}
+  else if(v==='build'){crumb(jobVerb())}
   else if(v==='server'){S.sid=arg;var s=S.servers.filter(function(x){return x.id===arg})[0];crumb(s?s.name:'Server');openServer(arg)}
   else if(v==='settings'){crumb('Settings');loadSettings()}
   if(v==='server'&&doneJob&&(doneJob.result||{}).server_id===arg)doneJob=null;
@@ -8250,14 +8626,21 @@ function renderHome(force){
     var c=el('button','glass scard'+(s.missing?' missing':''));c.dataset.shine='';
     var top=el('div','top'),ic=el('div','picon');packIcon(ic,iconUrl(s));top.appendChild(ic);var nm=el('div');nm.style.minWidth='0';nm.appendChild(el('h3',null,s.name));top.appendChild(nm);c.appendChild(top);
     var chips=el('div','chips');if(s.mc)chips.appendChild(el('span','chip pix',s.mc));if(s.loader)chips.appendChild(el('span','chip',loaderName(s.loader)));if(s.pack&&s.pack!==s.name)chips.appendChild(el('span','chip',s.pack));c.appendChild(chips);
-    var f=el('div','foot'),st=el('span','state'),d=el('i','dot '+(s.missing?'':s.state));st.appendChild(d);st.appendChild(document.createTextNode(s.missing?'Folder not found':stateText(s)));f.appendChild(st);f.appendChild(icon('chev'));f.lastChild.setAttribute('width','16');f.lastChild.setAttribute('height','16');c.appendChild(f);
+    var f=el('div','foot'),st=el('span','state'),d=el('i','dot '+(s.missing?'':s.state));st.appendChild(d);st.appendChild(document.createTextNode(s.missing?'Folder not found. Click to find it':stateText(s)));f.appendChild(st);f.appendChild(icon('chev'));f.lastChild.setAttribute('width','16');f.lastChild.setAttribute('height','16');c.appendChild(f);
     c.oncontextmenu=function(e){e.preventDefault();serverMenu(s,e.clientX||c.getBoundingClientRect().left+20,e.clientY||c.getBoundingClientRect().top+20)};
-    c.onclick=function(){if(s.missing){ask('Folder not found','The folder for \u201c'+s.name+'\u201d can\u2019t be found. It may have been moved or deleted. Remove it from your list?','Remove',true).then(function(ok){if(ok)api('/api/servers/remove',{id:s.id}).then(loadHome)});return}if(s.state==='setting_up'){go('build');return}go('server',s.id)};
+    c.onclick=function(){if(s.missing){missingFolder(s);return}if(s.state==='setting_up'){go('build');return}go('server',s.id)};
     box.appendChild(c)});
   if(has){var n=el('button','scard new');var p=el('span','plus');p.appendChild(icon('plus'));n.appendChild(p);n.appendChild(el('b',null,'Create a new server'));var im=el('span','muted','or add one you already have');n.appendChild(im);
     n.onclick=function(e){go('create')};im.onclick=function(e){e.stopPropagation();importServer()};box.appendChild(n)}
 }
 $('#home-new').onclick=$('#empty-new').onclick=function(){go('create')};$('#empty-import').onclick=importServer;
+// A server whose folder was renamed or moved: point the app at the new place (or take it off the list).
+function missingFolder(s){var box=el('div');box.appendChild(el('p',null,'The folder for \u201c'+s.name+'\u201d isn\u2019t where it used to be ('+s.dir+'). If you renamed or moved it, show the app where it is now. Your server keeps its name, icon and settings.'));
+  var sug=el('div','updopts');box.appendChild(sug);
+  function relocate(p){api('/api/servers/relocate',{id:s.id,dir:p}).then(function(){closeModal();toast('Found it. \u201c'+s.name+'\u201d is back.');loadHome()}).catch(function(e){toast(e.message,true)})}
+  api('/api/servers/guess?id='+encodeURIComponent(s.id)).then(function(g){if(g.dir)sug.appendChild(updOpt('folder','Is this it?',g.dir,function(){relocate(g.dir)}))}).catch(function(){});
+  modal('Folder not found',box,[{t:'Remove from list',fn:function(){ask('Remove from your list?','\u201c'+s.name+'\u201d is taken off your list. Nothing is deleted.','Remove',true).then(function(ok){if(ok)api('/api/servers/remove',{id:s.id}).then(loadHome)})}},
+    {t:'Find the folder',primary:true,fn:function(){pick({kind:'dir',title:'Where is \u201c'+s.name+'\u201d now?',start:parentDir(s.dir)||S.home}).then(function(p){if(p)relocate(p)});}}])}
 function importServer(){pick({kind:'dir',title:'Choose your server folder'}).then(function(p){if(!p)return;api('/api/servers/import',{dir:p}).then(function(s){toast('Added \u201c'+s.name+'\u201d');loadHome().then(function(){go('server',s.id)})}).catch(function(e){toast(e.message,true)})})}
 function paintRunPill(){var rs=S.servers.filter(function(s){return s.state&&s.state!=='offline'&&s.state!=='crashed'&&s.state!=='setting_up'&&!(S.view==='server'&&S.sid===s.id)}),p=$('#run-pill');p.hidden=!rs.length;if(!rs.length)return;
   if(rs.length===1){var r=rs[0];p.lastElementChild.textContent=r.name+': '+stateText(r);p.title='';p.onclick=function(){go('server',r.id)}}
@@ -8330,20 +8713,23 @@ $('#w-create').onclick=function(){var b=this;if(!$('#w-eula').checked)return;if(
 /* ---------- progress (create / fix jobs) ---------- */
 var STAGES={build:[['read','Get the game files'],['mods','Download mods'],['detect','Take out client-only mods'],['loader','Set up the server'],['test','First start']],
   vanilla:[['read','Get ready'],['loader','Download Minecraft'],['test','First start']],
+  update:[['read','Get the new version'],['mods','Download mods'],['detect','Take out client-only mods'],['loader','Set up the server'],['carry','Bring over your world'],['test','First start']],
   fix:[['read','Read the log'],['diagnose','Find the cause'],['repair','Fix it'],['test','Start the server']]};
 var cursor=0,polling=false,fails=0,todos=[],todoMode=false,stageKey='build',jobPct=0,jobStage='',doneJob=null;
+function jobVerb(){return S.jobKind==='fix'?'Fixing':S.jobKind==='update'?'Updating':'Setting up'}
 function jobName(){var s=S.servers.filter(function(x){return x.id===S.jobSid})[0];return s?s.name:(S.jobName||'')}
 function paintJobPill(){var p=$('#job-pill');if(!p)return;p.className='running-pill job';
-  if(polling){p.hidden=S.view==='build';var n=jobName();p.lastElementChild.textContent=(S.jobKind==='fix'?'Fixing':'Setting up')+(n?' '+n:'')+(jobPct?' \u00b7 '+jobPct+'%':'');p.title='Show progress';p.onclick=function(){go('build')};return}
+  if(polling){p.hidden=S.view==='build';var n=jobName();p.lastElementChild.textContent=jobVerb()+(n?' '+n:'')+(jobPct?' \u00b7 '+jobPct+'%':'');p.title='Show progress';p.onclick=function(){go('build')};return}
   if(doneJob&&S.view!=='build'){var r=doneJob.result||{},bad=doneJob.state==='error'||r.ok===false;p.classList.add(bad?'bad':'ready');p.hidden=false;
-    var fx=S.jobKind==='fix';p.lastElementChild.textContent=r.cancelled?(fx?'Repair stopped':'Setup stopped'):doneJob.state==='error'?(fx?'Repair didn\u2019t finish':'Setup didn\u2019t finish'):bad?'Needs a fix':(fx?'Fixed':'Server ready');p.title='Show the result';
+    var fx=S.jobKind==='fix',up=S.jobKind==='update';p.lastElementChild.textContent=r.cancelled?(fx?'Repair stopped':up?'Update stopped':'Setup stopped'):doneJob.state==='error'?(fx?'Repair didn\u2019t finish':up?'Update didn\u2019t finish':'Setup didn\u2019t finish'):bad?'Needs a fix':(fx?'Fixed':up?'Updated':'Server ready');p.title='Show the result';
     p.onclick=function(){var d=doneJob;doneJob=null;go('build');showResult(d)};return}
   p.hidden=true}
-function startProgress(kind,srcType){S.jobKind=kind;stageKey=kind==='fix'?'fix':(srcType==='vanilla'?'vanilla':'build');cursor=0;todos=[];todoMode=false;jobPct=0;jobStage='';doneJob=null;$('#feed').textContent='';$('#b-skip').hidden=true;
-  $('#b-result').hidden=true;$('.progress').hidden=false;$('#b-title').textContent=kind==='fix'?'Fixing your server':'Setting up your server';
+function startProgress(kind,srcType){S.jobKind=kind;stageKey=kind==='fix'||kind==='update'?kind:(srcType==='vanilla'?'vanilla':'build');cursor=0;todos=[];todoMode=false;jobPct=0;jobStage='';doneJob=null;$('#feed').textContent='';$('#b-skip').hidden=true;
+  $('#b-result').hidden=true;$('.progress').hidden=false;$('#b-title').textContent=kind==='fix'?'Fixing your server':kind==='update'?'Updating your modpack':'Setting up your server';
+  $('#b-tip').textContent=kind==='update'?'This takes about as long as making the server did. Your current server isn\u2019t changed until it\u2019s done.':'This usually takes a few minutes. You can look around the app meanwhile: the button at the top brings you back here.';
   var tr=$('#b-track');tr.textContent='';STAGES[stageKey].forEach(function(s){var d=el('div','st');var dd=el('span','d');dd.appendChild(icon('check'));d.appendChild(dd);d.appendChild(el('span',null,s[1]));tr.appendChild(d)});
   var st=$('#b-stop');st.disabled=false;st.lastElementChild.textContent='Stop';paintStage('',null,'running');go('build');if(!polling){polling=true;fails=0;pollJob()}}
-var NOW={read:{build:'Reading the modpack',vanilla:'Getting ready',fix:'Reading the log'},mods:'Downloading mods',detect:'Taking out mods that only work on players\u2019 computers',loader:'Setting up the server software',test:'Starting the server once to check that it works',diagnose:'Working out what went wrong',repair:'Fixing the problem'};
+var NOW={carry:'Bringing over your world, players and settings',read:{build:'Reading the modpack',vanilla:'Getting ready',fix:'Reading the log',update:'Getting the new version'},mods:'Downloading mods',detect:'Taking out mods that only work on players\u2019 computers',loader:'Setting up the server software',test:'Starting the server once to check that it works',diagnose:'Working out what went wrong',repair:'Fixing the problem'};
 function paintStage(stage,dl,state){var ids=STAGES[stageKey].map(function(x){return x[0]}),i=ids.indexOf(stage);
   $$('#b-track .st').forEach(function(n,k){n.className='st'+(state==='done'?' done':state==='error'&&k===Math.max(i,0)?' bad':k<i?' done':k===i?' on':'')});
   var frac=stage==='mods'&&dl&&dl[1]?dl[0]/dl[1]:0,p=state==='done'?1:(i<0?.03:(i+frac)/ids.length),bar=$('#b-bar');
@@ -8367,17 +8753,17 @@ function pollJob(){api('/api/events?since='+cursor).then(function(d){fails=0;cur
   .catch(function(){if(++fails>8){polling=false;finishJob({state:'error',result:{error:'Lost contact with the app. Open it again to carry on.'}})}else setTimeout(pollJob,1200)})}
 $('#b-leave').onclick=function(){go('home')};
 $('#b-skip').onclick=function(){var b=this;ask('Skip the test start?','The server is already set up. Skipping only means the app won\u2019t check that it starts. You can press Start on its page whenever you like, and \u201cFix it for me\u201d helps if it doesn\u2019t.','Skip the test',false).then(function(ok){if(!ok)return;b.disabled=true;api('/api/skiptest',{}).then(function(){b.hidden=true;b.disabled=false}).catch(function(e){b.disabled=false;toast(e.message,true)})})};
-$('#b-stop').onclick=function(){var b=this;ask('Stop setting up?','The app stops what it\u2019s doing. Anything already downloaded stays in the server folder.','Stop',true).then(function(ok){if(!ok)return;b.disabled=true;b.lastElementChild.textContent='Stopping\u2026';api('/api/cancel',{}).catch(function(){})})};
+$('#b-stop').onclick=function(){var b=this;(S.jobKind==='update'?ask('Stop updating?','The app stops and tidies up. Your server stays exactly as it was.','Stop',true):ask('Stop setting up?','The app stops what it\u2019s doing. Anything already downloaded stays in the server folder.','Stop',true)).then(function(ok){if(!ok)return;b.disabled=true;b.lastElementChild.textContent='Stopping\u2026';api('/api/cancel',{}).catch(function(){})})};
 function finishJob(d){paintStage(d.stage,d.dl,d.state==='error'?'error':'done');$('#b-skip').hidden=true;loadHome();
   if(S.view!=='build'){doneJob=d;paintJobPill();var r=d.result||{};
-    toast(r.cancelled?'Setup stopped.':d.state==='error'?'Setting up didn\u2019t finish. Click the button at the top for details.':r.ok===false?(jobName()||'Your server')+' needs a fix first. Click the button at the top.':(jobName()||'Your server')+' is ready!',d.state==='error'||r.ok===false);return}
+    toast(r.cancelled?(S.jobKind==='update'?'Update stopped. Your server is as it was.':'Setup stopped.'):d.state==='error'?(S.jobKind==='update'?'The update didn\u2019t finish. Your server is as it was. Click the button at the top for details.':'Setting up didn\u2019t finish. Click the button at the top for details.'):r.ok===false?(jobName()||'Your server')+' needs a fix first. Click the button at the top.':(jobName()||'Your server')+' is ready!',d.state==='error'||r.ok===false);return}
   showResult(d)}
 function showResult(d){var r=d.result||{};doneJob=null;paintJobPill();
   if(d.state!=='error'&&r.server_id&&r.ok!==false){loadHome().then(function(){S.justMade=true;go('server',r.server_id);
-    toast(d.kind==='fix'?'Fixed. Your server starts again.':r.skipped?'Your server is ready. Press Start to play.':'Your server is ready!')});return}
+    toast(d.kind==='fix'?'Fixed. Your server starts again.':d.kind==='update'?'Updated! Start it and check that everything\u2019s there.':r.skipped?'Your server is ready. Press Start to play.':'Your server is ready!')});return}
   $('.progress').hidden=true;$('#b-result').hidden=false;
-  var title,sub;if(r.cancelled){title='Stopped';sub='Nothing else will change. The server folder keeps what was done so far.'}else if(d.state==='error'){title='That didn\u2019t work';sub=r.error||'Something went wrong.'}
-  else if(r.ok===false){title=d.kind==='fix'?'Some problems still need you':'Your server is made, but it needs a fix first';sub=todos.length?'Here\u2019s what\u2019s left to do:':'Its first start didn\u2019t work. Open it and press Start to see what happens; \u201cFix it for me\u201d can usually sort it out.'}
+  var title,sub,up=d.kind==='update';if(r.cancelled){title='Stopped';sub=up?'Your server is exactly as it was.':'Nothing else will change. The server folder keeps what was done so far.'}else if(d.state==='error'){title=up?'The update didn\u2019t work':'That didn\u2019t work';sub=(r.error||'Something went wrong.')+(up?' Your server is exactly as it was.':'')}
+  else if(r.ok===false){title=d.kind==='fix'?'Some problems still need you':up?'Updated, but it needs a fix first':'Your server is made, but it needs a fix first';sub=todos.length?'Here\u2019s what\u2019s left to do:':'Its first start didn\u2019t work. Open it and press Start to see what happens; \u201cFix it for me\u201d can usually sort it out.'}
   else{title='Done';sub=''}
   if(d.state==='error'&&!r.cancelled&&r.steps&&r.steps.length){title=r.error||'That didn\u2019t work';sub='Here\u2019s what to do:'}
   var ol=$('#r-steps');ol.textContent='';(r.steps||[]).forEach(function(t){ol.appendChild(el('li',null,t))});ol.hidden=!(d.state==='error'&&!r.cancelled&&r.steps&&r.steps.length);
@@ -8393,6 +8779,46 @@ $('#r-retry').onclick=function(){var b=this;if(!S.lastCreate)return;b.disabled=t
   api('/api/defaults?name='+encodeURIComponent(lc.name||'My server')+'&base='+encodeURIComponent(parentDir(lc.dir))).then(function(d){lc.dir=d.dir}).catch(function(){}).then(function(){return api('/api/create',lc)}).then(function(){b.disabled=false;S.jobSid=null;startProgress('build',S.lastCreate.source&&S.lastCreate.source.type)}).catch(function(e){b.disabled=false;toast(e.message,true)})};
 
 /* ---------- server control room ---------- */
+/* ---------- updating the modpack ---------- */
+function paintUpdated(s){var b=$('#srv-updated');if(!s.previous){b.hidden=true;return}
+  var u=s.updated||{},p=s.previous,miss=u.missing||[];
+  $('#upd-title').textContent='Updated to '+(s.pack||'the new version')+(s.pack_version?' '+s.pack_version:'');
+  $('#upd-text').textContent='Your world, players and settings came over'+((u.kept||[]).length?', along with '+u.kept.length+' mod'+(u.kept.length===1?'':'s')+' you added':'')+'. Start it and check everything’s there. Your old version'+(p.pack_version?' ('+p.pack_version+')':'')+' is kept until you choose.'+
+    (miss.length?' Not in the new version: '+miss.slice(0,8).join(', ')+(miss.length>8?' and '+(miss.length-8)+' more':'')+'. If you added any of those yourself, add them again in Mods.':'');
+  $('#srv-ready').hidden=true;b.hidden=false}
+$('#upd-keep').onclick=function(){if(!srv)return;var sid=S.sid,p=srv.server.previous||{};
+  modal('Keep the new version?','Your old version is in its own folder ('+p.dir+'). You can keep it as a backup or move it to the Recycle Bin to free up space.',
+    [{t:'Cancel'},{t:'Keep the old folder',fn:function(){keepUpdate(sid,false)}},{t:'Move old folder to Recycle Bin',primary:true,fn:function(){keepUpdate(sid,true)}}])};
+function keepUpdate(sid,del){api('/api/server/update/keep',{id:sid,delete_old:del}).then(function(r){if(r.warning)toast(r.warning,true);else toast(del?'Done. The old version is in the Recycle Bin.':'Done. The old folder stays where it is.');if(sid===S.sid){srv.server.previous=null;$('#srv-updated').hidden=true}loadHome()}).catch(function(e){toast(e.message,true)})}
+$('#upd-undo').onclick=function(){if(!srv)return;var sid=S.sid,p=srv.server.previous||{};
+  ask('Go back to the old version?','Your server goes back to '+(p.pack||'the old version')+(p.pack_version?' '+p.pack_version:'')+', exactly as it was before the update. Anything built or changed in the world since the update is lost. The updated copy goes to the Recycle Bin.','Undo update',true).then(function(ok){if(!ok)return;
+    api('/api/server/update/undo',{id:sid}).then(function(r){toast(r.warning||'Back to the old version.',!!r.warning);if(sid===S.sid)refreshServer(true);loadHome()}).catch(function(e){toast(e.message,true)})})};
+function updOpt(ic,title,sub,fn){var b=el('button','updopt');b.type='button';b.appendChild(icon(ic));var t=el('div');t.appendChild(el('b',null,title));if(sub)t.appendChild(el('small',null,sub));b.appendChild(t);b.onclick=fn;return b}
+$('#pack-update').onclick=function(){if(!srv)return;var s=srv.server,st=srv.status&&srv.status.state;
+  if(st==='starting'||st==='online'||st==='stopping'){toast('Stop the server first. It can’t be updated while it’s running.',true);return}
+  if(s.previous){toast('Keep or undo the last update first (at the top of this page).',true);return}
+  var box=el('div');box.appendChild(el('p',null,'Choose the new version of '+(s.pack||s.name)+(s.pack_version?' (you have '+s.pack_version+')':'')+'. The app makes it in a new folder and brings over your world, players, settings and the mods you added. Your current server isn’t changed, and you can undo afterwards.'));
+  var opts=el('div','updopts');box.appendChild(opts);
+  if(s.src_id)opts.appendChild(updOpt('globe','Get the newest version','From Modrinth, where this modpack came from.',function(){updConfirm({type:'modrinth',id:s.src_id})}));
+  opts.appendChild(updOpt('file','Choose the new modpack file','A .zip or .mrpack file, for example downloaded from CurseForge or exported from your launcher.',function(){
+    pick({kind:'file',exts:['zip','mrpack'],title:'Choose the new version of the modpack',start:S.home}).then(function(p){if(p)updConfirm({type:'file',path:p})})}));
+  if(!s.src_id){var res=el('div','updopts');opts.appendChild(updOpt('search','Find it on Modrinth','Look up '+(s.pack||s.name)+' and get its newest version.',function(){
+      res.textContent='';res.appendChild(el('p','muted','Searching…'));api('/api/modpacks?q='+encodeURIComponent(s.pack||s.name)).then(function(d){res.textContent='';var hits=(d.hits||[]).slice(0,5);
+        if(!hits.length){res.appendChild(el('p','muted','Not found on Modrinth. Choose the modpack file instead.'));return}
+        hits.forEach(function(h){res.appendChild(updOpt('block',h.title,h.author?'by '+h.author:'',function(){updConfirm({type:'modrinth',id:h.id})}))})}).catch(function(e){res.textContent='';res.appendChild(el('p','muted',e.message))})}));box.appendChild(res)}
+  modal('Update modpack',box,[{t:'Cancel'}])};
+function updConfirm(src){var sid=S.sid,q='id='+encodeURIComponent(sid)+'&type='+src.type+(src.id?'&project='+encodeURIComponent(src.id):'')+(src.path?'&path='+encodeURIComponent(src.path):'');
+  modal('Update modpack','Checking the new version…',[{t:'Cancel'}]);
+  api('/api/server/update/check?'+q).then(function(c){if(sid!==S.sid)return;var box=el('div'),cmp=el('div','updcmp');
+    function side(lab,x){var d=el('div');d.appendChild(el('small',null,lab));d.appendChild(el('b',null,(x.name||'?')+(x.version?' '+x.version:'')));d.appendChild(el('small',null,[x.mc?'Minecraft '+x.mc:'',x.loader?loaderName(x.loader):''].filter(Boolean).join(' · ')));return d}
+    cmp.appendChild(side('You have',c.current));var ar=el('div','arr');ar.appendChild(icon('chev'));cmp.appendChild(ar);cmp.appendChild(side('New version',c.new));box.appendChild(cmp);
+    box.appendChild(el('p',null,'Your world'+(c.world_mb?' ('+fmtMB(c.world_mb)+')':'')+', players, settings and the mods you added come over. Your friends need to update the modpack in their launcher too.'));
+    (c.warnings||[]).forEach(function(w){var n=el('div','updnote');n.appendChild(icon('alert'));n.appendChild(el('div',null,w));box.appendChild(n)});
+    if(c.blocked){var n=el('div','updnote bad');n.appendChild(icon('alert'));n.appendChild(el('div',null,c.blocked));box.appendChild(n)}
+    modal('Update modpack',box,c.blocked?[{t:'Close',primary:true}]:[{t:'Cancel'},{t:'Update',primary:true,fn:function(){
+      api('/api/server/update',{id:sid,source:src}).then(function(){S.jobSid=sid;S.jobName=srv&&srv.server.name;startProgress('update')}).catch(function(e){toast(e.message,true)})}}])})
+  .catch(function(e){modal('Update modpack',e.message,[{t:'Close',primary:true}])})}
+
 var srv=null,conSince=0,sPollT=null,conT=null,conBusy=false,conGen=0,tab='console',lastState='';
 function ensureConsole(){if(!conT&&!conBusy)pollConsole()}
 var sGen=0;
@@ -8407,7 +8833,7 @@ function refreshServer(first){clearTimeout(sPollT);var id=S.sid,g=++sGen;   // a
   .catch(function(e){if(g!==sGen||S.view!=='server'||S.sid!==id)return;S.afterOpen=null;toast(e.message,true);go('home')})}
 function paintServer(d,first){var s=d.server,st=d.status||{},state=st.state||'offline';
   if(first){$('#srv-name').textContent=s.name;packIcon($('#srv-icon'),iconUrl(s));var ch=$('#srv-chips');ch.textContent='';if(s.mc)ch.appendChild(el('span','chip pix',s.mc));if(s.loader)ch.appendChild(el('span','chip',loaderName(s.loader)));if(s.pack&&s.pack!==s.name)ch.appendChild(el('span','chip',s.pack));
-    $('#stat-ver').textContent=s.mc||'-';$('#tab-mods').hidden=s.loader==='vanilla';if(s.loader==='vanilla'&&tab==='mods')selTab('console');$('#h-mods').hidden=s.loader==='vanilla'||!s.loader;var cr=$('#crumb span');if(cr)cr.textContent=s.name}
+    $('#stat-ver').textContent=s.mc||'-';$('#tab-mods').hidden=s.loader==='vanilla';paintUpdated(s);if(s.loader==='vanilla'&&tab==='mods')selTab('console');$('#h-mods').hidden=s.loader==='vanilla'||!s.loader;var cr=$('#crumb span');if(cr)cr.textContent=s.name}
   var j=d.join||{};setAddr('a-local',j.local||'localhost');setAddr('a-lan',j.lan||'Not connected to a network');$('#h-port').textContent=j.port||25565;setAddr('h-lan',j.lan?j.lan.split(':')[0]:'this PC');
   var orb=$('#orb');orb.className='orb '+state;var n=(st.players||[]).length;
   var T={offline:['Offline','Press Start when you want to play.'],starting:['Starting\u2026','Getting the world ready. Big modpacks can take a few minutes.'],online:['Online',n?(n===1?'1 person is playing.':n+' people are playing.'):'Ready for players. Share an address on the right.'],stopping:['Stopping\u2026','Saving the world before it shuts down.'],crashed:['Stopped','Something went wrong. See below.']}[state]||['Offline',''];
@@ -8744,7 +9170,7 @@ api('/api/info').then(function(d){S.info=d;S.home=d.home;S.sep=d.win?'\\':'/';va
   applyTheme(st.theme==='light'||st.theme==='dark'?st.theme:themeMode(),false);setupFrame();
   if(d.mode==='install'){$('#inst-dir').textContent=d.install_dir;if(d.installed){$('#inst-sub').textContent='Version '+d.installed+' is installed. This updates it to '+d.version+'.';$('#go-install').textContent='Update'}else $('#inst-sub').textContent='Version '+d.version+'. About 9 MB.';
     VIEWS.forEach(function(x){$('#v-'+x).hidden=x!=='install'});S.view='install';$('#go-settings').hidden=true;return}
-  api('/api/events?since=0').then(function(ev){if(ev.state==='running'){S.jobKind=ev.kind;startProgress(ev.kind==='fix'?'fix':'build')}else go('home')}).catch(function(){go('home')}).then(function(){S.booted=true});
+  api('/api/events?since=0').then(function(ev){if(ev.state==='running'){S.jobKind=ev.kind;startProgress(ev.kind==='fix'||ev.kind==='update'?ev.kind:'build')}else go('home')}).catch(function(){go('home')}).then(function(){S.booted=true});
   pollUpdate();setInterval(pollUpdate,60000);
   api('/api/whatsnew').then(function(w){if(!w.notes)return;(function show(){if(!$('#veil').hidden){setTimeout(show,2500);return}   // never cover another dialog
     modal('What\u2019s new in '+w.version,renderNotes(w.notes),[{t:'Got it',primary:true,fn:function(){api('/api/whatsnew/seen',{}).catch(function(){})}}],function(){api('/api/whatsnew/seen',{}).catch(function(){})})})()}).catch(function(){});

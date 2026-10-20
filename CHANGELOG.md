@@ -11,6 +11,17 @@ How to write an entry (for whoever makes the next update):
   * One short sentence per line. Bold the thing they'll look for, e.g. **Fix it for me**.
 -->
 
+## 3.8.0 - October 19, 2026
+
+### New
+- **Update modpack**, in the Mods tab. Pick the new version (straight from Modrinth, or a modpack file) and the app sets it up for you. It brings over your world, players, server settings and the mods you added yourself.
+- Before it starts, you see which version you have, which one you're getting, and a heads-up if anything looks risky, like a newer Minecraft version or a different modpack.
+- **Your current server isn't touched.** The new version is made in its own folder. If something isn't right, press **Undo update** to go back exactly as you were. When you're happy, press **Keep it**.
+- The app won't put your world on an older Minecraft version, and checks there's enough free space first.
+
+### Better
+- **Renamed or moved a server's folder?** Its card now offers **Find the folder**, so you can show the app where it is now. It keeps its name, icon and settings. If you just renamed it, the app usually spots the new folder for you.
+
 ## 3.7.2 - October 18, 2026
 
 ### Fixed
