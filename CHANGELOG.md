@@ -11,6 +11,12 @@ How to write an entry (for whoever makes the next update):
   * One short sentence per line. Bold the thing they'll look for, e.g. **Fix it for me**.
 -->
 
+## 3.8.1 - October 21, 2026
+
+### Better
+- **Less stutter on big modpacks.** Servers now start with Java memory settings tuned for modded Minecraft. Java cleans up memory in smaller, more frequent steps instead of pausing the whole game, and mods can no longer force a full freeze to clean up. This applies the next time you start your server. If you set your own Java options, the app leaves them alone.
+- **The app leaves your graphics card alone while you play.** Its animations pause whenever its window isn't in front, for example while you're in the game.
+
 ## 3.8.0 - October 19, 2026
 
 ### New

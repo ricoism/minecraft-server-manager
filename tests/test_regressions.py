@@ -25,6 +25,7 @@ def forge(p, mid, deps=(), classes=(), client_deps=()):
 def srv(name):
     d = TMP / name; (d / "mods").mkdir(parents=True); return d
 ok = lambda msg: print("ok -", msg)
+REAL_LAUNCH_CMD = m.launch_cmd
 
 # 1. harmless WARN-level mixin/class messages on a server that started: nothing removed, nothing learned
 d = srv("warn"); fabric(d / "mods/goodmod.jar", "goodmod")
@@ -528,4 +529,21 @@ r = m.relocate_server(rec["id"], newd)
 s2 = m.get_server(rec["id"])
 assert s2["dir"] == str(newd) and not s2.get("missing") and s2["name"] == "My moved server" and s2["id"] == rec["id"]
 ok("a renamed server folder is suggested and can be pointed to again")
+# 38. Java starts with garbage-collector settings that avoid stutter, unless the user set their own
+m.launch_cmd = REAL_LAUNCH_CMD
+d = srv("gcflags"); (d / "run.sh").write_text("java @user_jvm_args.txt @libraries/net/neoforged/neoforge/21.1.1/unix_args.txt nogui\n")
+ctx = m.Ctx("1.21.1", "neoforge", "21.1.1", True, False, "java", "java", 8192, log, True)
+(d / "user_jvm_args.txt").write_text("# -XX:+UseZGC is an example\n-Xmx8G\n")
+cmd = m.launch_cmd(d, ctx)
+assert m.launch_spec(d)["mode"] == "args"
+if True:
+    assert "-XX:+DisableExplicitGC" in cmd and cmd.index("-XX:+UseG1GC") < cmd.index("@user_jvm_args.txt"), cmd
+    (d / "user_jvm_args.txt").write_text("-Xmx8G\n-XX:+UseZGC\n")
+    assert not any(a.startswith("-XX:") for a in m.launch_cmd(d, ctx))
+d2 = srv("gcjar"); (d2 / "server.jar").write_bytes(b"x")
+cmd = m.launch_cmd(d2, m.Ctx("1.21.1", "vanilla", "", True, False, "java", "java", 4096, log, True))
+assert "-XX:+DisableExplicitGC" in cmd and "-Xmx4G" in cmd and cmd[-1] == "nogui", cmd
+assert "-XX:G1HeapRegionSize=16M" in m.gc_flags(16384) and "-XX:G1HeapRegionSize=8M" in m.gc_flags(8192)
+assert not any("PerfDisableSharedMem" in f for f in m.gc_flags(8192))     # the memory stat needs Java's counters
+ok("servers start with stutter-reducing Java settings; the user's own settings win")
 print("ALL REGRESSION TESTS PASSED")

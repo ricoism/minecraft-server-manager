@@ -1480,6 +1480,31 @@ def write_start_scripts(server_dir: Path, ram_mb: int, java_exec="java", log=pri
     log("Wrote start.sh and start.bat")
 
 
+def gc_flags(ram_mb: int) -> list:
+    """Garbage collector settings that keep big modded servers from freezing for a moment every so often
+    (the widely used "Aikar's flags", minus -XX:+PerfDisableSharedMem so the app can still read memory use).
+    -XX:+DisableExplicitGC stops mods from forcing a full stop-the-world clean-up. Unknown options are
+    ignored, so an older or newer Java can't refuse to start because of them."""
+    big = ram_mb >= 12 * 1024
+    return ["-XX:+IgnoreUnrecognizedVMOptions", "-XX:+UseG1GC", "-XX:+ParallelRefProcEnabled",
+            "-XX:MaxGCPauseMillis=200", "-XX:+UnlockExperimentalVMOptions", "-XX:+DisableExplicitGC",
+            f"-XX:G1NewSizePercent={40 if big else 30}", f"-XX:G1MaxNewSizePercent={50 if big else 40}",
+            f"-XX:G1HeapRegionSize={16 if big else 8}M", f"-XX:G1ReservePercent={15 if big else 20}",
+            "-XX:G1HeapWastePercent=5", "-XX:G1MixedGCCountTarget=4",
+            f"-XX:InitiatingHeapOccupancyPercent={20 if big else 15}", "-XX:G1MixedGCLiveThresholdPercent=90",
+            "-XX:SurvivorRatio=32", "-XX:MaxTenuringThreshold=1"]
+
+
+def user_jvm_tuned(server_dir: Path) -> bool:
+    """True when the user (or the modpack) set Java options of their own: then the app leaves them alone."""
+    p = server_dir / "user_jvm_args.txt"
+    if not p.is_file():
+        return False
+    text = "\n".join(l for l in p.read_text(encoding="utf-8", errors="ignore").splitlines()
+                     if not re.match(r"\s*#", l))
+    return "-XX:" in text
+
+
 def launch_cmd(server_dir: Path, ctx: Ctx):
     spec = launch_spec(server_dir)
     if not spec:
@@ -1489,9 +1514,10 @@ def launch_cmd(server_dir: Path, ctx: Ctx):
         if not jvm.exists():
             write_file(jvm, f"-Xms{fmt_ram(min(ctx.ram_mb, max(ctx.ram_mb // 2, 512)))}\n-Xmx{fmt_ram(ctx.ram_mb)}\n")
         args = spec["args"].replace("unix_args.txt", "win_args.txt") if IS_WIN else spec["args"]
-        return [ctx.java, "@user_jvm_args.txt", "@" + args, "nogui"]
-    return [ctx.java, f"-Xms{fmt_ram(min(ctx.ram_mb, max(ctx.ram_mb // 2, 512)))}", f"-Xmx{fmt_ram(ctx.ram_mb)}",
-            "-jar", spec["jar"], "nogui"]
+        extra = [] if user_jvm_tuned(server_dir) else gc_flags(ctx.ram_mb)
+        return [ctx.java, *extra, "@user_jvm_args.txt", "@" + args, "nogui"]
+    return [ctx.java, *gc_flags(ctx.ram_mb), f"-Xms{fmt_ram(min(ctx.ram_mb, max(ctx.ram_mb // 2, 512)))}",
+            f"-Xmx{fmt_ram(ctx.ram_mb)}", "-jar", spec["jar"], "nogui"]
 
 
 def set_ram(server_dir: Path, ctx: Ctx, mb: int):
@@ -2623,6 +2649,8 @@ class ServerRunner:
                 if j:
                     ctx.java = j[0]
             cmd = launch_cmd(d, ctx)
+            if "-XX:+DisableExplicitGC" in cmd:
+                self._app_log("Using Java settings that keep big modpacks from stuttering.")
         except Cancelled:
             return self._launch_fail(run_id, "Starting the server was cancelled.")
         except Exception as e:  # noqa: BLE001
@@ -7640,6 +7668,8 @@ button,input,select,textarea{font:inherit;color:inherit}
 .scene .shoot.go{animation:shoot 1.2s steps(24) forwards}
 @keyframes shoot{0%{opacity:0;transform:rotate(18deg) translateX(0) scaleX(.3)}12%{opacity:1}100%{opacity:0;transform:rotate(18deg) translateX(420px) scaleX(1)}}
 [data-motion=off] .scene *{animation:none!important}
+/* while the app is in the background (for example behind the game), nothing animates, so it leaves the graphics card alone */
+.app-idle .scene *,.app-idle .orb *,.app-idle .track *,.app-idle .bar *,.app-idle .dot,.app-idle .running-pill i{animation-play-state:paused!important}
 @media (prefers-reduced-motion:reduce){.scene *{animation:none!important}}
 .dimmer{position:fixed;inset:0;z-index:-1;background:var(--dim);pointer-events:none}
 [data-sky=day]{--sky1:#3d8fe8;--sky2:#7cbcf3;--sky3:#cfe8fb;--sun:#fff3b0;--cloud-a:.6;--h1:#a7c8e6;--h2:#71b179;--h3:#4a944f;--h4:#2f6e3a;--grass:#8fd46a}
@@ -8439,7 +8469,9 @@ function buildScene(){
 }
 function motionOn(){try{return localStorage.getItem('msb-motion')!=='off'}catch(e){return true}}
 function setMotion(on){try{localStorage.setItem('msb-motion',on?'on':'off')}catch(e){}root.dataset.motion=on?'on':'off'}
-(function shootLoop(){setTimeout(function(){var s=$('#shoot');if(s&&motionOn()&&!document.hidden&&!matchMedia('(prefers-reduced-motion: reduce)').matches){
+function idleState(){document.documentElement.classList.toggle('app-idle',document.hidden||!document.hasFocus())}
+window.addEventListener('blur',idleState);window.addEventListener('focus',idleState);document.addEventListener('visibilitychange',idleState);idleState();
+(function shootLoop(){setTimeout(function(){var s=$('#shoot');if(s&&motionOn()&&!document.hidden&&document.hasFocus()&&!matchMedia('(prefers-reduced-motion: reduce)').matches){
   s.style.left=(8+Math.random()*55)+'%';s.style.top=(4+Math.random()*24)+'%';s.classList.remove('go');void s.offsetWidth;s.classList.add('go')}shootLoop()},14000+Math.random()*22000)})();
 var rsT=0;addEventListener('resize',function(){clearTimeout(rsT);rsT=setTimeout(function(){var span=Math.round(innerWidth+360);$$('.scene .cloud.drift').forEach(function(c){c.style.setProperty('--st',span)})},300)});
 function themeMode(){try{return localStorage.getItem('msb-theme-mode')||'auto'}catch(e){return 'auto'}}
