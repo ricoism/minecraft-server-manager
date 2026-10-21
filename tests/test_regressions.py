@@ -546,4 +546,18 @@ assert "-XX:+DisableExplicitGC" in cmd and "-Xmx4G" in cmd and cmd[-1] == "nogui
 assert "-XX:G1HeapRegionSize=16M" in m.gc_flags(16384) and "-XX:G1HeapRegionSize=8M" in m.gc_flags(8192)
 assert not any("PerfDisableSharedMem" in f for f in m.gc_flags(8192))     # the memory stat needs Java's counters
 ok("servers start with stutter-reducing Java settings; the user's own settings win")
+# 39. memory stays bounded: long test-start output, huge log lines, changing mod files
+ht = m._HeadTail(head=5, tail=5)
+for i in range(100):
+    ht.append(f"line {i} " + "x" * 20000)
+txt = ht.text().splitlines()
+assert len(txt) == 11 and txt[0].startswith("line 0") and txt[-1].startswith("line 99") and "90 lines left out" in txt[5], txt[5]
+assert max(len(x) for x in txt) <= m.CAPTURE_LINE_MAX
+j = fabric(TMP / "cache/a.jar", "cachemod")
+m._MOD_CACHE.clear()
+for i in range(5):
+    fabric(j, f"cachemod{i}"); os.utime(j, (time.time() + i, time.time() + i))
+    assert m._mod_info_cached(j)[0].own_ids == {f"cachemod{i}"}
+assert len(m._MOD_CACHE) == 1, len(m._MOD_CACHE)
+ok("long outputs, huge lines and changed mod files don't pile up in memory")
 print("ALL REGRESSION TESTS PASSED")

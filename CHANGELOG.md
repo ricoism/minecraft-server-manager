@@ -11,6 +11,15 @@ How to write an entry (for whoever makes the next update):
   * One short sentence per line. Bold the thing they'll look for, e.g. **Fix it for me**.
 -->
 
+## 3.8.2 - October 21, 2026
+
+### Fixed
+- **The app could slowly use more and more memory** in a few situations. They're all fixed now:
+  - **Long lines in the console:** a server whose mods print very long lines (some print big data dumps) made the app hold on to all of them. It now keeps just enough to explain a crash.
+  - **The first start of a new server:** if it ran for a long time while printing lots of messages, the app kept every message.
+  - **Opening and closing the Health tab:** switching tabs at the wrong moment could leave an extra copy of the live-stats check running, so the app asked the server for numbers more and more often.
+  - **Mod details:** the app now keeps one set of details per mod file instead of a new set each time the file changed.
+
 ## 3.8.1 - October 21, 2026
 
 ### Better

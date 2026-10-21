@@ -1978,14 +1978,51 @@ def run_server_once(server_dir: Path, ctx: Ctx, timeout=1200):
                             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1,
                             **NOWIN)
     _win_kill_with_app(proc)               # if the app dies, the test server goes with it
-    q, lines = queue.Queue(), []
+    q = queue.Queue()
 
     def reader():
-        for line in proc.stdout:
-            q.put(line.rstrip("\n"))
+        try:
+            for line in proc.stdout:
+                q.put(line.rstrip("\n"))
+        except (OSError, ValueError):       # the pipe was closed because the test was stopped
+            pass
         q.put(None)
 
     threading.Thread(target=reader, daemon=True).start()
+    try:
+        return _watch_test_run(proc, ctx, q, start, timeout)
+    finally:
+        for pipe in (proc.stdin, proc.stdout):
+            try:
+                pipe.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+class _HeadTail:
+    """The first and last lines of a long output: what crash diagnosis needs, without keeping everything
+    a server that spams its log for 20 minutes prints."""
+
+    def __init__(self, head=20000, tail=30000, width=None):
+        self.head, self.tail, self.width, self.cut = [], deque(maxlen=tail), width or CAPTURE_LINE_MAX, 0
+        self.head_max = head
+
+    def append(self, line):
+        line = line[:self.width]
+        if len(self.head) < self.head_max:
+            self.head.append(line)
+        else:
+            if len(self.tail) == self.tail.maxlen:
+                self.cut += 1
+            self.tail.append(line)
+
+    def text(self):
+        mid = [f"... ({self.cut} lines left out) ..."] if self.cut else []
+        return "\n".join(self.head + mid + list(self.tail))
+
+
+def _watch_test_run(proc, ctx, q, start, timeout):
+    lines = _HeadTail()
     ok, echoed, last_beat, deadline = False, 0, time.time(), start + timeout
     while True:
         if CANCEL.is_set() or SKIP_TEST.is_set():
@@ -2034,12 +2071,7 @@ def run_server_once(server_dir: Path, ctx: Ctx, timeout=1200):
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
             pass
-    for pipe in (proc.stdin, proc.stdout):
-        try:
-            pipe.close()
-        except Exception:  # noqa: BLE001
-            pass
-    return ok, "\n".join(lines), start
+    return ok, lines.text(), start
 
 
 def collect_failure_text(server_dir: Path, output: str, since: float) -> str:
@@ -2343,6 +2375,7 @@ from collections import deque
 DEFAULT_PORT = 25565
 CONSOLE_KEEP = 3000          # console lines kept for the page
 CAPTURE_KEEP = 20000         # lines of the current run kept for crash diagnosis
+CAPTURE_LINE_MAX = 8000      # some mods print huge lines (data dumps); 20000 of those would be gigabytes
 LINE_MAX = 4000              # longest console line passed on (characters)
 
 
@@ -2419,24 +2452,36 @@ _WIN_JOB = None
 
 # ---- live stats: memory and tick speed ---------------------------------------------------------
 
+_RSS_API = None
+
+
+def _rss_api():
+    """Windows: the memory-query function and its structure, set up once (not on every 2-second sample)."""
+    global _RSS_API
+    if _RSS_API is None:
+        import ctypes
+        from ctypes import wintypes
+
+        class PMC(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                        ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.K32GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        _RSS_API = (ctypes, k32, PMC)
+    return _RSS_API
+
+
 def process_rss_mb(pid):
     """Memory the process is using (working set), in MB, or None."""
     try:
         if IS_WIN:
-            import ctypes
-            from ctypes import wintypes
-
-            class PMC(ctypes.Structure):
-                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
-                            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
-                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                            ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
-            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            k32.OpenProcess.restype = wintypes.HANDLE
-            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-            k32.K32GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
-            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            ctypes, k32, PMC = _rss_api()
             h = k32.OpenProcess(0x1000 | 0x0010, False, int(pid))   # QUERY_LIMITED_INFORMATION | VM_READ
             if not h:
                 return None
@@ -2768,7 +2813,7 @@ class ServerRunner:
                         mv = RX_MC_VERSION_LINE.search(line)
                         if mv:
                             self._probe_cmd = tick_probe_command(mv.group(1), self._probe_loader)
-                    self._capture.append(line)
+                    self._capture.append(line[:CAPTURE_LINE_MAX])
                     self._add(line, self._classify(line))
         except (OSError, ValueError):
             pass
@@ -6022,7 +6067,9 @@ def mc_req_matches(req, mc_version):
         return None
 
 
-_MOD_CACHE = {}
+_MOD_CACHE = {}             # jar path -> ((size, mtime), (info, meta))
+MOD_CACHE_MAX = 3000
+_MOD_CACHE_LOCK = threading.Lock()
 
 
 def _mod_info_cached(jar: Path):
@@ -6030,10 +6077,10 @@ def _mod_info_cached(jar: Path):
         st = jar.stat()
     except OSError:
         return None, {}
-    key = (str(jar), st.st_size, st.st_mtime)
+    key, stamp = str(jar), (st.st_size, st.st_mtime)
     hit = _MOD_CACHE.get(key)
-    if hit:
-        return hit
+    if hit and hit[0] == stamp:
+        return hit[1]
     info = parse_jar(jar)
     meta = {"files": set(), "client_flag": False, "plugin": False}
     try:
@@ -6047,9 +6094,11 @@ def _mod_info_cached(jar: Path):
                     meta["client_flag"] = True
     except Exception:  # noqa: BLE001
         pass
-    if len(_MOD_CACHE) > 4000:
-        _MOD_CACHE.clear()
-    _MOD_CACHE[key] = (info, meta)
+    with _MOD_CACHE_LOCK:
+        _MOD_CACHE.pop(key, None)               # a changed file replaces its old entry instead of adding one
+        while len(_MOD_CACHE) >= MOD_CACHE_MAX:
+            _MOD_CACHE.pop(next(iter(_MOD_CACHE)))   # forget the oldest
+        _MOD_CACHE[key] = (stamp, (info, meta))
     return info, meta
 
 
@@ -8854,8 +8903,8 @@ function updConfirm(src){var sid=S.sid,q='id='+encodeURIComponent(sid)+'&type='+
 var srv=null,conSince=0,sPollT=null,conT=null,conBusy=false,conGen=0,tab='console',lastState='';
 function ensureConsole(){if(!conT&&!conBusy)pollConsole()}
 var sGen=0;
-function stopServerPolling(){sGen++;clearTimeout(sPollT);clearTimeout(statsT);clearTimeout(conT);sPollT=conT=null;conGen++;conBusy=false}
-function openServer(id){stopServerPolling();srv=null;S.diag=null;paintMini(null);setTimeout(loadStats,700);modsData=null;$('#mods-list').textContent='';$('#mods-q').value='';plists={ops:[],whitelist:[],whitelist_on:false};S.onlinePlayers=null;setTimeout(loadPlayerLists,0);conSince=0;lastState='';$('#console').textContent='';var ce=el('div','empty-c','The server\u2019s messages appear here while it runs.');ce.id='console-empty';$('#console').appendChild(ce);
+function stopServerPolling(){sGen++;statsGen++;clearTimeout(sPollT);clearTimeout(statsT);clearTimeout(conT);sPollT=conT=null;conGen++;conBusy=false}
+function openServer(id){stopServerPolling();srv=null;S.diag=null;paintMini(null);statsT=setTimeout(loadStats,700);modsData=null;$('#mods-list').textContent='';$('#mods-q').value='';plists={ops:[],whitelist:[],whitelist_on:false};S.onlinePlayers=null;setTimeout(loadPlayerLists,0);conSince=0;lastState='';$('#console').textContent='';var ce=el('div','empty-c','The server\u2019s messages appear here while it runs.');ce.id='console-empty';$('#console').appendChild(ce);
   $('#srv-crash').hidden=true;$('#srv-ready').hidden=!S.justMade;S.justMade=false;setAddr('a-pub','Finding your address\u2026');$('#reach').textContent='';delete $('#reach').dataset.real;paintPrivacy();selTab('console');
   refreshServer(true);api('/api/server/public?id='+id).then(function(d){if(S.sid===id)setAddr('a-pub',d.address||'Not available right now')}).catch(function(){if(S.sid===id)setAddr('a-pub','Not available right now')})}
 function refreshServer(first){clearTimeout(sPollT);var id=S.sid,g=++sGen;   // a newer call (or leaving) makes older replies stale
@@ -9140,10 +9189,13 @@ function paintMini(d){var run=d&&(d.state==='online'||d.state==='starting');
   if(d.tick_ms==null){tk.textContent='…';ts.textContent=d.state==='online'?'Measuring…':'Starting…';return}
   var cls=d.tick_ms<40?'good':d.tick_ms<50?'warn':'bad';tk.className=cls;tk.textContent=d.tick_ms.toFixed(1)+' ms';ts.textContent=(d.tps!=null?d.tps.toFixed(1)+' TPS · ':'')+(cls==='good'?'Smooth':cls==='warn'?'Busy':'Lagging')}
 // One loop feeds the small boxes on the server page and the Health tab, only while a server runs.
-function loadStats(){clearTimeout(statsT);var st=srv&&srv.status&&srv.status.state,id=S.sid;
+// Each call starts a new round and ends the old one, so switching tabs while an answer is on its way
+// can't leave two loops running side by side.
+var statsGen=0;
+function loadStats(){clearTimeout(statsT);var g=++statsGen,st=srv&&srv.status&&srv.status.state,id=S.sid;
   if(S.view!=='server'||!id){return}
   if(st!=='online'&&st!=='starting'){paintMini(null);if(tab==='problems')paintStats(null);statsT=setTimeout(loadStats,2000);return}
-  api('/api/server/stats?id='+id).then(function(d){if(id!==S.sid)return;paintMini(d);if(tab==='problems')paintStats(d)}).catch(function(){}).then(function(){if(id===S.sid)statsT=setTimeout(loadStats,2000)})}
+  api('/api/server/stats?id='+id).then(function(d){if(g!==statsGen||id!==S.sid)return;paintMini(d);if(tab==='problems')paintStats(d)}).catch(function(){}).then(function(){if(g===statsGen&&id===S.sid)statsT=setTimeout(loadStats,2000)})}
 $('#lstats').onclick=function(){selTab('problems')};
 
 /* ---------- app settings ---------- */
